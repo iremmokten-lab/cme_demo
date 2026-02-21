@@ -1,4 +1,6 @@
-streamlit==1.31.0
-pandas
-reportlab
-openpyxl
+streamlit==1.32.2
+SQLAlchemy==2.0.25
+pandas==2.2.0
+python-dateutil==2.8.2
+openpyxl==3.1.2
+reportlab==4.1.0
