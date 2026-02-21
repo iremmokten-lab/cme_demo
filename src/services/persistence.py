@@ -3,7 +3,14 @@ from sqlalchemy.orm import Session
 from src.db.models import DatasetUpload, CalculationSnapshot
 from src.mrv.lineage import sha256_bytes, sha256_json
 
-def save_upload(db: Session, project_id: int, dataset_type: str, original_filename: str, content_bytes: bytes, schema_version: str = "v1") -> DatasetUpload:
+def save_upload(
+    db: Session,
+    project_id: int,
+    dataset_type: str,
+    original_filename: str,
+    content_bytes: bytes,
+    schema_version: str = "v1",
+) -> DatasetUpload:
     h = sha256_bytes(content_bytes)
     u = DatasetUpload(
         project_id=project_id,
