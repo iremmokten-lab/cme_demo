@@ -1,5 +1,5 @@
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Text, LargeBinary, Float
+from sqlalchemy import String, Integer, DateTime, ForeignKey, Text, LargeBinary
 from datetime import datetime, timezone
 
 def utcnow():
@@ -27,14 +27,11 @@ class Project(Base):
     snapshots: Mapped[list["CalculationSnapshot"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 class DatasetUpload(Base):
-    """
-    Stores raw uploaded CSV bytes (demo-friendly).
-    """
     __tablename__ = "dataset_uploads"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
 
-    dataset_type: Mapped[str] = mapped_column(String(50))  # "energy" or "production"
+    dataset_type: Mapped[str] = mapped_column(String(50))  # "energy" / "production"
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     original_filename: Mapped[str] = mapped_column(String(255))
@@ -46,18 +43,15 @@ class DatasetUpload(Base):
     project: Mapped["Project"] = relationship(back_populates="uploads")
 
 class CalculationSnapshot(Base):
-    """
-    Stores run configuration + summaries + result hashes.
-    """
     __tablename__ = "calculation_snapshots"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     engine_version: Mapped[str] = mapped_column(String(50))
-    config_json: Mapped[str] = mapped_column(Text)         # parameters / UI selections
-    input_hashes_json: Mapped[str] = mapped_column(Text)   # sha256 for energy/prod uploads
-    results_json: Mapped[str] = mapped_column(Text)        # summaries: energy/ets/cbam totals
+    config_json: Mapped[str] = mapped_column(Text)
+    input_hashes_json: Mapped[str] = mapped_column(Text)
+    results_json: Mapped[str] = mapped_column(Text)
     result_hash: Mapped[str] = mapped_column(String(64), index=True)
 
     project: Mapped["Project"] = relationship(back_populates="snapshots")
