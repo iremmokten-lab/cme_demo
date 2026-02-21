@@ -1,36 +1,41 @@
+import json
 from sqlalchemy.orm import Session
-from src.db.models import Company, Project
+from src.db.models import DatasetUpload, CalculationSnapshot
+from src.mrv.lineage import sha256_bytes, sha256_json
 
-def list_companies(db: Session) -> list[Company]:
-    return db.query(Company).order_by(Company.name.asc()).all()
-
-def get_or_create_company(db: Session, name: str) -> Company:
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("Company adı boş olamaz.")
-    existing = db.query(Company).filter(Company.name == name).one_or_none()
-    if existing:
-        return existing
-    c = Company(name=name)
-    db.add(c)
-    db.commit()
-    db.refresh(c)
-    return c
-
-def list_projects(db: Session, company_id: int) -> list[Project]:
-    return (
-        db.query(Project)
-        .filter(Project.company_id == company_id)
-        .order_by(Project.created_at.desc())
-        .all()
+def save_upload(db: Session, project_id: int, dataset_type: str, original_filename: str, content_bytes: bytes, schema_version: str = "v1") -> DatasetUpload:
+    h = sha256_bytes(content_bytes)
+    u = DatasetUpload(
+        project_id=project_id,
+        dataset_type=dataset_type,
+        original_filename=original_filename or f"{dataset_type}.csv",
+        sha256=h,
+        schema_version=schema_version,
+        content_bytes=content_bytes,
     )
-
-def create_project(db: Session, company_id: int, name: str) -> Project:
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("Project adı boş olamaz.")
-    p = Project(company_id=company_id, name=name)
-    db.add(p)
+    db.add(u)
     db.commit()
-    db.refresh(p)
-    return p
+    db.refresh(u)
+    return u
+
+def save_snapshot(
+    db: Session,
+    project_id: int,
+    engine_version: str,
+    config: dict,
+    input_hashes: dict,
+    results: dict,
+) -> CalculationSnapshot:
+    result_hash = sha256_json(results)
+    s = CalculationSnapshot(
+        project_id=project_id,
+        engine_version=engine_version,
+        config_json=json.dumps(config, ensure_ascii=False),
+        input_hashes_json=json.dumps(input_hashes, ensure_ascii=False),
+        results_json=json.dumps(results, ensure_ascii=False),
+        result_hash=result_hash,
+    )
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return s
