@@ -4,3 +4,4 @@ numpy==1.26.4
 reportlab==4.1.0
 openpyxl==3.1.2
 python-dateutil==2.8.2
+SQLAlchemy==2.0.25
