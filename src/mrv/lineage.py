@@ -6,4 +6,4 @@ def sha256_bytes(b: bytes) -> str:
 
 def sha256_json(obj) -> str:
     s = json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return sha256_bytes(s)
+    return hashlib.sha256(s).hexdigest()
