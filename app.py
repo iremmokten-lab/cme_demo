@@ -4,7 +4,8 @@ import numpy as np
 import json
 import os
 from datetime import datetime, timezone
-from io import BytesIO
+from io import BytesIO, StringIO
+import zipfile
 
 # -----------------------------
 # Optional PDF (ReportLab)
@@ -14,34 +15,16 @@ try:
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import cm
-
-    # Try better Unicode font (Turkish chars)
-    try:
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-        _FONT_REGISTERED = False
-        for p in [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
-        ]:
-            if os.path.exists(p):
-                pdfmetrics.registerFont(TTFont("DejaVuSans", p))
-                _FONT_REGISTERED = True
-                break
-        PDF_FONT = "DejaVuSans" if _FONT_REGISTERED else "Helvetica"
-    except Exception:
-        PDF_FONT = "Helvetica"
-
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
 except Exception:
     PDF_AVAILABLE = False
-    PDF_FONT = "Helvetica"
 
 # -----------------------------
 # App Config
 # -----------------------------
 st.set_page_config(page_title="CME Demo — CBAM + ETS", layout="wide")
-
-APP_VERSION = "final-1.0-cbam-ets"
+APP_VERSION = "final-2.0-export-demo-dashboard-font"
 AUDIT_LOG_PATH = "runs.jsonl"
 
 DISCLAIMER_TEXT = (
@@ -92,14 +75,6 @@ def safe_float(x):
     except Exception:
         return np.nan
 
-def read_csv_uploaded(uploaded_file) -> pd.DataFrame:
-    return pd.read_csv(uploaded_file)
-
-def append_audit_log(record: dict):
-    line = json.dumps(record, ensure_ascii=False)
-    with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
 def kg_to_t(x_kg):
     return float(x_kg) / 1000.0
 
@@ -115,20 +90,17 @@ def format_tl(x):
     except Exception:
         return str(x)
 
-def missing_columns(df: pd.DataFrame, required: list) -> list:
-    return [c for c in required if c not in df.columns]
+def append_audit_log(record: dict):
+    line = json.dumps(record, ensure_ascii=False)
+    with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 def validate_required_columns(df: pd.DataFrame, required: list, df_name: str):
-    miss = missing_columns(df, required)
-    if miss:
-        raise ValueError(f"'{df_name}' dosyasında eksik kolon(lar): " + ", ".join(miss))
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"'{df_name}' dosyasında eksik kolon(lar): " + ", ".join(missing))
 
 def validate_nonnegative(df: pd.DataFrame, cols: list, df_name: str):
-    """
-    Finds first invalid row for each col:
-      - missing (NaN) OR negative
-    Reports with row number (1-based excluding header).
-    """
     problems = []
     for c in cols:
         if c not in df.columns:
@@ -137,11 +109,17 @@ def validate_nonnegative(df: pd.DataFrame, cols: list, df_name: str):
         bad = s.isna() | (s < 0)
         if bad.any():
             i = int(np.where(bad.to_numpy())[0][0])
-            excel_row = i + 2  # header=1, first data row=2
+            excel_row = i + 2
             val = df.iloc[i][c]
             problems.append(f"{df_name}: kolon '{c}' satır {excel_row} geçersiz (boş/negatif): {val}")
     if problems:
         raise ValueError(" | ".join(problems))
+
+def read_csv_uploaded(uploaded_file) -> pd.DataFrame:
+    return pd.read_csv(uploaded_file)
+
+def parse_csv_string(s: str) -> pd.DataFrame:
+    return pd.read_csv(StringIO(s))
 
 # -----------------------------
 # Calculations
@@ -155,9 +133,8 @@ def compute_energy_emissions(energy_df: pd.DataFrame):
     df["activity_amount"] = df["activity_amount"].apply(safe_float)
     df["emission_factor_kgco2_per_unit"] = df["emission_factor_kgco2_per_unit"].apply(safe_float)
 
-    # validations
     validate_nonnegative(df, ["activity_amount", "emission_factor_kgco2_per_unit"], "energy.csv")
-    # scope must be 1 or 2
+
     bad_scope = ~df["scope"].isin([1, 2])
     if bad_scope.any():
         i = int(np.where(bad_scope.to_numpy())[0][0])
@@ -171,7 +148,7 @@ def compute_energy_emissions(energy_df: pd.DataFrame):
     scope1_kg = float(df.loc[df["scope"] == 1, "emissions_kgco2"].sum()) if len(df) else 0.0
     scope2_kg = float(df.loc[df["scope"] == 2, "emissions_kgco2"].sum()) if len(df) else 0.0
 
-    return df, {
+    summary = {
         "total_kgco2": total_kg,
         "scope1_kgco2": scope1_kg,
         "scope2_kgco2": scope2_kg,
@@ -179,12 +156,12 @@ def compute_energy_emissions(energy_df: pd.DataFrame):
         "scope1_tco2": kg_to_t(scope1_kg),
         "scope2_tco2": kg_to_t(scope2_kg),
     }
+    return df, summary
 
 def allocate_energy_to_skus(production_df: pd.DataFrame, total_energy_kgco2: float):
     validate_required_columns(production_df, ["sku", "quantity"], "production.csv")
     df = production_df.copy()
     df["quantity"] = df["quantity"].apply(safe_float)
-
     validate_nonnegative(df, ["quantity"], "production.csv")
 
     total_qty = float(df["quantity"].sum()) if len(df) else 0.0
@@ -208,20 +185,16 @@ def compute_cbam(production_df: pd.DataFrame, eua_price_eur_per_t: float, total_
 
     df = production_df.copy()
 
-    # Optional cbam_covered
     if "cbam_covered" not in df.columns:
         df["cbam_covered"] = 1
 
-    # Normalize types
     df["quantity"] = df["quantity"].apply(safe_float)
     df["export_to_eu_quantity"] = df["export_to_eu_quantity"].apply(safe_float)
     df["input_emission_factor_kg_per_unit"] = df["input_emission_factor_kg_per_unit"].apply(safe_float)
     df["cbam_covered"] = df["cbam_covered"].apply(safe_float)
 
-    # Validations (Step 5)
     validate_nonnegative(df, ["quantity", "export_to_eu_quantity", "input_emission_factor_kg_per_unit"], "production.csv")
 
-    # cbam_covered must be 0/1 (if provided)
     bad_cov = ~df["cbam_covered"].fillna(1).isin([0, 1])
     if bad_cov.any():
         i = int(np.where(bad_cov.to_numpy())[0][0])
@@ -229,13 +202,10 @@ def compute_cbam(production_df: pd.DataFrame, eua_price_eur_per_t: float, total_
         raise ValueError(f"production.csv: kolon 'cbam_covered' satır {excel_row} sadece 0 veya 1 olmalı.")
     df["cbam_covered"] = df["cbam_covered"].fillna(1).astype(int)
 
-    # Allocation always computed (demo), but CBAM only for covered
     df = allocate_energy_to_skus(df, float(total_energy_kgco2))
 
-    # If not covered, force export=0 for CBAM calculation
     df["export_to_eu_quantity_for_cbam"] = np.where(df["cbam_covered"] == 1, df["export_to_eu_quantity"], 0.0)
 
-    # Keep existing warning: export > quantity (only for covered rows, more meaningful)
     export_gt_qty = df[(df["cbam_covered"] == 1) & (df["export_to_eu_quantity"] > df["quantity"]) & (df["quantity"] > 0)]
     warning = None
     if len(export_gt_qty):
@@ -244,13 +214,11 @@ def compute_cbam(production_df: pd.DataFrame, eua_price_eur_per_t: float, total_
             "Lütfen production.csv dosyanı kontrol et."
         )
 
-    # Embedded emissions
     df["total_emission_factor_kg_per_unit"] = df["alloc_energy_kgco2_per_unit"] + df["input_emission_factor_kg_per_unit"]
     df["cbam_embedded_emissions_kgco2"] = df["export_to_eu_quantity_for_cbam"] * df["total_emission_factor_kg_per_unit"]
     df["cbam_embedded_emissions_tco2"] = df["cbam_embedded_emissions_kgco2"].apply(kg_to_t)
     df["cbam_cost_eur"] = df["cbam_embedded_emissions_tco2"] * float(eua_price_eur_per_t)
 
-    # Risk score (covered focus)
     cost = df["cbam_cost_eur"].fillna(0.0).to_numpy()
     intensity = df["total_emission_factor_kg_per_unit"].fillna(0.0).to_numpy()
 
@@ -294,8 +262,25 @@ def compute_ets(scope1_tco2: float, free_allocation_tco2: float, banked_tco2: fl
     }
 
 # -----------------------------
-# PDF
+# PDF with bundled font (DejaVuSans.ttf)
 # -----------------------------
+def register_pdf_font():
+    """
+    Uses DejaVuSans.ttf if present at repo root.
+    """
+    if not PDF_AVAILABLE:
+        return "Helvetica"
+    font_path = "DejaVuSans.ttf"
+    if os.path.exists(font_path):
+        try:
+            pdfmetrics.registerFont(TTFont("DejaVuSans", font_path))
+            return "DejaVuSans"
+        except Exception:
+            return "Helvetica"
+    return "Helvetica"
+
+PDF_FONT = register_pdf_font()
+
 def build_pdf_report(
     eua_price: float,
     fx: float,
@@ -312,7 +297,6 @@ def build_pdf_report(
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
-
     x0 = 2 * cm
     y = height - 2 * cm
 
@@ -328,33 +312,27 @@ def build_pdf_report(
         c.drawString(x0, y, str(text))
         y -= dy
 
-    # Title
     draw("CME Demo Raporu — CBAM + ETS (Tahmini)", dy=20, bold=True, size=14)
-    draw(f"Tarih (UTC): {now_iso()}", dy=16, size=10)
-    draw(f"Uygulama sürümü: {APP_VERSION}", dy=18, size=10)
+    draw(f"Tarih (UTC): {now_iso()}", dy=16)
+    draw(f"Uygulama sürümü: {APP_VERSION}", dy=18)
 
-    # Disclaimer
     setfont(size=9)
     c.drawString(x0, y, DISCLAIMER_TEXT)
     y -= 22
 
-    # Params
     draw("Genel Parametreler", dy=16, bold=True, size=11)
     draw(f"EUA price: {format_eur(eua_price)} / tCO2", dy=14)
     draw(f"FX: {fx:.2f} TL / €", dy=18)
 
-    # Upstream note (Step 3)
     draw("Upstream Girdi (Bildirime Yardımcı Not)", dy=16, bold=True, size=11)
     draw(f"Input emission kaynağı: {upstream_source}", dy=14)
     draw(f"Kaynak notu: {upstream_note if upstream_note.strip() else '-'}", dy=18)
 
-    # Energy
     draw("Energy (Scope 1–2) Özeti", dy=16, bold=True, size=11)
     draw(f"Total: {energy_summary['total_tco2']:.4f} tCO2", dy=14)
     draw(f"Scope 1: {energy_summary['scope1_tco2']:.4f} tCO2", dy=14)
     draw(f"Scope 2: {energy_summary['scope2_tco2']:.4f} tCO2", dy=18)
 
-    # ETS
     draw("ETS Özeti (Tesis Bazlı)", dy=16, bold=True, size=11)
     draw(f"Scope 1 total: {ets_summary['scope1_tco2']:.4f} tCO2", dy=14)
     draw(f"Free allocation: {ets_summary['free_allocation_tco2']:.4f} tCO2", dy=14)
@@ -362,7 +340,6 @@ def build_pdf_report(
     draw(f"Net EUA requirement: {ets_summary['net_eua_requirement_tco2']:.4f} tCO2", dy=14)
     draw(f"ETS cost (TL): {format_tl(ets_summary['ets_cost_tl'])}", dy=18)
 
-    # CBAM
     draw("CBAM Özeti (Ürün Bazlı, Demo)", dy=16, bold=True, size=11)
     if cbam_df is None or cbam_totals is None or len(cbam_df) == 0:
         draw("CBAM hesaplaması için production.csv yüklenmedi veya boş.", dy=14)
@@ -372,9 +349,7 @@ def build_pdf_report(
         draw(f"Toplam embedded: {cbam_totals['total_cbam_embedded_tco2']:.4f} tCO2", dy=14)
         draw(f"Toplam CBAM maliyeti: {format_eur(cbam_totals['total_cbam_cost_eur'])}", dy=18)
 
-        # Top 10 risk
         top = cbam_df.sort_values("risk_score_0_100", ascending=False).head(10)
-
         if y < 6 * cm:
             c.showPage()
             y = height - 2 * cm
@@ -383,7 +358,6 @@ def build_pdf_report(
         setfont(size=9)
         c.drawString(x0, y, "SKU | CBAM covered | Risk(0-100) | EU tCO2 | CBAM €")
         y -= 12
-
         for _, r in top.iterrows():
             txt = (
                 f"{r['sku']} | {int(r.get('cbam_covered', 1))} | {r['risk_score_0_100']} | "
@@ -396,7 +370,6 @@ def build_pdf_report(
                 c.showPage()
                 y = height - 2 * cm
 
-    # Footer
     if y < 3 * cm:
         c.showPage()
         y = height - 2 * cm
@@ -410,9 +383,47 @@ def build_pdf_report(
     return buffer.read()
 
 # -----------------------------
+# Export helpers (ADIM 6)
+# -----------------------------
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+def build_excel_bytes(sheets: dict) -> bytes:
+    """
+    sheets: dict of {sheet_name: dataframe}
+    Requires openpyxl in requirements.txt
+    """
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            safe_name = name[:31]  # Excel sheet name limit
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+    output.seek(0)
+    return output.read()
+
+def build_zip_package(files: dict) -> bytes:
+    """
+    files: dict of {filename: bytes}
+    """
+    out = BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for fname, data in files.items():
+            z.writestr(fname, data)
+    out.seek(0)
+    return out.read()
+
+# -----------------------------
 # UI
 # -----------------------------
 st.title("CME Demo — CBAM (Ürün) + ETS (Tesis)")
+
+# Session defaults
+if "demo_mode" not in st.session_state:
+    st.session_state["demo_mode"] = False
+if "free_allocation" not in st.session_state:
+    st.session_state["free_allocation"] = 0.0
+if "banked_allowances" not in st.session_state:
+    st.session_state["banked_allowances"] = 0.0
 
 with st.sidebar:
     st.subheader("Genel Parametreler")
@@ -425,6 +436,18 @@ with st.sidebar:
     upstream_note = st.text_input("Kaynak notu (kısa)", value="")
 
     st.divider()
+    st.subheader("Tek tık demo (ADIM 7)")
+    cdm1, cdm2 = st.columns(2)
+    with cdm1:
+        if st.button("Demo veriyi yükle", type="primary"):
+            st.session_state["demo_mode"] = True
+            st.success("Demo veri aktif. (CSV yüklemeden çalışır)")
+    with cdm2:
+        if st.button("Demo kapat"):
+            st.session_state["demo_mode"] = False
+            st.info("Demo kapandı. (CSV yükleyerek çalışır)")
+
+    st.divider()
     st.subheader("CSV indir (Template / Demo)")
     c1, c2 = st.columns(2)
     with c1:
@@ -435,182 +458,256 @@ with st.sidebar:
         st.download_button("production demo", PRODUCTION_DEMO_CSV.encode("utf-8"), file_name="production_demo.csv", mime="text/csv")
 
     st.divider()
-    st.caption("Dosyalar")
+    st.caption("Dosyalar (Demo kapalıysa kullan)")
     energy_file = st.file_uploader("energy.csv yükle", type=["csv"], key="energy_csv")
     production_file = st.file_uploader("production.csv yükle (CBAM için)", type=["csv"], key="production_csv")
 
-tab_cbam, tab_ets = st.tabs(["CBAM (ürün bazlı)", "ETS (tesis bazlı)"])
+tab_dash, tab_cbam, tab_ets = st.tabs(["Dashboard (ADIM 8)", "CBAM (ürün bazlı)", "ETS (tesis bazlı)"])
 
-# Load energy
+# -----------------------------
+# Load data (demo vs upload)
+# -----------------------------
+energy_error = None
+prod_error = None
+energy_df = None
+prod_df = None
+
+if st.session_state["demo_mode"]:
+    try:
+        energy_df = parse_csv_string(ENERGY_DEMO_CSV)
+        prod_df = parse_csv_string(PRODUCTION_DEMO_CSV)
+    except Exception as e:
+        energy_error = f"Demo yüklenemedi: {e}"
+else:
+    if energy_file is not None:
+        try:
+            energy_df = read_csv_uploaded(energy_file)
+        except Exception as e:
+            energy_error = f"energy.csv okunamadı: {e}"
+    if production_file is not None:
+        try:
+            prod_df = read_csv_uploaded(production_file)
+        except Exception as e:
+            prod_error = f"production.csv okunamadı: {e}"
+
+# Compute energy
 energy_calc_df = None
 energy_summary = {
-    "total_kgco2": 0.0,
-    "scope1_kgco2": 0.0,
-    "scope2_kgco2": 0.0,
-    "total_tco2": 0.0,
-    "scope1_tco2": 0.0,
-    "scope2_tco2": 0.0,
+    "total_kgco2": 0.0, "scope1_kgco2": 0.0, "scope2_kgco2": 0.0,
+    "total_tco2": 0.0, "scope1_tco2": 0.0, "scope2_tco2": 0.0,
 }
-energy_error = None
-
-if energy_file is not None:
+if energy_df is not None and energy_error is None:
     try:
-        energy_df = read_csv_uploaded(energy_file)
         energy_calc_df, energy_summary = compute_energy_emissions(energy_df)
     except Exception as e:
         energy_error = str(e)
 
-# ETS inputs (store in session so PDF from CBAM tab also consistent)
-if "free_allocation" not in st.session_state:
-    st.session_state["free_allocation"] = 0.0
-if "banked_allowances" not in st.session_state:
-    st.session_state["banked_allowances"] = 0.0
+# ETS
+ets_summary = compute_ets(
+    scope1_tco2=float(energy_summary["scope1_tco2"]),
+    free_allocation_tco2=float(st.session_state["free_allocation"]),
+    banked_tco2=float(st.session_state["banked_allowances"]),
+    eua_price=float(eua_price),
+    fx_tl_per_eur=float(fx),
+)
+
+# CBAM (if production available)
+cbam_df = None
+cbam_totals = None
+cbam_warning = None
+if prod_df is not None and energy_error is None:
+    try:
+        cbam_df, cbam_totals, cbam_warning = compute_cbam(
+            prod_df,
+            eua_price_eur_per_t=float(eua_price),
+            total_energy_kgco2=float(energy_summary["total_kgco2"]),
+        )
+    except Exception as e:
+        prod_error = str(e)
+
+# -----------------------------
+# DASHBOARD (ADIM 8)
+# -----------------------------
+with tab_dash:
+    st.subheader("Dashboard")
+
+    if energy_error:
+        st.error(f"Energy hatası: {energy_error}")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Energy total (tCO2)", f"{energy_summary['total_tco2']:.4f}")
+        c2.metric("Scope 1 (tCO2)", f"{energy_summary['scope1_tco2']:.4f}")
+        if cbam_totals:
+            c3.metric("CBAM embedded (tCO2)", f"{cbam_totals['total_cbam_embedded_tco2']:.4f}")
+            c4.metric("CBAM €", f"{cbam_totals['total_cbam_cost_eur']:.2f}")
+        else:
+            c3.metric("CBAM embedded (tCO2)", "-")
+            c4.metric("CBAM €", "-")
+
+        st.divider()
+        c5, c6, c7 = st.columns(3)
+        c5.metric("ETS Net EUA (tCO2)", f"{ets_summary['net_eua_requirement_tco2']:.4f}")
+        c6.metric("ETS Cost (TL)", format_tl(ets_summary["ets_cost_tl"]))
+        c7.metric("FX (TL/€)", f"{fx:.2f}")
+
+        st.caption("Scope kırılımı (tCO2)")
+        chart_df = pd.DataFrame({
+            "Scope": ["Scope 1", "Scope 2"],
+            "tCO2": [energy_summary["scope1_tco2"], energy_summary["scope2_tco2"]]
+        })
+        st.bar_chart(chart_df.set_index("Scope"))
+
+    st.divider()
+    st.subheader("Export (ADIM 6) — Tek pakette indir")
+    st.write("CBAM sonuçları, ETS özeti ve energy hesap tablosunu **CSV / Excel / ZIP** olarak indirebilirsin.")
+
+    # Prepare export dataframes
+    ets_df = pd.DataFrame([ets_summary])
+    meta_df = pd.DataFrame([{
+        "ts_utc": now_iso(),
+        "app_version": APP_VERSION,
+        "eua_price_eur_per_tco2": float(eua_price),
+        "fx_tl_per_eur": float(fx),
+        "upstream_source": upstream_source,
+        "upstream_note": upstream_note,
+        "demo_mode": bool(st.session_state["demo_mode"]),
+    }])
+
+    # CSV download buttons
+    colx1, colx2, colx3 = st.columns(3)
+    with colx1:
+        if energy_calc_df is not None:
+            st.download_button("Energy hesap (CSV)", df_to_csv_bytes(energy_calc_df), "energy_calculated.csv", "text/csv")
+        st.download_button("ETS summary (CSV)", df_to_csv_bytes(ets_df), "ets_summary.csv", "text/csv")
+    with colx2:
+        if cbam_df is not None:
+            st.download_button("CBAM results (CSV)", df_to_csv_bytes(cbam_df), "cbam_results.csv", "text/csv")
+        st.download_button("Run meta (CSV)", df_to_csv_bytes(meta_df), "run_meta.csv", "text/csv")
+    with colx3:
+        # Excel
+        try:
+            sheets = {
+                "run_meta": meta_df,
+                "ets_summary": ets_df,
+            }
+            if energy_calc_df is not None:
+                sheets["energy_calculated"] = energy_calc_df
+            if cbam_df is not None:
+                sheets["cbam_results"] = cbam_df
+
+            excel_bytes = build_excel_bytes(sheets)
+            st.download_button(
+                "Excel indir (xlsx)",
+                data=excel_bytes,
+                file_name="cme_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            # ZIP package
+            files = {
+                "run_meta.csv": df_to_csv_bytes(meta_df),
+                "ets_summary.csv": df_to_csv_bytes(ets_df),
+            }
+            if energy_calc_df is not None:
+                files["energy_calculated.csv"] = df_to_csv_bytes(energy_calc_df)
+            if cbam_df is not None:
+                files["cbam_results.csv"] = df_to_csv_bytes(cbam_df)
+            files["cme_export.xlsx"] = excel_bytes
+            zip_bytes = build_zip_package(files)
+
+            st.download_button(
+                "Hepsini indir (ZIP)",
+                data=zip_bytes,
+                file_name="cme_export_package.zip",
+                mime="application/zip",
+            )
+        except Exception as e:
+            st.warning(f"Excel/ZIP export için requirements.txt içine openpyxl ekli olmalı. Hata: {e}")
 
 # -----------------------------
 # CBAM TAB
 # -----------------------------
 with tab_cbam:
     st.subheader("CBAM — Ürün Bazlı (Demo)")
-    st.write(
-        "Akış: **energy.csv (Scope 1–2)** toplam emisyonu → SKU’lara **quantity oranında dağıtım** → "
-        "EU export için embedded emisyon → CBAM maliyeti (EUA fiyatı ile)."
-    )
-
-    if energy_file is None:
-        st.info("CBAM için önce **energy.csv** yükleyin. (Template/Demo butonlarını sol menüden indirebilirsin.)")
-    elif energy_error:
+    if energy_error:
         st.error(f"energy.csv hatası: {energy_error}")
+    elif prod_error:
+        st.error(f"production.csv hatası: {prod_error}")
     else:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Energy total (tCO2)", f"{energy_summary['total_tco2']:.4f}")
-        c2.metric("Scope 1 (tCO2)", f"{energy_summary['scope1_tco2']:.4f}")
-        c3.metric("Scope 2 (tCO2)", f"{energy_summary['scope2_tco2']:.4f}")
+        if cbam_warning:
+            st.warning(cbam_warning)
 
-        st.caption("Energy detay (ilk 20 satır)")
-        st.dataframe(energy_calc_df.head(20), use_container_width=True)
-
-        st.divider()
-        if production_file is None:
-            st.info("CBAM hesaplamak için **production.csv** yükleyin. (Template/Demo butonları sol menüde.)")
+        if cbam_df is None:
+            st.info("CBAM hesaplamak için production.csv yükleyin (veya Demo veriyi açın).")
         else:
-            try:
-                prod_df = read_csv_uploaded(production_file)
-                cbam_df, cbam_totals, cbam_warning = compute_cbam(
-                    prod_df,
-                    eua_price_eur_per_t=float(eua_price),
-                    total_energy_kgco2=float(energy_summary["total_kgco2"]),
-                )
+            st.caption(f"CBAM covered: {cbam_totals['covered_sku_count']} | CBAM dışı: {cbam_totals['not_covered_sku_count']}")
+            c1, c2 = st.columns(2)
+            c1.metric("Toplam CBAM embedded (tCO2)", f"{cbam_totals['total_cbam_embedded_tco2']:.4f}")
+            c2.metric("Toplam CBAM maliyeti (EUR)", f"{cbam_totals['total_cbam_cost_eur']:.2f}")
 
-                if cbam_warning:
-                    st.warning(cbam_warning)
+            show_cols = [
+                "sku","cbam_covered","quantity","export_to_eu_quantity","export_to_eu_quantity_for_cbam",
+                "alloc_energy_kgco2_per_unit","input_emission_factor_kg_per_unit","total_emission_factor_kg_per_unit",
+                "cbam_embedded_emissions_tco2","cbam_cost_eur","risk_score_0_100",
+            ]
+            existing_cols = [c for c in show_cols if c in cbam_df.columns]
+            cbam_sorted = cbam_df.sort_values("risk_score_0_100", ascending=False)
+            st.dataframe(cbam_sorted[existing_cols], use_container_width=True, height=420)
 
-                # Covered summary
-                st.caption(f"CBAM covered: {cbam_totals['covered_sku_count']} SKU | CBAM dışı: {cbam_totals['not_covered_sku_count']} SKU")
-
-                c1, c2 = st.columns(2)
-                c1.metric("Toplam CBAM embedded (tCO2)", f"{cbam_totals['total_cbam_embedded_tco2']:.4f}")
-                c2.metric("Toplam CBAM maliyeti (EUR)", f"{cbam_totals['total_cbam_cost_eur']:.2f}")
-
-                st.subheader("SKU Risk Sıralaması")
-                show_cols = [
-                    "sku",
-                    "cbam_covered",
-                    "quantity",
-                    "export_to_eu_quantity",
-                    "export_to_eu_quantity_for_cbam",
-                    "alloc_energy_kgco2_per_unit",
-                    "input_emission_factor_kg_per_unit",
-                    "total_emission_factor_kg_per_unit",
-                    "cbam_embedded_emissions_tco2",
-                    "cbam_cost_eur",
-                    "risk_score_0_100",
-                ]
-                existing_cols = [c for c in show_cols if c in cbam_df.columns]
-                cbam_sorted = cbam_df.sort_values("risk_score_0_100", ascending=False)
-                st.dataframe(cbam_sorted[existing_cols], use_container_width=True)
-
-                out_csv = cbam_sorted.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "CBAM sonuçlarını indir (CSV)",
-                    data=out_csv,
-                    file_name="cbam_results.csv",
-                    mime="text/csv",
-                )
-
-                st.divider()
-                st.subheader("Rapor / Audit")
-
-                # PDF uses ETS values from session
-                ets_summary_for_pdf = compute_ets(
-                    scope1_tco2=float(energy_summary["scope1_tco2"]),
-                    free_allocation_tco2=float(st.session_state["free_allocation"]),
-                    banked_tco2=float(st.session_state["banked_allowances"]),
-                    eua_price=float(eua_price),
-                    fx_tl_per_eur=float(fx),
-                )
-
-                colA, colB = st.columns(2)
-                with colA:
-                    if st.button("Audit log yaz (runs.jsonl)", type="secondary", key="audit_cbam"):
-                        record = {
-                            "ts_utc": now_iso(),
-                            "app_version": APP_VERSION,
-                            "inputs": {
-                                "eua_price_eur_per_tco2": float(eua_price),
-                                "fx_tl_per_eur": float(fx),
-                                "upstream_source": upstream_source,
-                                "upstream_note": upstream_note,
-                                "ets_free_allocation_tco2": float(st.session_state["free_allocation"]),
-                                "ets_banked_allowances_tco2": float(st.session_state["banked_allowances"]),
-                                "has_energy_csv": energy_file is not None,
-                                "has_production_csv": production_file is not None,
-                            },
-                            "energy_summary": energy_summary,
-                            "ets_summary": ets_summary_for_pdf,
-                            "cbam_totals": cbam_totals,
-                        }
-                        append_audit_log(record)
-                        st.success("Audit log yazıldı: runs.jsonl")
-
-                with colB:
-                    if PDF_AVAILABLE:
-                        if st.button("PDF raporu üret", type="primary", key="pdf_cbam"):
-                            pdf_bytes = build_pdf_report(
-                                eua_price=float(eua_price),
-                                fx=float(fx),
-                                energy_summary=energy_summary,
-                                ets_summary=ets_summary_for_pdf,
-                                upstream_source=upstream_source,
-                                upstream_note=upstream_note,
-                                cbam_df=cbam_sorted,
-                                cbam_totals=cbam_totals,
-                            )
-                            st.download_button(
-                                "PDF indir",
-                                data=pdf_bytes,
-                                file_name="cme_report_cbam_ets.pdf",
-                                mime="application/pdf",
-                            )
-                    else:
-                        st.warning("PDF üretimi için reportlab gerekli. requirements.txt içinde 'reportlab' olmalı.")
-
-            except Exception as e:
-                st.error(f"production.csv hatası: {e}")
+            st.divider()
+            st.subheader("Rapor / Audit")
+            colA, colB = st.columns(2)
+            with colA:
+                if st.button("Audit log yaz (runs.jsonl)", type="secondary", key="audit_cbam"):
+                    record = {
+                        "ts_utc": now_iso(),
+                        "app_version": APP_VERSION,
+                        "inputs": {
+                            "eua_price_eur_per_tco2": float(eua_price),
+                            "fx_tl_per_eur": float(fx),
+                            "upstream_source": upstream_source,
+                            "upstream_note": upstream_note,
+                            "ets_free_allocation_tco2": float(st.session_state["free_allocation"]),
+                            "ets_banked_allowances_tco2": float(st.session_state["banked_allowances"]),
+                            "demo_mode": bool(st.session_state["demo_mode"]),
+                        },
+                        "energy_summary": energy_summary,
+                        "ets_summary": ets_summary,
+                        "cbam_totals": cbam_totals,
+                    }
+                    append_audit_log(record)
+                    st.success("Audit log yazıldı: runs.jsonl")
+            with colB:
+                if PDF_AVAILABLE:
+                    if st.button("PDF raporu üret", type="primary", key="pdf_cbam"):
+                        pdf_bytes = build_pdf_report(
+                            eua_price=float(eua_price),
+                            fx=float(fx),
+                            energy_summary=energy_summary,
+                            ets_summary=ets_summary,
+                            upstream_source=upstream_source,
+                            upstream_note=upstream_note,
+                            cbam_df=cbam_sorted,
+                            cbam_totals=cbam_totals,
+                        )
+                        st.download_button(
+                            "PDF indir",
+                            data=pdf_bytes,
+                            file_name="cme_report_cbam_ets.pdf",
+                            mime="application/pdf",
+                        )
+                else:
+                    st.warning("PDF üretimi için reportlab gerekli. requirements.txt içinde reportlab olmalı.")
 
 # -----------------------------
 # ETS TAB
 # -----------------------------
 with tab_ets:
     st.subheader("ETS — Tesis Bazlı (Türkiye ETS Demo)")
-    st.write("Bu sekme yalnızca **Scope 1** emisyonlarına bakar (energy.csv).")
-
-    if energy_file is None:
-        st.info("ETS için önce **energy.csv** yükleyin. (Template/Demo sol menüde.)")
-    elif energy_error:
+    if energy_error:
         st.error(f"energy.csv hatası: {energy_error}")
     else:
-        left, right = st.columns([1, 1])
-
+        left, right = st.columns([1,1])
         with left:
             st.markdown("### Girdiler")
             st.session_state["free_allocation"] = st.number_input(
@@ -625,68 +722,18 @@ with tab_ets:
                 value=float(st.session_state["banked_allowances"]),
                 step=100.0,
             )
-
-        ets_summary = compute_ets(
+        ets_summary_live = compute_ets(
             scope1_tco2=float(energy_summary["scope1_tco2"]),
             free_allocation_tco2=float(st.session_state["free_allocation"]),
             banked_tco2=float(st.session_state["banked_allowances"]),
             eua_price=float(eua_price),
             fx_tl_per_eur=float(fx),
         )
-
         with right:
             st.markdown("### Çıktılar")
-            st.metric("Scope 1 total (tCO2)", f"{ets_summary['scope1_tco2']:.4f}")
-            st.metric("Net EUA requirement (tCO2)", f"{ets_summary['net_eua_requirement_tco2']:.4f}")
-            st.metric("ETS cost (TL)", format_tl(ets_summary["ets_cost_tl"]))
-
-        st.divider()
-        st.caption("Audit / PDF")
-        c1, c2 = st.columns(2)
-
-        with c1:
-            if st.button("ETS audit log yaz (runs.jsonl)", type="secondary", key="audit_ets"):
-                record = {
-                    "ts_utc": now_iso(),
-                    "app_version": APP_VERSION,
-                    "inputs": {
-                        "eua_price_eur_per_tco2": float(eua_price),
-                        "fx_tl_per_eur": float(fx),
-                        "upstream_source": upstream_source,
-                        "upstream_note": upstream_note,
-                        "ets_free_allocation_tco2": float(st.session_state["free_allocation"]),
-                        "ets_banked_allowances_tco2": float(st.session_state["banked_allowances"]),
-                        "has_energy_csv": True,
-                        "has_production_csv": production_file is not None,
-                    },
-                    "energy_summary": energy_summary,
-                    "ets_summary": ets_summary,
-                    "cbam_totals": None,
-                }
-                append_audit_log(record)
-                st.success("Audit log yazıldı: runs.jsonl")
-
-        with c2:
-            if PDF_AVAILABLE:
-                if st.button("ETS PDF raporu üret", type="primary", key="pdf_ets"):
-                    pdf_bytes = build_pdf_report(
-                        eua_price=float(eua_price),
-                        fx=float(fx),
-                        energy_summary=energy_summary,
-                        ets_summary=ets_summary,
-                        upstream_source=upstream_source,
-                        upstream_note=upstream_note,
-                        cbam_df=None,
-                        cbam_totals=None,
-                    )
-                    st.download_button(
-                        "PDF indir",
-                        data=pdf_bytes,
-                        file_name="cme_report_ets.pdf",
-                        mime="application/pdf",
-                    )
-            else:
-                st.warning("PDF üretimi için reportlab gerekli. requirements.txt içinde 'reportlab' olmalı.")
+            st.metric("Scope 1 total (tCO2)", f"{ets_summary_live['scope1_tco2']:.4f}")
+            st.metric("Net EUA requirement (tCO2)", f"{ets_summary_live['net_eua_requirement_tco2']:.4f}")
+            st.metric("ETS cost (TL)", format_tl(ets_summary_live["ets_cost_tl"]))
 
 st.divider()
 st.caption("Demo notu: CBAM ve ETS hesapları yönetim amaçlı tahmini çıktılardır; resmî beyan değildir.")
