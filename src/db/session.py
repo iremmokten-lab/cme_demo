@@ -36,6 +36,8 @@ def _sqlite_add_column_if_missing(table: str, col: str, ddl: str):
 
 
 def _ensure_sqlite_migrations():
+    """SQLite için minimal migration. Yeni tablolar create_all ile gelir.
+    Var olan tablolara eklenen kolonlar ALTER TABLE ile eklenir."""
     try:
         if not str(engine.url).startswith("sqlite"):
             return
@@ -46,6 +48,9 @@ def _ensure_sqlite_migrations():
         if "datasetuploads" in tables:
             _sqlite_add_column_if_missing("datasetuploads", "source", "source VARCHAR(200) DEFAULT ''")
             _sqlite_add_column_if_missing("datasetuploads", "document_ref", "document_ref VARCHAR(300) DEFAULT ''")
+            _sqlite_add_column_if_missing("datasetuploads", "evidence_document_id", "evidence_document_id INTEGER")
+            _sqlite_add_column_if_missing("datasetuploads", "data_quality_score", "data_quality_score INTEGER")
+            _sqlite_add_column_if_missing("datasetuploads", "data_quality_report_json", "data_quality_report_json TEXT DEFAULT '{}'")
 
         if "calculationsnapshots" in tables:
             _sqlite_add_column_if_missing("calculationsnapshots", "methodology_id", "methodology_id INTEGER")
@@ -60,25 +65,21 @@ def _ensure_sqlite_migrations():
 
 
 def _seed_minimum_reference_data():
-    """Boş DB'de minimum Methodology + EmissionFactor seed (Paket A için genişletildi)."""
+    """Boş DB'de minimum Methodology + EmissionFactor seed."""
     try:
         from sqlalchemy import select
 
         from src.db.models import EmissionFactor, Methodology
 
         demo_factors = [
-            # Grid
             ("grid:location", 0.42, "kgCO2e/kWh", "Demo varsayım", 2025, "v1", "TR"),
             ("grid:market", 0.10, "kgCO2e/kWh", "Demo varsayım", 2025, "v1", "TR"),
-            # Natural gas (Nm3)
             ("ncv:natural_gas", 0.038, "GJ/Nm3", "Demo varsayım", 2025, "v1", "TR"),
             ("ef:natural_gas", 0.0561, "tCO2/GJ", "Demo varsayım", 2025, "v1", "TR"),
             ("of:natural_gas", 0.995, "-", "Demo varsayım", 2025, "v1", "TR"),
-            # Diesel (L)
             ("ncv:diesel", 0.036, "GJ/L", "Demo varsayım", 2025, "v1", "TR"),
             ("ef:diesel", 0.0741, "tCO2/GJ", "Demo varsayım", 2025, "v1", "TR"),
             ("of:diesel", 0.995, "-", "Demo varsayım", 2025, "v1", "TR"),
-            # Coal (kg)
             ("ncv:coal", 0.025, "GJ/kg", "Demo varsayım", 2025, "v1", "TR"),
             ("ef:coal", 0.0946, "tCO2/GJ", "Demo varsayım", 2025, "v1", "TR"),
             ("of:coal", 0.98, "-", "Demo varsayım", 2025, "v1", "TR"),
@@ -99,7 +100,6 @@ def _seed_minimum_reference_data():
                     )
                 )
 
-            # Seed factors: sadece hiç yoksa ekle
             any_f = s.execute(select(EmissionFactor).limit(1)).scalars().first()
             if not any_f:
                 for ft, val, unit, src, yr, ver, reg in demo_factors:
