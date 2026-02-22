@@ -78,7 +78,6 @@ class EvidenceDocument(Base):
 
     uploaded_by_user_id = Column(Integer, nullable=True)
 
-    # İsteğe bağlı meta
     notes = Column(Text, default="")
 
     project = relationship("Project", back_populates="evidence_documents")
@@ -105,10 +104,9 @@ class DatasetUpload(Base):
     source = Column(String(200), default="")
     document_ref = Column(String(300), default="")
 
-    # Paket B: gerçek evidence dokümana bağlama
     evidence_document_id = Column(Integer, ForeignKey("evidencedocuments.id"), nullable=True, index=True)
 
-    # Paket B: data quality
+    # Data quality
     data_quality_score = Column(Integer, nullable=True)  # 0-100
     data_quality_report_json = Column(Text, default="{}")
 
@@ -180,10 +178,8 @@ class CalculationSnapshot(Base):
 
     result_hash = Column(String(64), nullable=False, index=True)
 
-    # Hash chain
     previous_snapshot_hash = Column(String(64), nullable=True, index=True)
 
-    # MRV / governance
     created_by_user_id = Column(Integer, nullable=True)
     locked = Column(Boolean, default=False)
     locked_at = Column(DateTime(timezone=True), nullable=True)
@@ -210,6 +206,22 @@ class Report(Base):
     snapshot = relationship("CalculationSnapshot", back_populates="reports")
 
 
+class AuditEvent(Base):
+    __tablename__ = "auditevents"
+
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+
+    event_type = Column(String(120), nullable=False, index=True)
+    entity_type = Column(String(120), default="", index=True)  # snapshot/report/evidence/upload
+    entity_id = Column(Integer, nullable=True, index=True)
+
+    details_json = Column(Text, default="{}")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -220,3 +232,8 @@ class User(Base):
 
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=True, index=True)
     company = relationship("Company", back_populates="users")
+
+    # Paket C: login güvenliği alanları
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    failed_login_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime(timezone=True), nullable=True)
