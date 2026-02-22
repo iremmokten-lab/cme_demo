@@ -1,44 +1,45 @@
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from src.db.session import db
+from src.db.models import Company, Facility, Project
 
-from src.db.models import Company, Project
+def list_companies_for_user(user):
+    with db() as s:
+        if user.role.startswith("consultant"):
+            return s.execute(select(Company).order_by(Company.name)).scalars().all()
+        # client -> sadece kendi company
+        if not user.company_id:
+            return []
+        c = s.get(Company, user.company_id)
+        return [c] if c else []
 
+def create_company(name: str) -> Company:
+    with db() as s:
+        c = Company(name=name.strip())
+        s.add(c)
+        s.commit()
+        s.refresh(c)
+        return c
 
-def list_companies(db: Session) -> list[Company]:
-    return db.query(Company).order_by(Company.name.asc()).all()
+def list_facilities(company_id: int):
+    with db() as s:
+        return s.execute(select(Facility).where(Facility.company_id == company_id).order_by(Facility.name)).scalars().all()
 
+def create_facility(company_id: int, name: str, country: str, sector: str):
+    with db() as s:
+        f = Facility(company_id=company_id, name=name.strip(), country=country.strip(), sector=sector.strip())
+        s.add(f)
+        s.commit()
+        s.refresh(f)
+        return f
 
-def get_or_create_company(db: Session, name: str) -> Company:
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("Company adı boş olamaz.")
+def list_projects(company_id: int):
+    with db() as s:
+        return s.execute(select(Project).where(Project.company_id == company_id).order_by(Project.created_at.desc())).scalars().all()
 
-    existing = db.query(Company).filter(Company.name == name).one_or_none()
-    if existing:
-        return existing
-
-    c = Company(name=name)
-    db.add(c)
-    db.commit()
-    db.refresh(c)
-    return c
-
-
-def list_projects(db: Session, company_id: int) -> list[Project]:
-    return (
-        db.query(Project)
-        .filter(Project.company_id == company_id)
-        .order_by(Project.created_at.desc())
-        .all()
-    )
-
-
-def create_project(db: Session, company_id: int, name: str) -> Project:
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("Project adı boş olamaz.")
-
-    p = Project(company_id=company_id, name=name)
-    db.add(p)
-    db.commit()
-    db.refresh(p)
-    return p
+def create_project(company_id: int, facility_id: int | None, name: str, year: int):
+    with db() as s:
+        p = Project(company_id=company_id, facility_id=facility_id, name=name.strip(), year=year)
+        s.add(p)
+        s.commit()
+        s.refresh(p)
+        return p
