@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from src.db.models import CalculationSnapshot, DatasetUpload, EvidenceDocument, Methodology, MonitoringPlan, Report, User
 from src.db.session import db
+from src.mrv.audit import append_audit, infer_company_id_for_snapshot, infer_company_id_for_user
 from src.mrv.lineage import sha256_bytes
 from src.services import projects as prj
 from src.services.exports import build_evidence_pack, build_zip, build_xlsx_from_results
@@ -80,6 +81,7 @@ def _save_upload_dedup(
     with db() as s:
         existing = _first_existing_upload(s, project_id, dataset_type, sha)
         if existing:
+            # ensure file exists
             try:
                 uri = getattr(existing, "storage_uri", None)
                 if uri:
@@ -98,7 +100,7 @@ def _save_upload_dedup(
             except Exception:
                 pass
 
-            # Paket B: data quality / evidence link update (best-effort)
+            # Paket B/C: data quality + evidence link update (best-effort)
             try:
                 changed = False
                 if existing.data_quality_score is None and data_quality_score is not None:
@@ -229,12 +231,10 @@ def _save_evidence_document(
     if cat not in EVIDENCE_DOCS_CATEGORIES:
         cat = "documents"
 
-    # path: storage/evidence/<cat>/<project_id>/<sha>_<filename>
     fp = EVIDENCE_DOCS_DIR / cat / f"project_{project_id}" / f"{sha}_{safe}"
     write_bytes(fp, file_bytes)
 
     with db() as s:
-        # dedup: aynı sha + project + category
         existing = (
             s.execute(
                 select(EvidenceDocument)
@@ -249,7 +249,6 @@ def _save_evidence_document(
             .first()
         )
         if existing:
-            # dosya yoksa yeniden yazılmış olabilir; storage_uri check
             try:
                 p = Path(str(existing.storage_uri))
                 if not p.exists():
@@ -309,6 +308,14 @@ def consultant_app(user):
                     st.warning("Tesis adı boş olamaz.")
                 else:
                     prj.create_facility(company_id, fn, cc, ss)
+                    append_audit(
+                        "facility_created",
+                        {"facility_name": fn, "country": cc, "sector": ss, "company_id": company_id},
+                        user_id=getattr(user, "id", None),
+                        company_id=int(company_id),
+                        entity_type="facility",
+                        entity_id=None,
+                    )
                     st.success("Tesis oluşturuldu.")
                     st.rerun()
 
@@ -320,7 +327,9 @@ def consultant_app(user):
                 method = st.selectbox(
                     "Yöntem",
                     ["standard", "mass_balance", "calculation", "measurement"],
-                    index=0 if not mp else (["standard", "mass_balance", "calculation", "measurement"].index(mp.method) if mp.method in ["standard", "mass_balance", "calculation", "measurement"] else 0),
+                    index=0
+                    if not mp
+                    else (["standard", "mass_balance", "calculation", "measurement"].index(mp.method) if mp.method in ["standard", "mass_balance", "calculation", "measurement"] else 0),
                     key="mp_method",
                 )
                 tier = st.selectbox(
@@ -341,6 +350,14 @@ def consultant_app(user):
                         data_source=str(data_source),
                         qa_procedure=str(qa_proc),
                         responsible_person=str(responsible),
+                    )
+                    append_audit(
+                        "monitoring_plan_saved",
+                        {"facility_id": int(facility_id), "method": method, "tier": tier},
+                        user_id=getattr(user, "id", None),
+                        company_id=int(company_id),
+                        entity_type="monitoring_plan",
+                        entity_id=int(facility_id),
                     )
                     st.success("Monitoring Plan kaydedildi ✅")
                     st.rerun()
@@ -378,6 +395,14 @@ def consultant_app(user):
                     st.warning("Proje adı boş olamaz.")
                 else:
                     newp = prj.create_project(company_id, facility_id, pn, int(py))
+                    append_audit(
+                        "project_created",
+                        {"project_id": newp.id, "name": pn, "year": int(py), "facility_id": facility_id},
+                        user_id=getattr(user, "id", None),
+                        company_id=int(company_id),
+                        entity_type="project",
+                        entity_id=newp.id,
+                    )
                     st.session_state["selected_project_id"] = newp.id
                     st.success(f"Proje oluşturuldu: id={newp.id}")
                     st.rerun()
@@ -424,6 +449,31 @@ def consultant_app(user):
         methodology_id = None
         if meth_sel != "(seçilmedi)":
             methodology_id = meths[meth_labels.index(meth_sel) - 1].id
+
+        with st.expander("Yeni metodoloji oluştur"):
+            mn = st.text_input("Metodoloji adı", key="meth_new_name")
+            mv = st.text_input("Versiyon", value="v1", key="meth_new_version")
+            ms = st.text_input("Kapsam", value="CBAM+ETS", key="meth_new_scope")
+            md = st.text_area("Açıklama", key="meth_new_desc")
+            if st.button("Metodolojiyi kaydet", type="primary", key="btn_create_meth"):
+                if not mn.strip():
+                    st.warning("Metodoloji adı boş olamaz.")
+                else:
+                    with db() as s:
+                        m = Methodology(name=mn.strip(), description=md or "", scope=ms.strip(), version=mv.strip() or "v1")
+                        s.add(m)
+                        s.commit()
+                        s.refresh(m)
+                    append_audit(
+                        "methodology_created",
+                        {"methodology_id": m.id, "name": m.name, "version": m.version},
+                        user_id=getattr(user, "id", None),
+                        company_id=int(company_id),
+                        entity_type="methodology",
+                        entity_id=m.id,
+                    )
+                    st.success("Metodoloji oluşturuldu ✅")
+                    st.rerun()
 
     config = {
         "region": str(region).strip() or "TR",
@@ -476,7 +526,7 @@ def consultant_app(user):
     tabs = st.tabs(
         [
             "Veri Yükleme",
-            "Evidence (Dokümanlar)",
+            "Evidence",
             "Hesaplama",
             "Senaryolar",
             "Raporlar ve İndirme",
@@ -488,13 +538,11 @@ def consultant_app(user):
     # Veri Yükleme
     with tabs[0]:
         st.subheader("CSV Yükleme (Data Quality ile)")
-
         st.caption(
-            "Paket B: Yükleme sırasında otomatik veri kalite kontrolleri yapılır ve 0–100 skor üretilir. "
-            "İstersen ilgili CSV’yi bir evidence dokümanına bağlayabilirsin (örn. fatura PDF’si)."
+            "Yükleme sırasında otomatik veri kalite kontrolleri yapılır ve 0–100 skor üretilir. "
+            "CSV’yi bir evidence dokümanına bağlayabilirsiniz."
         )
 
-        # Evidence seçimi (CSV upload'a bağlamak için)
         with db() as s:
             ev_docs = (
                 s.execute(
@@ -510,9 +558,7 @@ def consultant_app(user):
             ev_options[f"{ddoc.category} • {ddoc.original_filename} • {ddoc.sha256[:10]}… (id:{ddoc.id})"] = ddoc.id
         ev_sel = st.selectbox("CSV için doküman referansı (opsiyonel)", list(ev_options.keys()), index=0, key="csv_doc_ref_sel")
         evidence_document_id = ev_options[ev_sel]
-        document_ref_text = ""
-        if evidence_document_id:
-            document_ref_text = f"EvidenceDocument:{int(evidence_document_id)}"
+        document_ref_text = f"EvidenceDocument:{int(evidence_document_id)}" if evidence_document_id else ""
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -544,6 +590,22 @@ def consultant_app(user):
                 evidence_document_id=int(evidence_document_id) if evidence_document_id else None,
                 document_ref=document_ref_text,
             )
+
+            append_audit(
+                "dataset_uploaded",
+                {
+                    "project_id": project_id,
+                    "dataset_type": dtype,
+                    "sha256": sha,
+                    "data_quality_score": score,
+                    "evidence_document_id": int(evidence_document_id) if evidence_document_id else None,
+                },
+                user_id=getattr(user, "id", None),
+                company_id=int(company_id),
+                entity_type="dataset_upload",
+                entity_id=None,
+            )
+
             st.success(f"{dtype}.csv yüklendi ✅ (sha={sha[:10]}…) | Data Quality: {score}/100")
             with st.expander("Data Quality raporu", expanded=False):
                 st.json(report)
@@ -559,11 +621,7 @@ def consultant_app(user):
     # Evidence
     with tabs[1]:
         st.subheader("Evidence Dokümanları (Kurumsal)")
-
-        st.caption(
-            "Paket B: Dokümanları kategorilere göre saklayıp (documents/meter_readings/invoices/contracts) "
-            "CSV upload’larına referans olarak bağlayabilirsin."
-        )
+        st.caption("Dokümanları kategorilere göre saklar ve evidence pack’e otomatik dahil eder.")
 
         left, right = st.columns([2, 3])
 
@@ -584,6 +642,14 @@ def consultant_app(user):
                         file_bytes=bts,
                         user_id=getattr(user, "id", None),
                         notes=str(ev_notes or ""),
+                    )
+                    append_audit(
+                        "evidence_document_uploaded",
+                        {"project_id": project_id, "evidence_document_id": doc.id, "category": doc.category, "sha256": doc.sha256},
+                        user_id=getattr(user, "id", None),
+                        company_id=int(company_id),
+                        entity_type="evidence_document",
+                        entity_id=doc.id,
                     )
                     st.success(f"Evidence kaydedildi ✅ id={doc.id}")
                     st.rerun()
@@ -617,7 +683,6 @@ def consultant_app(user):
                     )
                 st.dataframe(rows, use_container_width=True)
 
-                # İndirme butonları
                 st.markdown("#### İndir")
                 pick = st.selectbox(
                     "Doküman seçin",
@@ -628,20 +693,31 @@ def consultant_app(user):
                 sel_doc = docs[[f"{d.category} • {d.original_filename} (id:{d.id})" for d in docs[:200]].index(pick)]
                 p = Path(str(sel_doc.storage_uri))
                 if p.exists():
-                    st.download_button(
+                    bts = p.read_bytes()
+                    if st.download_button(
                         "Seçili dokümanı indir",
-                        data=p.read_bytes(),
+                        data=bts,
                         file_name=sel_doc.original_filename,
                         mime="application/octet-stream",
                         use_container_width=True,
                         key=f"ev_dl_{sel_doc.id}",
-                    )
+                    ):
+                        append_audit(
+                            "evidence_document_downloaded",
+                            {"evidence_document_id": sel_doc.id, "project_id": project_id},
+                            user_id=getattr(user, "id", None),
+                            company_id=int(company_id),
+                            entity_type="evidence_document",
+                            entity_id=sel_doc.id,
+                        )
                 else:
                     st.warning("Dosya bulunamadı.")
 
     # Hesaplama
     with tabs[2]:
         st.subheader("Baseline Hesaplama (Regülasyon Yakın Motor)")
+        st.caption("Not: Aynı input+config varsa snapshot reuse devreye girer (workflow içinde).")
+
         if st.button("Baseline çalıştır", type="primary", key="btn_run_baseline"):
             try:
                 snap = run_full(
@@ -652,6 +728,14 @@ def consultant_app(user):
                     created_by_user_id=getattr(user, "id", None),
                 )
                 st.session_state["last_snapshot_id"] = snap.id
+                append_audit(
+                    "snapshot_created",
+                    {"project_id": project_id, "snapshot_id": snap.id, "scenario": None},
+                    user_id=getattr(user, "id", None),
+                    company_id=int(company_id),
+                    entity_type="snapshot",
+                    entity_id=snap.id,
+                )
                 st.success(f"Hesaplama tamamlandı ✅ Snapshot ID: {snap.id}")
             except Exception as e:
                 st.error("Hesaplama başarısız")
@@ -688,6 +772,14 @@ def consultant_app(user):
                     created_by_user_id=getattr(user, "id", None),
                 )
                 st.session_state["last_snapshot_id"] = snap.id
+                append_audit(
+                    "snapshot_created",
+                    {"project_id": project_id, "snapshot_id": snap.id, "scenario": scenario.get("name")},
+                    user_id=getattr(user, "id", None),
+                    company_id=int(company_id),
+                    entity_type="snapshot",
+                    entity_id=snap.id,
+                )
                 st.success(f"Senaryo tamamlandı ✅ Snapshot ID: {snap.id}")
                 st.rerun()
             except Exception as e:
@@ -715,6 +807,7 @@ def consultant_app(user):
 
         preferred_id = st.session_state.get("last_snapshot_id")
         labels = []
+        id_list = []
         for sn in snaps[:50]:
             r = _read_results(sn)
             scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
@@ -724,15 +817,14 @@ def consultant_app(user):
             share_tag = "👁️" if getattr(sn, "shared_with_client", False) else ""
             chain_tag = "⛓️" if getattr(sn, "previous_snapshot_hash", None) else ""
             labels.append(f"{lock_tag}{share_tag}{chain_tag} ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
+            id_list.append(sn.id)
 
         default_index = 0
         if preferred_id:
             try:
                 preferred_id = int(preferred_id)
-                for i, sn in enumerate(snaps[:50]):
-                    if sn.id == preferred_id:
-                        default_index = i
-                        break
+                if preferred_id in id_list:
+                    default_index = id_list.index(preferred_id)
             except Exception:
                 pass
 
@@ -740,32 +832,277 @@ def consultant_app(user):
         sn = snaps[labels.index(sel)]
         results = _read_results(sn)
 
-        colA, colB, colC = st.columns(3)
+        append_audit(
+            "snapshot_viewed",
+            {"snapshot_id": sn.id, "project_id": project_id},
+            user_id=getattr(user, "id", None),
+            company_id=int(company_id),
+            entity_type="snapshot",
+            entity_id=sn.id,
+        )
+
+        # Snapshot yönetimi
+        st.markdown("#### Snapshot Yönetimi")
+        mcol1, mcol2, mcol3 = st.columns([1, 1, 2])
+
+        with mcol1:
+            if getattr(sn, "locked", False):
+                st.success("Durum: Kilitli 🔒")
+                if st.button("Kilidi aç", key="btn_unlock"):
+                    with db() as s:
+                        obj = s.get(CalculationSnapshot, sn.id)
+                        if obj:
+                            obj.locked = False
+                            obj.locked_at = None
+                            obj.locked_by_user_id = None
+                            s.add(obj)
+                            s.commit()
+                    append_audit(
+                        "snapshot_unlocked",
+                        {"snapshot_id": sn.id},
+                        user_id=getattr(user, "id", None),
+                        company_id=int(company_id),
+                        entity_type="snapshot",
+                        entity_id=sn.id,
+                    )
+                    st.rerun()
+            else:
+                st.info("Durum: Kilitsiz")
+                if st.button("Snapshot'ı kilitle", type="primary", key="btn_lock"):
+                    with db() as s:
+                        obj = s.get(CalculationSnapshot, sn.id)
+                        if obj:
+                            obj.locked = True
+                            obj.locked_at = datetime.now(timezone.utc)
+                            obj.locked_by_user_id = getattr(user, "id", None)
+                            s.add(obj)
+                            s.commit()
+                    append_audit(
+                        "snapshot_locked",
+                        {"snapshot_id": sn.id},
+                        user_id=getattr(user, "id", None),
+                        company_id=int(company_id),
+                        entity_type="snapshot",
+                        entity_id=sn.id,
+                    )
+                    st.rerun()
+
+        with mcol2:
+            shared = bool(getattr(sn, "shared_with_client", False))
+            new_shared = st.toggle("Müşteri ile paylaş", value=shared, key=f"toggle_share_{sn.id}")
+            if new_shared != shared:
+                with db() as s:
+                    obj = s.get(CalculationSnapshot, sn.id)
+                    if obj:
+                        obj.shared_with_client = bool(new_shared)
+                        s.add(obj)
+                        s.commit()
+                append_audit(
+                    "snapshot_shared_toggled",
+                    {"snapshot_id": sn.id, "shared_with_client": bool(new_shared)},
+                    user_id=getattr(user, "id", None),
+                    company_id=int(company_id),
+                    entity_type="snapshot",
+                    entity_id=sn.id,
+                )
+                st.rerun()
+
+        with mcol3:
+            prev_hash = getattr(sn, "previous_snapshot_hash", None)
+            st.caption(f"Engine: {getattr(sn, 'engine_version', '-')}")
+            st.caption(f"Result hash: {(sn.result_hash[:16] + '…') if getattr(sn, 'result_hash', None) else '-'}")
+            st.caption(f"Previous hash: {(prev_hash[:16] + '…') if prev_hash else '(yok)'}")
+
+        # KPI özet
+        st.divider()
+        kpis = (results.get("kpis") or {}) if isinstance(results, dict) else {}
+        cbam_prec = (((results.get("cbam") or {}).get("totals") or {}).get("precursor_tco2", 0))
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Direct (tCO2)", _fmt_tr(kpis.get("direct_tco2", 0), 3))
+        c2.metric("Indirect (tCO2)", _fmt_tr(kpis.get("indirect_tco2", 0), 3))
+        c3.metric("Precursor (tCO2)", _fmt_tr(cbam_prec, 3))
+        c4.metric("CBAM (€)", _fmt_tr(kpis.get("cbam_cost_eur", 0), 2))
+        c5.metric("ETS (TL)", _fmt_tr(kpis.get("ets_cost_tl", 0), 2))
+
+        st.divider()
+        colA, colB, colC, colD, colE = st.columns(5)
+
+        pdf_bytes = None
         with colA:
-            zip_bytes = build_zip(sn.id, sn.results_json or "{}")
-            st.download_button("ZIP indir (JSON + XLSX)", data=zip_bytes, file_name=f"snapshot_{sn.id}.zip", mime="application/zip", use_container_width=True)
+            if st.button("PDF üret", type="primary", key="btn_make_pdf"):
+                try:
+                    try:
+                        snap_config = json.loads(sn.config_json) if sn.config_json else {}
+                    except Exception:
+                        snap_config = {}
+
+                    meth_payload = None
+                    if getattr(sn, "methodology_id", None):
+                        with db() as s:
+                            m = s.get(Methodology, int(sn.methodology_id))
+                        meth_payload = _get_methodology_dict(m)
+
+                    payload = {
+                        "kpis": kpis,
+                        "config": snap_config,
+                        "cbam_table": results.get("cbam_table", []),
+                        "scenario": results.get("scenario", {}),
+                        "methodology": meth_payload,
+                        "data_sources": [
+                            "energy.csv (yüklenen dosya)",
+                            "production.csv (yüklenen dosya)",
+                            "materials.csv (opsiyonel, precursor)",
+                            "EmissionFactor Library (DB)",
+                            "Monitoring Plan (DB, facility bazlı)",
+                        ],
+                        "formulas": [
+                            "Direct emissions: fuel_quantity × NCV × emission_factor × oxidation_factor",
+                            "Indirect emissions: electricity_kwh × grid_factor (location/market)",
+                            "Precursor emissions: materials.material_quantity × materials.emission_factor",
+                            "CBAM exposure (demo): embedded_tCO2 × EUA × export_share",
+                        ],
+                    }
+
+                    title = "Rapor — CBAM + ETS (Regülasyon Yakın, Tahmini)"
+                    scen = payload.get("scenario") or {}
+                    if isinstance(scen, dict) and scen.get("name"):
+                        title = f"Senaryo Raporu — {scen.get('name')} (Tahmini)"
+
+                    pdf_uri, pdf_sha = build_pdf(sn.id, title, payload)
+
+                    # report kaydı (dedup)
+                    try:
+                        with db() as s:
+                            ex = (
+                                s.execute(
+                                    select(Report)
+                                    .where(
+                                        Report.snapshot_id == sn.id,
+                                        Report.report_type == "pdf",
+                                        Report.sha256 == pdf_sha,
+                                    )
+                                    .limit(1)
+                                )
+                                .scalars()
+                                .first()
+                            )
+                            if not ex:
+                                s.add(Report(snapshot_id=sn.id, report_type="pdf", storage_uri=str(pdf_uri), sha256=pdf_sha))
+                                s.commit()
+                    except Exception:
+                        pass
+
+                    p = Path(str(pdf_uri))
+                    if p.exists():
+                        pdf_bytes = p.read_bytes()
+
+                    append_audit(
+                        "report_generated",
+                        {"snapshot_id": sn.id, "sha256": pdf_sha},
+                        user_id=getattr(user, "id", None),
+                        company_id=infer_company_id_for_snapshot(sn.id) or int(company_id),
+                        entity_type="report",
+                        entity_id=sn.id,
+                    )
+
+                    st.success("PDF üretildi ✅")
+                except Exception as e:
+                    st.error("PDF üretilemedi")
+                    st.exception(e)
 
         with colB:
+            zip_bytes = build_zip(sn.id, sn.results_json or "{}")
+            if st.download_button(
+                "ZIP indir (JSON + XLSX)",
+                data=zip_bytes,
+                file_name=f"snapshot_{sn.id}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            ):
+                append_audit(
+                    "zip_exported",
+                    {"snapshot_id": sn.id},
+                    user_id=getattr(user, "id", None),
+                    company_id=infer_company_id_for_snapshot(sn.id) or int(company_id),
+                    entity_type="zip",
+                    entity_id=sn.id,
+                )
+
+        with colC:
             xlsx_bytes = build_xlsx_from_results(sn.results_json or "{}")
-            st.download_button(
+            if st.download_button(
                 "XLSX indir",
                 data=xlsx_bytes,
                 file_name=f"snapshot_{sn.id}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
-            )
+            ):
+                append_audit(
+                    "xlsx_exported",
+                    {"snapshot_id": sn.id},
+                    user_id=getattr(user, "id", None),
+                    company_id=infer_company_id_for_snapshot(sn.id) or int(company_id),
+                    entity_type="xlsx",
+                    entity_id=sn.id,
+                )
 
-        with colC:
-            ep = build_evidence_pack(sn.id)
-            st.download_button(
-                "Evidence Pack (ZIP) — Signed",
-                data=ep,
-                file_name=f"evidence_pack_snapshot_{sn.id}.zip",
-                mime="application/zip",
+        with colD:
+            if st.download_button(
+                "JSON indir",
+                data=(sn.results_json or "{}").encode("utf-8"),
+                file_name=f"snapshot_{sn.id}.json",
+                mime="application/json",
                 use_container_width=True,
-                type="primary" if getattr(sn, "locked", False) else "secondary",
-            )
-            st.caption("Not: İmza için env var `EVIDENCE_SIGNING_KEY` set edilmeli. Yoksa signature=null olur.")
+            ):
+                append_audit(
+                    "json_exported",
+                    {"snapshot_id": sn.id},
+                    user_id=getattr(user, "id", None),
+                    company_id=infer_company_id_for_snapshot(sn.id) or int(company_id),
+                    entity_type="json",
+                    entity_id=sn.id,
+                )
+
+        with colE:
+            try:
+                ep = build_evidence_pack(sn.id)
+                if st.download_button(
+                    "Evidence Pack (ZIP)",
+                    data=ep,
+                    file_name=f"evidence_pack_snapshot_{sn.id}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    type="primary" if getattr(sn, "locked", False) else "secondary",
+                ):
+                    append_audit(
+                        "evidence_exported",
+                        {"snapshot_id": sn.id, "locked": bool(getattr(sn, "locked", False))},
+                        user_id=getattr(user, "id", None),
+                        company_id=infer_company_id_for_snapshot(sn.id) or int(company_id),
+                        entity_type="evidence_pack",
+                        entity_id=sn.id,
+                    )
+            except Exception as e:
+                st.error("Evidence pack üretilemedi")
+                st.exception(e)
+
+        if pdf_bytes:
+            if st.download_button(
+                "PDF indir (az önce üretilen)",
+                data=pdf_bytes,
+                file_name=f"snapshot_{sn.id}.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+            ):
+                append_audit(
+                    "report_exported",
+                    {"snapshot_id": sn.id},
+                    user_id=getattr(user, "id", None),
+                    company_id=infer_company_id_for_snapshot(sn.id) or int(company_id),
+                    entity_type="report",
+                    entity_id=sn.id,
+                )
 
     # Geçmiş
     with tabs[5]:
@@ -777,25 +1114,55 @@ def consultant_app(user):
                 .scalars()
                 .all()
             )
+            snaps = (
+                s.execute(select(CalculationSnapshot).where(CalculationSnapshot.project_id == project_id).order_by(CalculationSnapshot.created_at.desc()))
+                .scalars()
+                .all()
+            )
+
+        st.markdown("#### Yüklemeler")
         if uploads:
-            rows = []
-            for u in uploads[:300]:
-                dq = u.data_quality_score
-                rows.append(
+            st.dataframe(
+                [
                     {
                         "ID": u.id,
                         "Tür": u.dataset_type,
                         "Dosya": u.original_filename,
                         "Tarih": u.uploaded_at,
-                        "DQ": f"{dq}/100" if dq is not None else "",
+                        "DQ": f"{u.data_quality_score}/100" if u.data_quality_score is not None else "",
                         "DocRef": u.document_ref or "",
                         "EvidenceID": u.evidence_document_id or "",
                         "SHA": (u.sha256[:10] + "…") if u.sha256 else "",
                     }
+                    for u in uploads
+                ],
+                use_container_width=True,
+            )
+        else:
+            st.info("Henüz upload yok.")
+
+        st.markdown("#### Snapshot'lar")
+        if snaps:
+            rows = []
+            for sn in snaps:
+                r = _read_results(sn)
+                scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
+                kind = "Senaryo" if scen else "Baseline"
+                name = scen.get("name") if scen else ""
+                rows.append(
+                    {
+                        "ID": sn.id,
+                        "Tür": f"{kind}{(' — ' + name) if name else ''}",
+                        "Tarih": sn.created_at,
+                        "Kilitli": bool(getattr(sn, "locked", False)),
+                        "Paylaşıldı": bool(getattr(sn, "shared_with_client", False)),
+                        "Metodoloji": getattr(sn, "methodology_id", None),
+                        "Prev Hash": "Var" if getattr(sn, "previous_snapshot_hash", None) else "Yok",
+                    }
                 )
             st.dataframe(rows, use_container_width=True)
         else:
-            st.info("Henüz upload yok.")
+            st.info("Henüz snapshot yok.")
 
     # Kullanıcılar
     with tabs[6]:
@@ -824,12 +1191,21 @@ def consultant_app(user):
                 st.warning("E-posta ve şifre zorunlu.")
             else:
                 with db() as s:
-                    existing = s.execute(select(User).where(User.email == new_email).limit(1)).scalars().first()
+                    existing = s.execute(select(User).where(User.email == new_email.strip().lower()).limit(1)).scalars().first()
                     if existing:
                         st.error("Bu e-posta zaten kayıtlı.")
                     else:
-                        u = User(email=new_email.strip(), password_hash=_hash_pw(new_pw), role=role, company_id=company_id)
+                        u = User(email=new_email.strip().lower(), password_hash=_hash_pw(new_pw), role=role, company_id=company_id)
                         s.add(u)
                         s.commit()
+                        s.refresh(u)
+                append_audit(
+                    "user_created",
+                    {"created_user_email": new_email.strip().lower(), "role": role},
+                    user_id=getattr(user, "id", None),
+                    company_id=int(company_id),
+                    entity_type="user",
+                    entity_id=getattr(u, "id", None),
+                )
                 st.success("Kullanıcı oluşturuldu ✅")
                 st.rerun()
