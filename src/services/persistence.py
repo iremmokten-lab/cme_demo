@@ -14,6 +14,7 @@ def save_upload(
     schema_version: str = "v1",
 ) -> DatasetUpload:
     h = sha256_bytes(content_bytes)
+
     u = DatasetUpload(
         project_id=project_id,
         dataset_type=dataset_type,
@@ -37,6 +38,7 @@ def save_snapshot(
     results: dict,
 ) -> CalculationSnapshot:
     result_hash = sha256_json({"config": config, "inputs": input_hashes, "results": results})
+
     s = CalculationSnapshot(
         project_id=project_id,
         engine_version=engine_version,
