@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
@@ -5,9 +7,9 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import select
 
+from src.db.models import CalculationSnapshot, Project, Report
 from src.db.session import db
-from src.db.models import Project, CalculationSnapshot, Report
-from src.services.exports import build_zip, build_xlsx_from_results
+from src.services.exports import build_evidence_pack, build_zip, build_xlsx_from_results
 from src.services.reporting import build_pdf
 
 
@@ -35,11 +37,7 @@ def client_app(user):
 
     with db() as s:
         projects = (
-            s.execute(
-                select(Project)
-                .where(Project.company_id == user.company_id)
-                .order_by(Project.created_at.desc())
-            )
+            s.execute(select(Project).where(Project.company_id == user.company_id).order_by(Project.created_at.desc()))
             .scalars()
             .all()
         )
@@ -48,11 +46,12 @@ def client_app(user):
         st.warning("Henüz proje yok.")
         st.markdown(
             """
-**Ne yapılmalı?**
-- Danışman proje oluşturmalı
-- CSV’ler yüklenmeli
-- Baseline veya Senaryo çalıştırılmalı
-"""
+            **Ne yapılmalı?**
+            - Danışman proje oluşturmalı
+            - CSV’ler yüklenmeli
+            - Baseline veya Senaryo çalıştırılmalı
+            - Snapshot paylaşılmalı (👁️)
+            """
         )
         return
 
@@ -61,7 +60,7 @@ def client_app(user):
     project = projects[project_labels.index(psel)]
 
     with db() as s:
-        snaps = (
+        snaps_all = (
             s.execute(
                 select(CalculationSnapshot)
                 .where(CalculationSnapshot.project_id == project.id)
@@ -71,8 +70,11 @@ def client_app(user):
             .all()
         )
 
+    # Müşteriye sadece paylaşılan snapshot'ları göster
+    snaps = [sn for sn in snaps_all if bool(getattr(sn, "shared_with_client", False))]
+
     if not snaps:
-        st.warning("Bu proje için henüz snapshot yok.")
+        st.info("Bu proje için henüz paylaşılan snapshot yok. (Danışman panelinden 'Müşteri ile paylaş' açılmalı.)")
         return
 
     snap_labels = []
@@ -81,7 +83,8 @@ def client_app(user):
         scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
         kind = "Senaryo" if scen else "Baseline"
         name = scen.get("name") if scen else ""
-        snap_labels.append(f"ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
+        lock_tag = "🔒" if getattr(sn, "locked", False) else ""
+        snap_labels.append(f"{lock_tag} ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
 
     sel = st.selectbox("Snapshot seçin", snap_labels, index=0)
     snapshot = snaps[snap_labels.index(sel)]
@@ -99,7 +102,7 @@ def client_app(user):
 
     # Trend
     st.divider()
-    st.subheader("Trend (son 20 snapshot)")
+    st.subheader("Trend (son 20 paylaşılan snapshot)")
     trend_rows = []
     for sn in reversed(snaps[:20]):
         r = _read_results(sn)
@@ -131,22 +134,26 @@ def client_app(user):
             .all()
         )
 
-    # ---- YENİ: PDF yoksa üretme butonu
     if not reports:
         st.info("Bu snapshot için henüz PDF rapor yok.")
         if st.button("PDF üret (bu snapshot)", type="primary"):
             try:
+                try:
+                    cfg = json.loads(snapshot.config_json or "{}")
+                except Exception:
+                    cfg = {}
                 payload = {
                     "kpis": kpis,
-                    "config": json.loads(snapshot.config_json or "{}"),
+                    "config": cfg,
                     "cbam_table": results.get("cbam_table", []),
                     "scenario": results.get("scenario", {}),
                 }
-                pdf_uri, pdf_sha = build_pdf(
-                    snapshot.id,
-                    "CME Demo Raporu — CBAM + ETS (Tahmini)",
-                    payload,
-                )
+                title = "CME Demo Raporu — CBAM + ETS (Tahmini)"
+                scen = payload.get("scenario") or {}
+                if isinstance(scen, dict) and scen.get("name"):
+                    title = f"Senaryo Raporu — {scen.get('name')} (Tahmini)"
+
+                pdf_uri, pdf_sha = build_pdf(snapshot.id, title, payload)
 
                 # DB’ye kaydet (duplicate olsa da patlamasın)
                 try:
@@ -181,7 +188,7 @@ def client_app(user):
             created = getattr(r, "created_at", None)
             sha = getattr(r, "sha256", None)
             cols = st.columns([4, 2])
-            cols[0].write(f"📄 {created} • sha:{(sha[:10] + '…') if sha else '-'}")
+            cols[0].write(f"{created} • sha:{(sha[:10] + '…') if sha else '-'}")
             if uri:
                 p = Path(str(uri))
                 if p.exists():
@@ -199,8 +206,8 @@ def client_app(user):
     # Export
     st.divider()
     st.subheader("Export / İndirme")
+    colA, colB, colC, colD = st.columns(4)
 
-    colA, colB, colC = st.columns(3)
     try:
         zip_bytes = build_zip(snapshot.id, snapshot.results_json or "{}")
         colA.download_button(
@@ -234,3 +241,21 @@ def client_app(user):
         mime="application/json",
         use_container_width=True,
     )
+
+    # Evidence pack
+    if getattr(snapshot, "locked", False):
+        try:
+            ep = build_evidence_pack(snapshot.id)
+            colD.download_button(
+                "Evidence Pack (ZIP)",
+                data=ep,
+                file_name=f"evidence_pack_snapshot_{snapshot.id}.zip",
+                mime="application/zip",
+                use_container_width=True,
+                type="primary",
+            )
+        except Exception as e:
+            colD.error("Evidence pack üretilemedi")
+            colD.exception(e)
+    else:
+        colD.info("Evidence pack için snapshot kilitli olmalı (🔒).")
