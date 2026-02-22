@@ -8,12 +8,7 @@ from sqlalchemy import select
 from src.db.session import db
 from src.db.models import Project, CalculationSnapshot, Report
 from src.services.exports import build_zip, build_xlsx_from_results
-
-# mail opsiyonel: secrets yoksa panel kırılmasın
-try:
-    from src.services.mailer import send_pdf_mail
-except Exception:
-    send_pdf_mail = None
+from src.services.reporting import build_pdf
 
 
 def _fmt_tr(x, digits=2) -> str:
@@ -31,22 +26,13 @@ def _read_results(snapshot: CalculationSnapshot) -> dict:
         return {}
 
 
-def _read_kpis(snapshot: CalculationSnapshot) -> dict:
-    r = _read_results(snapshot)
-    return (r.get("kpis") or {}) if isinstance(r, dict) else {}
-
-
 def client_app(user):
     st.title("Müşteri Kontrol Paneli")
 
     if not getattr(user, "company_id", None):
-        st.error("Bu kullanıcıya şirket atanmadı. (company_id boş)")
-        st.info("Lütfen danışman/admin kullanıcı şirket ataması yapsın.")
+        st.error("Bu kullanıcıya şirket atanmadı.")
         return
 
-    # -------------------------
-    # Projeler
-    # -------------------------
     with db() as s:
         projects = (
             s.execute(
@@ -62,20 +48,18 @@ def client_app(user):
         st.warning("Henüz proje yok.")
         st.markdown(
             """
-**Ne yapmalısınız?**
-- Danışman panelinden bir proje oluşturulmalı
-- energy.csv ve production.csv yüklenmeli
+**Ne yapılmalı?**
+- Danışman proje oluşturmalı
+- CSV’ler yüklenmeli
 - Baseline veya Senaryo çalıştırılmalı
-            """
+"""
         )
         return
 
-    # Üst seçim alanı
     project_labels = [f"{p.name} / {p.year} (id:{p.id})" for p in projects]
     psel = st.selectbox("Proje seçin", project_labels, index=0)
     project = projects[project_labels.index(psel)]
 
-    # Snapshotlar
     with db() as s:
         snaps = (
             s.execute(
@@ -89,24 +73,15 @@ def client_app(user):
 
     if not snaps:
         st.warning("Bu proje için henüz snapshot yok.")
-        st.markdown(
-            """
-**Ne yapmalısınız?**
-- Danışman panelinde **Hesaplama** sekmesinden Baseline çalıştırın
-- veya **Senaryolar** sekmesinden senaryo çalıştırın
-            """
-        )
         return
 
-    # Snapshot seçimi: varsayılan en yeni
     snap_labels = []
     for sn in snaps[:50]:
         r = _read_results(sn)
         scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
         kind = "Senaryo" if scen else "Baseline"
         name = scen.get("name") if scen else ""
-        label = f"ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}"
-        snap_labels.append(label)
+        snap_labels.append(f"ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
 
     sel = st.selectbox("Snapshot seçin", snap_labels, index=0)
     snapshot = snaps[snap_labels.index(sel)]
@@ -114,26 +89,21 @@ def client_app(user):
     results = _read_results(snapshot)
     kpis = (results.get("kpis") or {}) if isinstance(results, dict) else {}
 
-    # -------------------------
-    # Özet KPI Kartları
-    # -------------------------
+    # KPI
     st.subheader("KPI Özeti")
-
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Toplam Emisyon (tCO2)", _fmt_tr(kpis.get("energy_total_tco2", 0), 3))
     c2.metric("Scope-1 (tCO2)", _fmt_tr(kpis.get("energy_scope1_tco2", 0), 3))
-    c3.metric("CBAM Maliyeti (€)", _fmt_tr(kpis.get("cbam_cost_eur", 0), 2))
-    c4.metric("ETS Maliyeti (TL)", _fmt_tr(kpis.get("ets_cost_tl", 0), 2))
+    c3.metric("CBAM (€)", _fmt_tr(kpis.get("cbam_cost_eur", 0), 2))
+    c4.metric("ETS (TL)", _fmt_tr(kpis.get("ets_cost_tl", 0), 2))
 
-    # -------------------------
-    # Trend Grafikleri (son 20 snapshot)
-    # -------------------------
+    # Trend
     st.divider()
     st.subheader("Trend (son 20 snapshot)")
-
     trend_rows = []
-    for sn in reversed(snaps[:20]):  # eski -> yeni
-        k = _read_kpis(sn)
+    for sn in reversed(snaps[:20]):
+        r = _read_results(sn)
+        k = (r.get("kpis") or {}) if isinstance(r, dict) else {}
         trend_rows.append(
             {
                 "Tarih": sn.created_at,
@@ -142,15 +112,11 @@ def client_app(user):
                 "ETS (TL)": float(k.get("ets_cost_tl", 0) or 0),
             }
         )
-
     if trend_rows:
         df = pd.DataFrame(trend_rows).set_index("Tarih")
-        # Streamlit varsayılan renkler
         st.line_chart(df)
 
-    # -------------------------
-    # Raporlar (PDF)
-    # -------------------------
+    # PDF Raporlar
     st.divider()
     st.subheader("PDF Raporlar")
 
@@ -165,24 +131,63 @@ def client_app(user):
             .all()
         )
 
+    # ---- YENİ: PDF yoksa üretme butonu
     if not reports:
-        st.info("Bu snapshot için henüz PDF rapor yok (danışman üretmiş olmalı).")
+        st.info("Bu snapshot için henüz PDF rapor yok.")
+        if st.button("PDF üret (bu snapshot)", type="primary"):
+            try:
+                payload = {
+                    "kpis": kpis,
+                    "config": json.loads(snapshot.config_json or "{}"),
+                    "cbam_table": results.get("cbam_table", []),
+                    "scenario": results.get("scenario", {}),
+                }
+                pdf_uri, pdf_sha = build_pdf(
+                    snapshot.id,
+                    "CME Demo Raporu — CBAM + ETS (Tahmini)",
+                    payload,
+                )
+
+                # DB’ye kaydet (duplicate olsa da patlamasın)
+                try:
+                    with db() as s:
+                        ex = (
+                            s.execute(
+                                select(Report)
+                                .where(
+                                    Report.snapshot_id == snapshot.id,
+                                    Report.report_type == "pdf",
+                                    Report.sha256 == pdf_sha,
+                                )
+                                .limit(1)
+                            )
+                            .scalars()
+                            .first()
+                        )
+                        if not ex:
+                            s.add(Report(snapshot_id=snapshot.id, report_type="pdf", storage_uri=pdf_uri, sha256=pdf_sha))
+                            s.commit()
+                except Exception:
+                    pass
+
+                st.success("PDF üretildi ✅")
+                st.rerun()
+            except Exception as e:
+                st.error("PDF üretimi başarısız.")
+                st.exception(e)
     else:
         for r in reports:
             uri = getattr(r, "storage_uri", None)
             created = getattr(r, "created_at", None)
             sha = getattr(r, "sha256", None)
-
-            cols = st.columns([4, 2, 2])
-            cols[0].write(f"📄 PDF • {created} • sha:{(sha[:10] + '…') if sha else '-'}")
-
+            cols = st.columns([4, 2])
+            cols[0].write(f"📄 {created} • sha:{(sha[:10] + '…') if sha else '-'}")
             if uri:
                 p = Path(str(uri))
                 if p.exists():
-                    data = p.read_bytes()
                     cols[1].download_button(
                         "PDF indir",
-                        data=data,
+                        data=p.read_bytes(),
                         file_name=p.name,
                         mime="application/pdf",
                         key=f"client_pdf_{r.id}",
@@ -190,34 +195,8 @@ def client_app(user):
                     )
                 else:
                     cols[1].warning("Dosya bulunamadı")
-            else:
-                cols[1].warning("URI yok")
 
-            # Mail opsiyonel
-            if send_pdf_mail is None:
-                cols[2].caption("Mail özelliği kapalı")
-            else:
-                with cols[2]:
-                    with st.popover("📧 Mail ile gönder"):
-                        to_email = st.text_input("Alıcı e-posta", key=f"mail_to_{r.id}")
-                        if st.button("Gönder", key=f"send_{r.id}", type="primary"):
-                            try:
-                                if not to_email:
-                                    st.warning("E-posta girin.")
-                                else:
-                                    p = Path(str(uri))
-                                    if not p.exists():
-                                        st.error("PDF dosyası bulunamadı.")
-                                    else:
-                                        send_pdf_mail(to_email, p.read_bytes(), p.name)
-                                        st.success("Gönderildi ✅")
-                            except Exception as e:
-                                st.error("Mail gönderimi başarısız.")
-                                st.exception(e)
-
-    # -------------------------
-    # Export (ZIP/XLSX/JSON)
-    # -------------------------
+    # Export
     st.divider()
     st.subheader("Export / İndirme")
 
@@ -248,14 +227,10 @@ def client_app(user):
         colB.error("XLSX üretilemedi")
         colB.exception(e)
 
-    try:
-        colC.download_button(
-            "JSON indir",
-            data=(snapshot.results_json or "{}").encode("utf-8"),
-            file_name=f"snapshot_{snapshot.id}.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-    except Exception as e:
-        colC.error("JSON hazırlanamadı")
-        colC.exception(e)
+    colC.download_button(
+        "JSON indir",
+        data=(snapshot.results_json or "{}").encode("utf-8"),
+        file_name=f"snapshot_{snapshot.id}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
