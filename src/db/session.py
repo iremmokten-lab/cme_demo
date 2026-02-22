@@ -36,8 +36,6 @@ def _sqlite_add_column_if_missing(table: str, col: str, ddl: str):
 
 
 def _ensure_sqlite_migrations():
-    """SQLite için minimal migration. Yeni tablolar create_all ile gelir.
-    Var olan tablolara eklenen kolonlar ALTER TABLE ile eklenir."""
     try:
         if not str(engine.url).startswith("sqlite"):
             return
@@ -60,12 +58,16 @@ def _ensure_sqlite_migrations():
             _sqlite_add_column_if_missing("calculationsnapshots", "locked_by_user_id", "locked_by_user_id INTEGER")
             _sqlite_add_column_if_missing("calculationsnapshots", "shared_with_client", "shared_with_client BOOLEAN DEFAULT 0")
             _sqlite_add_column_if_missing("calculationsnapshots", "previous_snapshot_hash", "previous_snapshot_hash VARCHAR(64)")
+
+        if "users" in tables:
+            _sqlite_add_column_if_missing("users", "last_login_at", "last_login_at DATETIME")
+            _sqlite_add_column_if_missing("users", "failed_login_attempts", "failed_login_attempts INTEGER DEFAULT 0")
+            _sqlite_add_column_if_missing("users", "locked_until", "locked_until DATETIME")
     except Exception:
         return
 
 
 def _seed_minimum_reference_data():
-    """Boş DB'de minimum Methodology + EmissionFactor seed."""
     try:
         from sqlalchemy import select
 
@@ -92,8 +94,8 @@ def _seed_minimum_reference_data():
                     Methodology(
                         name="Demo Metodoloji (CBAM+ETS)",
                         description=(
-                            "Paket A motoru ile: yakıt bazlı direct, elektrik bazlı indirect, "
-                            "materials.csv üzerinden precursor; CBAM kapsamı CN code + cbam_covered ile belirlenir."
+                            "Yakıt bazlı direct, elektrik bazlı indirect, materials.csv üzerinden precursor. "
+                            "CBAM kapsamı CN code + cbam_covered ile belirlenir."
                         ),
                         scope="CBAM+ETS",
                         version="v1",
