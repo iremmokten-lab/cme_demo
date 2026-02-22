@@ -104,7 +104,7 @@ def consultant_app(user):
     st.title("Danışman Kontrol Paneli")
 
     # =======================
-    # SOL MENÜ: şirket/tesis/proje + parametreler
+    # SOL MENÜ
     # =======================
     try:
         companies = prj.list_companies_for_user(user)
@@ -135,10 +135,10 @@ def consultant_app(user):
         facility_id = fac_opts[fac_label]
 
         with st.expander("Yeni tesis oluştur"):
-            fn = st.text_input("Tesis adı")
-            cc = st.text_input("Ülke", value="TR")
-            ss = st.text_input("Sektör", value="")
-            if st.button("Tesis ekle"):
+            fn = st.text_input("Tesis adı", key="new_facility_name")
+            cc = st.text_input("Ülke", value="TR", key="new_facility_country")
+            ss = st.text_input("Sektör", value="", key="new_facility_sector")
+            if st.button("Tesis ekle", key="btn_add_facility"):
                 try:
                     if not fn.strip():
                         st.warning("Tesis adı boş olamaz.")
@@ -147,41 +147,73 @@ def consultant_app(user):
                         st.success("Tesis oluşturuldu.")
                         st.rerun()
                 except Exception as e:
+                    st.error("Tesis oluşturulamadı.")
                     st.exception(e)
 
         st.markdown("### Proje")
+
+        # ---- Kritik düzeltme:
+        # Projeleri önce, "(yeni proje oluştur)" seçeneğini en sona koyuyoruz.
         projects = prj.list_projects(company_id)
-        proj_opts = {"(yeni proje oluştur)": None}
+
+        proj_items = []
         for p in projects:
             year = getattr(p, "year", "")
-            proj_opts[f"{p.name} / {year} (id:{p.id})"] = p.id
-        psel = st.selectbox("Proje seçin", list(proj_opts.keys()), index=0)
+            label = f"{p.name} / {year} (id:{p.id})"
+            proj_items.append((label, p.id))
 
-        if psel == "(yeni proje oluştur)":
-            pn = st.text_input("Proje adı")
-            py = st.number_input("Yıl", 2000, 2100, 2026)
-            if st.button("Proje oluştur", type="primary"):
+        NEW_LABEL = "(yeni proje oluştur)"
+        proj_labels = [lbl for (lbl, _) in proj_items] + [NEW_LABEL]
+
+        # Varsayılan seçimi boş bırakmayalım: projeler varsa ilk projeyi seç
+        if "project_select_label" not in st.session_state:
+            st.session_state["project_select_label"] = proj_labels[0] if proj_items else NEW_LABEL
+
+        psel = st.selectbox(
+            "Proje seçin",
+            proj_labels,
+            key="project_select_label",
+        )
+
+        if psel == NEW_LABEL:
+            pn = st.text_input("Proje adı", key="new_project_name")
+            py = st.number_input("Yıl", 2000, 2100, 2025, key="new_project_year")
+
+            if st.button("Proje oluştur", type="primary", key="btn_create_project"):
                 try:
                     if not pn.strip():
                         st.warning("Proje adı boş olamaz.")
                     else:
                         newp = prj.create_project(company_id, facility_id, pn, int(py))
+                        # Yeni projeyi otomatik seç
+                        new_label = f"{newp.name} / {newp.year} (id:{newp.id})"
+                        st.session_state["project_select_label"] = new_label
                         st.success(f"Proje oluşturuldu: id={newp.id}")
                         st.rerun()
                 except Exception as e:
+                    st.error("Proje oluşturulamadı.")
                     st.exception(e)
 
             st.info("Devam etmek için proje oluşturun veya mevcut bir proje seçin.")
             st.stop()
 
-        project_id = proj_opts[psel]
+        # psel bir proje label’ı => id’sini bulalım
+        project_id = None
+        for lbl, pid in proj_items:
+            if lbl == psel:
+                project_id = pid
+                break
+
+        if project_id is None:
+            st.error("Seçili proje bulunamadı. Lütfen sayfayı yenileyin.")
+            st.stop()
 
         st.divider()
         st.markdown("### Parametreler")
-        eua = st.slider("EUA fiyatı (€/t)", 0.0, 300.0, 80.0)
-        fx = st.number_input("Kur (TL/€)", value=35.0)
-        free_alloc = st.number_input("Ücretsiz tahsis (tCO2)", value=0.0)
-        banked = st.number_input("Banked / devreden (tCO2)", value=0.0)
+        eua = st.slider("EUA fiyatı (€/t)", 0.0, 300.0, 80.0, key="param_eua")
+        fx = st.number_input("Kur (TL/€)", value=35.0, key="param_fx")
+        free_alloc = st.number_input("Ücretsiz tahsis (tCO2)", value=0.0, key="param_free")
+        banked = st.number_input("Banked / devreden (tCO2)", value=0.0, key="param_banked")
 
     config = {
         "eua_price_eur": float(eua),
@@ -191,7 +223,7 @@ def consultant_app(user):
     }
 
     # =======================
-    # ÜST DASHBOARD (boş görünmesin)
+    # ÜST DASHBOARD
     # =======================
     st.subheader("Proje Özeti")
 
@@ -231,7 +263,6 @@ def consultant_app(user):
     elif not last_snaps:
         st.info("CSV’ler var. Şimdi Hesaplama veya Senaryolar sekmesinden snapshot üretin.")
     else:
-        # Son KPI hızlı göster
         r = _read_results(last_snaps[0])
         k = (r.get("kpis") or {}) if isinstance(r, dict) else {}
         k1, k2, k3, k4 = st.columns(4)
@@ -255,14 +286,10 @@ def consultant_app(user):
         ]
     )
 
-    # =======================
     # 1) VERİ YÜKLEME
-    # =======================
     with tabs[0]:
         st.subheader("CSV Yükleme")
         st.caption("Aynı dosya tekrar yüklenirse yeni kayıt açılmaz (dedup).")
-
-        st.markdown("**Şablon notu:** Dosya kolonları mevcut doğrulayıcıya (validate_csv) uygun olmalı.")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -289,43 +316,10 @@ def consultant_app(user):
         _handle_upload(up_energy, "energy")
         _handle_upload(up_prod, "production")
 
-        st.divider()
-        st.subheader("Son yüklemeler")
-        with db() as s:
-            uploads = (
-                s.execute(
-                    select(DatasetUpload)
-                    .where(DatasetUpload.project_id == project_id)
-                    .order_by(DatasetUpload.uploaded_at.desc())
-                    .limit(20)
-                )
-                .scalars()
-                .all()
-            )
-        if uploads:
-            st.dataframe(
-                [
-                    {
-                        "ID": u.id,
-                        "Tür": u.dataset_type,
-                        "Dosya": u.original_filename,
-                        "SHA": (u.sha256[:12] + "…") if u.sha256 else "",
-                        "Tarih": u.uploaded_at,
-                    }
-                    for u in uploads
-                ],
-                use_container_width=True,
-            )
-        else:
-            st.info("Henüz upload yok.")
-
-    # =======================
     # 2) HESAPLAMA
-    # =======================
     with tabs[1]:
         st.subheader("Hesaplama (Baseline)")
-
-        if st.button("Baseline çalıştır", type="primary"):
+        if st.button("Baseline çalıştır", type="primary", key="btn_run_baseline"):
             try:
                 snap = run_full(project_id, config=config, scenario=None)
                 st.success(f"Hesaplama tamamlandı ✅ Snapshot ID: {snap.id} (hash={snap.result_hash[:10]}…)")
@@ -333,21 +327,17 @@ def consultant_app(user):
                 st.error("Hesaplama başarısız.")
                 st.exception(e)
 
-    # =======================
     # 3) SENARYOLAR
-    # =======================
     with tabs[2]:
         st.subheader("Senaryolar")
-        st.caption("Senaryo çalıştırınca yeni bir snapshot oluşur.")
-
         left, right = st.columns(2)
         with left:
-            scen_name = st.text_input("Senaryo adı", value="Senaryo 1")
-            renewable_share_pct = st.slider("Yenilenebilir enerji payı (%)", 0, 100, 0)
-            energy_reduction_pct = st.slider("Enerji tüketimi azaltımı (%)", 0, 100, 0)
+            scen_name = st.text_input("Senaryo adı", value="Senaryo 1", key="scen_name")
+            renewable_share_pct = st.slider("Yenilenebilir enerji payı (%)", 0, 100, 0, key="scen_ren")
+            energy_reduction_pct = st.slider("Enerji tüketimi azaltımı (%)", 0, 100, 0, key="scen_red")
         with right:
-            supplier_factor_multiplier = st.slider("Tedarikçi emisyon faktörü çarpanı", 0.50, 2.00, 1.00, 0.05)
-            export_mix_multiplier = st.slider("AB ihracat miktarı çarpanı", 0.00, 2.00, 1.00, 0.05)
+            supplier_factor_multiplier = st.slider("Tedarikçi emisyon faktörü çarpanı", 0.50, 2.00, 1.00, 0.05, key="scen_sup")
+            export_mix_multiplier = st.slider("AB ihracat miktarı çarpanı", 0.00, 2.00, 1.00, 0.05, key="scen_exp")
 
         scenario = {
             "name": scen_name.strip() or "Senaryo",
@@ -357,7 +347,7 @@ def consultant_app(user):
             "export_mix_multiplier": float(export_mix_multiplier),
         }
 
-        if st.button("Senaryoyu çalıştır", type="primary"):
+        if st.button("Senaryoyu çalıştır", type="primary", key="btn_run_scenario"):
             try:
                 snap = run_full(project_id, config=config, scenario=scenario)
                 st.success(f"Senaryo tamamlandı ✅ Snapshot ID: {snap.id} (hash={snap.result_hash[:10]}…)")
@@ -365,80 +355,7 @@ def consultant_app(user):
                 st.error("Senaryo çalıştırma başarısız.")
                 st.exception(e)
 
-        st.divider()
-        st.subheader("Hızlı karşılaştırma (son Baseline vs son Senaryo)")
-
-        def _latest_snapshot_by_kind(kind: str):
-            with db() as s:
-                xs = (
-                    s.execute(
-                        select(CalculationSnapshot)
-                        .where(CalculationSnapshot.project_id == project_id)
-                        .order_by(CalculationSnapshot.created_at.desc())
-                    )
-                    .scalars()
-                    .all()
-                )
-            for sn in xs:
-                r = _read_results(sn)
-                scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
-                is_scenario = bool(scen)
-                if kind == "scenario" and is_scenario:
-                    return sn, r
-                if kind == "baseline" and not is_scenario:
-                    return sn, r
-            return None, {}
-
-        base_sn, base_r = _latest_snapshot_by_kind("baseline")
-        scen_sn, scen_r = _latest_snapshot_by_kind("scenario")
-
-        if not base_sn and not scen_sn:
-            st.info("Karşılaştırma için önce baseline veya senaryo çalıştırın.")
-        else:
-            base_k = (base_r.get("kpis") or {}) if isinstance(base_r, dict) else {}
-            scen_k = (scen_r.get("kpis") or {}) if isinstance(scen_r, dict) else {}
-
-            a, b, c, d = st.columns(4)
-            a.metric(
-                "Toplam Emisyon (tCO2)",
-                _fmt_tr(scen_k.get("energy_total_tco2", 0), 3) if scen_sn else "-",
-                (
-                    _fmt_tr((scen_k.get("energy_total_tco2", 0) - base_k.get("energy_total_tco2", 0)), 3)
-                    if (scen_sn and base_sn)
-                    else None
-                ),
-            )
-            b.metric(
-                "Scope-1 (tCO2)",
-                _fmt_tr(scen_k.get("energy_scope1_tco2", 0), 3) if scen_sn else "-",
-                (
-                    _fmt_tr((scen_k.get("energy_scope1_tco2", 0) - base_k.get("energy_scope1_tco2", 0)), 3)
-                    if (scen_sn and base_sn)
-                    else None
-                ),
-            )
-            c.metric(
-                "CBAM (€)",
-                _fmt_tr(scen_k.get("cbam_cost_eur", 0), 2) if scen_sn else "-",
-                (
-                    _fmt_tr((scen_k.get("cbam_cost_eur", 0) - base_k.get("cbam_cost_eur", 0)), 2)
-                    if (scen_sn and base_sn)
-                    else None
-                ),
-            )
-            d.metric(
-                "ETS (TL)",
-                _fmt_tr(scen_k.get("ets_cost_tl", 0), 2) if scen_sn else "-",
-                (
-                    _fmt_tr((scen_k.get("ets_cost_tl", 0) - base_k.get("ets_cost_tl", 0)), 2)
-                    if (scen_sn and base_sn)
-                    else None
-                ),
-            )
-
-    # =======================
     # 4) RAPORLAR / EXPORT
-    # =======================
     with tabs[3]:
         st.subheader("Raporlar ve İndirme")
 
@@ -454,10 +371,9 @@ def consultant_app(user):
             )
 
         if not snaps:
-            st.info("Önce bir snapshot üretin (Hesaplama veya Senaryolar).")
+            st.info("Önce snapshot üretin (Hesaplama / Senaryolar).")
             st.stop()
 
-        # Snapshot seçimi
         labels = []
         for sn in snaps[:50]:
             r = _read_results(sn)
@@ -466,7 +382,7 @@ def consultant_app(user):
             name = scen.get("name") if scen else ""
             labels.append(f"ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
 
-        sel = st.selectbox("Snapshot seçin", labels, index=0)
+        sel = st.selectbox("Snapshot seçin", labels, index=0, key="report_snap_select")
         sn = snaps[labels.index(sel)]
 
         results = _read_results(sn)
@@ -476,23 +392,11 @@ def consultant_app(user):
         except Exception:
             snap_config = {}
 
-        # KPI özet
-        st.markdown("#### Özet KPI")
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Toplam Emisyon (tCO2)", _fmt_tr(kpis.get("energy_total_tco2", 0), 3))
-        k2.metric("Scope-1 (tCO2)", _fmt_tr(kpis.get("energy_scope1_tco2", 0), 3))
-        k3.metric("CBAM (€)", _fmt_tr(kpis.get("cbam_cost_eur", 0), 2))
-        k4.metric("ETS (TL)", _fmt_tr(kpis.get("ets_cost_tl", 0), 2))
-
-        st.divider()
-
-        # Export butonları her zaman görünür
         colA, colB, colC, colD = st.columns(4)
 
-        # PDF üret + indir
         pdf_bytes = None
         with colA:
-            if st.button("PDF üret", type="primary"):
+            if st.button("PDF üret", type="primary", key="btn_make_pdf"):
                 try:
                     payload = {
                         "kpis": kpis,
@@ -500,13 +404,8 @@ def consultant_app(user):
                         "cbam_table": results.get("cbam_table", []),
                         "scenario": results.get("scenario", {}),
                     }
-                    pdf_uri, pdf_sha = build_pdf(
-                        sn.id,
-                        "CME Demo Raporu — CBAM + ETS (Tahmini)",
-                        payload,
-                    )
+                    pdf_uri, pdf_sha = build_pdf(sn.id, "CME Demo Raporu — CBAM + ETS (Tahmini)", payload)
 
-                    # Report kaydı: duplicate olsa da patlamasın
                     try:
                         with db() as s:
                             ex = (
@@ -531,42 +430,32 @@ def consultant_app(user):
                     p = Path(str(pdf_uri))
                     if p.exists():
                         pdf_bytes = p.read_bytes()
+
                     st.success("PDF üretildi ✅")
                 except Exception as e:
                     st.error("PDF üretimi başarısız.")
                     st.exception(e)
 
-        # ZIP
         with colB:
-            try:
-                zip_bytes = build_zip(sn.id, sn.results_json or "{}")
-                st.download_button(
-                    "ZIP indir",
-                    data=zip_bytes,
-                    file_name=f"snapshot_{sn.id}.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.error("ZIP üretilemedi.")
-                st.exception(e)
+            zip_bytes = build_zip(sn.id, sn.results_json or "{}")
+            st.download_button(
+                "ZIP indir",
+                data=zip_bytes,
+                file_name=f"snapshot_{sn.id}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
 
-        # XLSX
         with colC:
-            try:
-                xlsx_bytes = build_xlsx_from_results(sn.results_json or "{}")
-                st.download_button(
-                    "XLSX indir",
-                    data=xlsx_bytes,
-                    file_name=f"snapshot_{sn.id}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.error("XLSX üretilemedi.")
-                st.exception(e)
+            xlsx_bytes = build_xlsx_from_results(sn.results_json or "{}")
+            st.download_button(
+                "XLSX indir",
+                data=xlsx_bytes,
+                file_name=f"snapshot_{sn.id}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
-        # JSON
         with colD:
             st.download_button(
                 "JSON indir",
@@ -586,50 +475,9 @@ def consultant_app(user):
                 use_container_width=True,
             )
 
-        st.divider()
-        st.subheader("Bu snapshot için kayıtlı PDF’ler")
-
-        with db() as s:
-            reps = (
-                s.execute(
-                    select(Report)
-                    .where(Report.snapshot_id == sn.id, Report.report_type == "pdf")
-                    .order_by(Report.created_at.desc())
-                )
-                .scalars()
-                .all()
-            )
-
-        if not reps:
-            st.info("Kayıtlı PDF yok.")
-        else:
-            for r in reps:
-                uri = getattr(r, "storage_uri", None)
-                created = getattr(r, "created_at", None)
-                sha = getattr(r, "sha256", None)
-                if not uri:
-                    continue
-                p = Path(str(uri))
-                cols = st.columns([4, 2])
-                cols[0].write(f"📄 {created} • sha:{(sha[:10] + '…') if sha else '-'}")
-                if p.exists():
-                    cols[1].download_button(
-                        "İndir",
-                        data=p.read_bytes(),
-                        file_name=p.name,
-                        mime="application/pdf",
-                        key=f"cons_pdf_{r.id}",
-                        use_container_width=True,
-                    )
-                else:
-                    cols[1].warning("Dosya bulunamadı")
-
-    # =======================
     # 5) GEÇMİŞ
-    # =======================
     with tabs[4]:
         st.subheader("Geçmiş")
-
         with db() as s:
             uploads = (
                 s.execute(
@@ -654,13 +502,7 @@ def consultant_app(user):
         if uploads:
             st.dataframe(
                 [
-                    {
-                        "ID": u.id,
-                        "Tür": u.dataset_type,
-                        "Dosya": u.original_filename,
-                        "SHA": (u.sha256[:12] + "…") if u.sha256 else "",
-                        "Tarih": u.uploaded_at,
-                    }
+                    {"ID": u.id, "Tür": u.dataset_type, "Dosya": u.original_filename, "Tarih": u.uploaded_at}
                     for u in uploads
                 ],
                 use_container_width=True,
@@ -682,7 +524,6 @@ def consultant_app(user):
                         "Tür": f"{kind}{(' — ' + name) if name else ''}",
                         "Hash": (sn.result_hash[:12] + "…") if sn.result_hash else "",
                         "Tarih": sn.created_at,
-                        "Engine": sn.engine_version,
                     }
                 )
             st.dataframe(rows, use_container_width=True)
