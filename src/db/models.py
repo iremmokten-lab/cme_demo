@@ -60,6 +60,29 @@ class Project(Base):
     facility = relationship("Facility", back_populates="projects")
     uploads = relationship("DatasetUpload", back_populates="project", cascade="all, delete-orphan")
     snapshots = relationship("CalculationSnapshot", back_populates="project", cascade="all, delete-orphan")
+    evidence_documents = relationship("EvidenceDocument", back_populates="project", cascade="all, delete-orphan")
+
+
+class EvidenceDocument(Base):
+    __tablename__ = "evidencedocuments"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+
+    category = Column(String(50), nullable=False, default="documents")  # documents / meter_readings / invoices / contracts
+    uploaded_at = Column(DateTime(timezone=True), default=utcnow)
+    original_filename = Column(String(300), nullable=False)
+
+    sha256 = Column(String(64), nullable=False, index=True)
+    storage_uri = Column(String(500), nullable=False)
+
+    uploaded_by_user_id = Column(Integer, nullable=True)
+
+    # İsteğe bağlı meta
+    notes = Column(Text, default="")
+
+    project = relationship("Project", back_populates="evidence_documents")
+    dataset_uploads = relationship("DatasetUpload", back_populates="evidence_document")
 
 
 class DatasetUpload(Base):
@@ -82,7 +105,15 @@ class DatasetUpload(Base):
     source = Column(String(200), default="")
     document_ref = Column(String(300), default="")
 
+    # Paket B: gerçek evidence dokümana bağlama
+    evidence_document_id = Column(Integer, ForeignKey("evidencedocuments.id"), nullable=True, index=True)
+
+    # Paket B: data quality
+    data_quality_score = Column(Integer, nullable=True)  # 0-100
+    data_quality_report_json = Column(Text, default="{}")
+
     project = relationship("Project", back_populates="uploads")
+    evidence_document = relationship("EvidenceDocument", back_populates="dataset_uploads")
 
 
 class Methodology(Base):
@@ -103,12 +134,6 @@ class EmissionFactor(Base):
 
     id = Column(Integer, primary_key=True)
 
-    # Önerilen factor_type convention (Paket A):
-    # - ncv:<fuel_type>                 value: GJ / fuel_unit
-    # - ef:<fuel_type>                  value: tCO2 / GJ
-    # - of:<fuel_type>                  value: oxidation factor (0-1)
-    # - grid:location                   value: kgCO2e / kWh
-    # - grid:market                     value: kgCO2e / kWh
     factor_type = Column(String(120), nullable=False, index=True)
     value = Column(Float, nullable=False)
     unit = Column(String(80), nullable=False, default="")
@@ -155,7 +180,7 @@ class CalculationSnapshot(Base):
 
     result_hash = Column(String(64), nullable=False, index=True)
 
-    # Hash chain (Paket A)
+    # Hash chain
     previous_snapshot_hash = Column(String(64), nullable=True, index=True)
 
     # MRV / governance
