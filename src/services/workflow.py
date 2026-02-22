@@ -1,40 +1,56 @@
+from __future__ import annotations
+
 import json
+
 import pandas as pd
 from sqlalchemy import select
 
 from src.db.session import db
-from src.db.models import DatasetUpload, CalculationSnapshot
-from src.mrv.lineage import sha256_json
+from src.db.models import CalculationSnapshot, DatasetUpload
 from src.mrv.audit import append_audit
+from src.mrv.lineage import sha256_json
+from src.engine.cbam import cbam_cost
 from src.engine.emissions import energy_emissions_kg
 from src.engine.ets import ets_cost_tl
-from src.engine.cbam import cbam_cost
 from src.engine.scenarios import apply_scenarios
-from src.services.storage import UPLOAD_DIR
-from pathlib import Path
 
-ENGINE_VERSION = "engine-0.5.0"
+ENGINE_VERSION = "engine-0.6.0"
+
 
 def load_csv_from_uri(uri: str) -> pd.DataFrame:
     return pd.read_csv(uri)
 
-def latest_upload_uri(project_id: int, dataset_type: str) -> str | None:
+
+def latest_upload(project_id: int, dataset_type: str) -> DatasetUpload | None:
     with db() as s:
-        u = s.execute(
-            select(DatasetUpload)
-            .where(DatasetUpload.project_id == project_id, DatasetUpload.dataset_type == dataset_type)
-            .order_by(DatasetUpload.uploaded_at.desc())
-        ).scalars().first()
-        return u.storage_uri if u else None
+        return (
+            s.execute(
+                select(DatasetUpload)
+                .where(DatasetUpload.project_id == project_id, DatasetUpload.dataset_type == dataset_type)
+                .order_by(DatasetUpload.uploaded_at.desc())
+            )
+            .scalars()
+            .first()
+        )
 
-def run_full(project_id: int, config: dict, scenario: dict | None = None) -> CalculationSnapshot:
-    energy_uri = latest_upload_uri(project_id, "energy")
-    prod_uri = latest_upload_uri(project_id, "production")
 
-    if not energy_uri:
+def run_full(
+    project_id: int,
+    config: dict,
+    scenario: dict | None = None,
+    methodology_id: int | None = None,
+    created_by_user_id: int | None = None,
+) -> CalculationSnapshot:
+    energy_u = latest_upload(project_id, "energy")
+    prod_u = latest_upload(project_id, "production")
+
+    if not energy_u:
         raise ValueError("energy.csv yüklenmemiş.")
-    if not prod_uri:
+    if not prod_u:
         raise ValueError("production.csv yüklenmemiş.")
+
+    energy_uri = str(energy_u.storage_uri)
+    prod_uri = str(prod_u.storage_uri)
 
     energy_df = load_csv_from_uri(energy_uri)
     prod_df = load_csv_from_uri(prod_uri)
@@ -83,9 +99,23 @@ def run_full(project_id: int, config: dict, scenario: dict | None = None) -> Cal
         "scenario": scenario,
     }
 
-    # MRV hashes
-    input_hashes = {"energy_uri": energy_uri, "production_uri": prod_uri}
-    result_hash = sha256_json({"config": config, "inputs": input_hashes, "results": results})
+    # MRV hashes (input lineage)
+    input_hashes = {
+        "energy": {
+            "uri": energy_uri,
+            "sha256": getattr(energy_u, "sha256", ""),
+            "original_filename": getattr(energy_u, "original_filename", ""),
+            "schema_version": getattr(energy_u, "schema_version", "v1"),
+        },
+        "production": {
+            "uri": prod_uri,
+            "sha256": getattr(prod_u, "sha256", ""),
+            "original_filename": getattr(prod_u, "original_filename", ""),
+            "schema_version": getattr(prod_u, "schema_version", "v1"),
+        },
+    }
+
+    result_hash = sha256_json({"engine_version": ENGINE_VERSION, "config": config, "inputs": input_hashes, "results": results})
 
     snap = CalculationSnapshot(
         project_id=project_id,
@@ -94,6 +124,10 @@ def run_full(project_id: int, config: dict, scenario: dict | None = None) -> Cal
         input_hashes_json=json.dumps(input_hashes, ensure_ascii=False),
         results_json=json.dumps(results, ensure_ascii=False),
         result_hash=result_hash,
+        methodology_id=methodology_id,
+        created_by_user_id=created_by_user_id,
+        locked=False,
+        shared_with_client=False,
     )
 
     with db() as s:
@@ -101,5 +135,12 @@ def run_full(project_id: int, config: dict, scenario: dict | None = None) -> Cal
         s.commit()
         s.refresh(snap)
 
-    append_audit("snapshot_created", {"project_id": project_id, "snapshot_id": snap.id, "hash": result_hash})
+    try:
+        append_audit(
+            "snapshot_created",
+            {"project_id": project_id, "snapshot_id": snap.id, "hash": result_hash, "engine_version": ENGINE_VERSION},
+        )
+    except Exception:
+        pass
+
     return snap
