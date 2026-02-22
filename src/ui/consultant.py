@@ -1,3 +1,4 @@
+from src.ui.lang import TR
 import json
 import streamlit as st
 import pandas as pd
