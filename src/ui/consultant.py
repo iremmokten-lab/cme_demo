@@ -1,21 +1,22 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
+import bcrypt
 import pandas as pd
 import streamlit as st
 from sqlalchemy import select
 
+from src.db.models import CalculationSnapshot, DatasetUpload, Methodology, Report, User
 from src.db.session import db
-from src.db.models import DatasetUpload, CalculationSnapshot, Report, User
 from src.mrv.lineage import sha256_bytes
 from src.services import projects as prj
-from src.services.exports import build_zip, build_xlsx_from_results
+from src.services.exports import build_evidence_pack, build_zip, build_xlsx_from_results
 from src.services.ingestion import validate_csv
 from src.services.reporting import build_pdf
 from src.services.storage import UPLOAD_DIR, write_bytes
 from src.services.workflow import run_full
-
-import bcrypt
 
 
 def _hash_pw(pw: str) -> str:
@@ -23,7 +24,7 @@ def _hash_pw(pw: str) -> str:
 
 
 def _safe_name(name: str) -> str:
-    return (name or "").replace("/", "_").replace("\\", "_").strip()
+    return (name or "").replace("/", "_").replace("\\\\", "_").strip()
 
 
 def _fmt_tr(x, digits=2) -> str:
@@ -100,6 +101,24 @@ def _save_upload_dedup(
         s.add(u)
         s.commit()
     return sha
+
+
+def _list_methodologies() -> list[Methodology]:
+    with db() as s:
+        return s.execute(select(Methodology).order_by(Methodology.created_at.desc())).scalars().all()
+
+
+def _get_methodology_dict(m: Methodology | None) -> dict | None:
+    if not m:
+        return None
+    return {
+        "id": m.id,
+        "name": m.name,
+        "description": m.description,
+        "scope": m.scope,
+        "version": m.version,
+        "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
+    }
 
 
 def consultant_app(user):
@@ -189,6 +208,31 @@ def consultant_app(user):
         free_alloc = st.number_input("Ücretsiz tahsis (tCO2)", value=0.0, key="param_free")
         banked = st.number_input("Banked / devreden (tCO2)", value=0.0, key="param_banked")
 
+        st.divider()
+        st.markdown("### Metodoloji")
+        meths = _list_methodologies()
+        meth_labels = ["(seçilmedi)"] + [f"{m.name} • {m.version} (id:{m.id})" for m in meths]
+        meth_sel = st.selectbox("Metodoloji seçin", meth_labels, index=0, key="meth_select")
+        methodology_id = None
+        if meth_sel != "(seçilmedi)":
+            methodology_id = meths[meth_labels.index(meth_sel) - 1].id
+
+        with st.expander("Yeni metodoloji oluştur"):
+            mn = st.text_input("Metodoloji adı", key="meth_new_name")
+            mv = st.text_input("Versiyon", value="v1", key="meth_new_version")
+            ms = st.text_input("Kapsam", value="CBAM+ETS", key="meth_new_scope")
+            md = st.text_area("Açıklama", key="meth_new_desc")
+            if st.button("Metodolojiyi kaydet", type="primary", key="btn_create_meth"):
+                if not mn.strip():
+                    st.warning("Metodoloji adı boş olamaz.")
+                else:
+                    with db() as s:
+                        m = Methodology(name=mn.strip(), description=md or "", scope=ms.strip(), version=mv.strip() or "v1")
+                        s.add(m)
+                        s.commit()
+                    st.success("Metodoloji oluşturuldu ✅")
+                    st.rerun()
+
     config = {
         "eua_price_eur": float(eua),
         "fx_tl_per_eur": float(fx),
@@ -272,16 +316,23 @@ def consultant_app(user):
     # Hesaplama
     with tabs[1]:
         st.subheader("Baseline Hesaplama")
+        st.caption("Not: Seçili metodoloji snapshot içine kaydedilir ve PDF/evidence pack içinde yer alır.")
         if st.button("Baseline çalıştır", type="primary", key="btn_run_baseline"):
             try:
-                snap = run_full(project_id, config=config, scenario=None)
+                snap = run_full(
+                    project_id,
+                    config=config,
+                    scenario=None,
+                    methodology_id=methodology_id,
+                    created_by_user_id=getattr(user, "id", None),
+                )
                 st.session_state["last_snapshot_id"] = snap.id
                 st.success(f"Hesaplama tamamlandı ✅ Snapshot ID: {snap.id}")
             except Exception as e:
                 st.error("Hesaplama başarısız")
                 st.exception(e)
 
-    # Senaryolar (SONUÇ GÖSTERİMİ EKLİ)
+    # Senaryolar
     with tabs[2]:
         st.subheader("Senaryolar")
 
@@ -304,7 +355,13 @@ def consultant_app(user):
 
         if st.button("Senaryoyu çalıştır", type="primary", key="btn_run_scenario"):
             try:
-                snap = run_full(project_id, config=config, scenario=scenario)
+                snap = run_full(
+                    project_id,
+                    config=config,
+                    scenario=scenario,
+                    methodology_id=methodology_id,
+                    created_by_user_id=getattr(user, "id", None),
+                )
                 st.session_state["last_snapshot_id"] = snap.id
                 st.success(f"Senaryo tamamlandı ✅ Snapshot ID: {snap.id} (hash={snap.result_hash[:10]}…)")
                 st.rerun()
@@ -312,7 +369,7 @@ def consultant_app(user):
                 st.error("Senaryo başarısız")
                 st.exception(e)
 
-        # ---- YENİ: Son üretilen snapshot sonucu burada görünsün
+        # Son üretilen snapshot sonucu
         last_id = st.session_state.get("last_snapshot_id")
         if last_id:
             with db() as s:
@@ -330,10 +387,9 @@ def consultant_app(user):
 
                 if st.button("Bu sonucu Raporlar sekmesinde aç", key="btn_go_reports"):
                     st.session_state["open_reports_for_snapshot_id"] = last_snap.id
-                    st.session_state["active_tab"] = "reports"
                     st.rerun()
 
-    # Raporlar ve İndirme (OTOMATİK SNAPSHOT SEÇİMİ)
+    # Raporlar ve İndirme
     with tabs[3]:
         st.subheader("Raporlar ve İndirme")
 
@@ -352,7 +408,6 @@ def consultant_app(user):
             st.info("Önce snapshot üretin.")
             st.stop()
 
-        # Otomatik seçim: son senaryo/baseline id’si varsa onu seç
         preferred_id = st.session_state.get("open_reports_for_snapshot_id") or st.session_state.get("last_snapshot_id")
 
         labels = []
@@ -362,7 +417,9 @@ def consultant_app(user):
             scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
             kind = "Senaryo" if scen else "Baseline"
             name = scen.get("name") if scen else ""
-            labels.append(f"ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
+            lock_tag = "🔒" if getattr(sn, "locked", False) else ""
+            share_tag = "👁️" if getattr(sn, "shared_with_client", False) else ""
+            labels.append(f"{lock_tag}{share_tag} ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
             id_list.append(sn.id)
 
         default_index = 0
@@ -376,8 +433,6 @@ def consultant_app(user):
 
         sel = st.selectbox("Snapshot seçin", labels, index=default_index, key="report_snap_select")
         sn = snaps[labels.index(sel)]
-
-        # bir kere kullandıktan sonra temizle
         st.session_state.pop("open_reports_for_snapshot_id", None)
 
         results = _read_results(sn)
@@ -387,19 +442,91 @@ def consultant_app(user):
         except Exception:
             snap_config = {}
 
-        colA, colB, colC, colD = st.columns(4)
+        # Yönetim: kilit & paylaşım
+        st.markdown("#### Snapshot Yönetimi")
+        mcol1, mcol2, mcol3 = st.columns([1, 1, 2])
+
+        with mcol1:
+            if getattr(sn, "locked", False):
+                st.success("Durum: Kilitli 🔒")
+                if st.button("Kilidi aç", key="btn_unlock"):
+                    with db() as s:
+                        obj = s.get(CalculationSnapshot, sn.id)
+                        if obj:
+                            obj.locked = False
+                            obj.locked_at = None
+                            obj.locked_by_user_id = None
+                            s.add(obj)
+                            s.commit()
+                    st.rerun()
+            else:
+                st.info("Durum: Kilitsiz")
+                if st.button("Snapshot'ı kilitle", type="primary", key="btn_lock"):
+                    with db() as s:
+                        obj = s.get(CalculationSnapshot, sn.id)
+                        if obj:
+                            obj.locked = True
+                            from datetime import datetime, timezone
+
+                            obj.locked_at = datetime.now(timezone.utc)
+                            obj.locked_by_user_id = getattr(user, "id", None)
+                            s.add(obj)
+                            s.commit()
+                    st.rerun()
+
+        with mcol2:
+            shared = bool(getattr(sn, "shared_with_client", False))
+            new_shared = st.toggle("Müşteri ile paylaş", value=shared, key=f"toggle_share_{sn.id}")
+            if new_shared != shared:
+                with db() as s:
+                    obj = s.get(CalculationSnapshot, sn.id)
+                    if obj:
+                        obj.shared_with_client = bool(new_shared)
+                        s.add(obj)
+                        s.commit()
+                st.rerun()
+
+        with mcol3:
+            st.caption("🔒 Kilit: snapshot'ın final/kanıt paketi için hazır olduğunu gösterir. 👁️ Paylaş: Client Dashboard'da indirme görünür.")
+
+        st.divider()
+
+        colA, colB, colC, colD, colE = st.columns(5)
 
         pdf_bytes = None
         with colA:
             if st.button("PDF üret", type="primary", key="btn_make_pdf"):
                 try:
+                    meth_payload = None
+                    if getattr(sn, "methodology_id", None):
+                        with db() as s:
+                            m = s.get(Methodology, int(sn.methodology_id))
+                        meth_payload = _get_methodology_dict(m)
+
                     payload = {
                         "kpis": kpis,
                         "config": snap_config,
                         "cbam_table": results.get("cbam_table", []),
                         "scenario": results.get("scenario", {}),
+                        "methodology": meth_payload,
+                        "data_sources": [
+                            "energy.csv (yüklenen dosya)",
+                            "production.csv (yüklenen dosya)",
+                            "EmissionFactor Library (DB)",
+                        ],
+                        "formulas": [
+                            "Direct emissions (örnek): fuel_quantity × NCV × emission_factor",
+                            "Indirect emissions (örnek): electricity_kwh × grid_factor",
+                            "CBAM embedded (demo): ürün faktörü × AB ihracat miktarı",
+                        ],
                     }
-                    pdf_uri, pdf_sha = build_pdf(sn.id, "CME Demo Raporu — CBAM + ETS (Tahmini)", payload)
+
+                    title = "CME Demo Raporu — CBAM + ETS (Tahmini)"
+                    scen = payload.get("scenario") or {}
+                    if isinstance(scen, dict) and scen.get("name"):
+                        title = f"Senaryo Raporu — {scen.get('name')} (Tahmini)"
+
+                    pdf_uri, pdf_sha = build_pdf(sn.id, title, payload)
 
                     # duplicate report olmasın
                     try:
@@ -433,29 +560,86 @@ def consultant_app(user):
 
         with colB:
             zip_bytes = build_zip(sn.id, sn.results_json or "{}")
-            st.download_button("ZIP indir (JSON + XLSX)", data=zip_bytes, file_name=f"snapshot_{sn.id}.zip", mime="application/zip", use_container_width=True)
+            st.download_button(
+                "ZIP indir (JSON + XLSX)",
+                data=zip_bytes,
+                file_name=f"snapshot_{sn.id}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
 
         with colC:
             xlsx_bytes = build_xlsx_from_results(sn.results_json or "{}")
-            st.download_button("XLSX indir", data=xlsx_bytes, file_name=f"snapshot_{sn.id}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            st.download_button(
+                "XLSX indir",
+                data=xlsx_bytes,
+                file_name=f"snapshot_{sn.id}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
         with colD:
-            st.download_button("JSON indir", data=(sn.results_json or "{}").encode("utf-8"), file_name=f"snapshot_{sn.id}.json", mime="application/json", use_container_width=True)
+            st.download_button(
+                "JSON indir",
+                data=(sn.results_json or "{}").encode("utf-8"),
+                file_name=f"snapshot_{sn.id}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+        with colE:
+            try:
+                ep = build_evidence_pack(sn.id)
+                st.download_button(
+                    "Evidence Pack (ZIP)",
+                    data=ep,
+                    file_name=f"evidence_pack_snapshot_{sn.id}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    type="primary" if getattr(sn, "locked", False) else "secondary",
+                )
+            except Exception as e:
+                st.error("Evidence pack üretilemedi")
+                st.exception(e)
 
         if pdf_bytes:
-            st.download_button("PDF indir (az önce üretilen)", data=pdf_bytes, file_name=f"snapshot_{sn.id}.pdf", mime="application/pdf", type="primary", use_container_width=True)
+            st.download_button(
+                "PDF indir (az önce üretilen)",
+                data=pdf_bytes,
+                file_name=f"snapshot_{sn.id}.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+            )
 
     # Geçmiş
     with tabs[4]:
         st.subheader("Geçmiş")
         with db() as s:
-            uploads = s.execute(select(DatasetUpload).where(DatasetUpload.project_id == project_id).order_by(DatasetUpload.uploaded_at.desc())).scalars().all()
-            snaps = s.execute(select(CalculationSnapshot).where(CalculationSnapshot.project_id == project_id).order_by(CalculationSnapshot.created_at.desc())).scalars().all()
+            uploads = (
+                s.execute(select(DatasetUpload).where(DatasetUpload.project_id == project_id).order_by(DatasetUpload.uploaded_at.desc()))
+                .scalars()
+                .all()
+            )
+            snaps = (
+                s.execute(select(CalculationSnapshot).where(CalculationSnapshot.project_id == project_id).order_by(CalculationSnapshot.created_at.desc()))
+                .scalars()
+                .all()
+            )
 
         st.markdown("#### Yüklemeler")
         if uploads:
             st.dataframe(
-                [{"ID": u.id, "Tür": u.dataset_type, "Dosya": u.original_filename, "Tarih": u.uploaded_at} for u in uploads],
+                [
+                    {
+                        "ID": u.id,
+                        "Tür": u.dataset_type,
+                        "Dosya": u.original_filename,
+                        "Tarih": u.uploaded_at,
+                        "SHA": (u.sha256[:10] + "…") if u.sha256 else "",
+                    }
+                    for u in uploads
+                ],
                 use_container_width=True,
             )
         else:
@@ -469,7 +653,16 @@ def consultant_app(user):
                 scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
                 kind = "Senaryo" if scen else "Baseline"
                 name = scen.get("name") if scen else ""
-                rows.append({"ID": sn.id, "Tür": f"{kind}{(' — ' + name) if name else ''}", "Tarih": sn.created_at})
+                rows.append(
+                    {
+                        "ID": sn.id,
+                        "Tür": f"{kind}{(' — ' + name) if name else ''}",
+                        "Tarih": sn.created_at,
+                        "Kilitli": bool(getattr(sn, "locked", False)),
+                        "Paylaşıldı": bool(getattr(sn, "shared_with_client", False)),
+                        "Metodoloji": getattr(sn, "methodology_id", None),
+                    }
+                )
             st.dataframe(rows, use_container_width=True)
         else:
             st.info("Henüz snapshot yok.")
