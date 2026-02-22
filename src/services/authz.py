@@ -7,17 +7,19 @@ from src.db.models import User, Company
 
 SESSION_KEY = "user_id"
 
+
 def _hash_pw(pw: str) -> str:
-    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
 
 def _check_pw(pw: str, hashed: str) -> bool:
     try:
-        return bcrypt.checkpw(pw.encode("utf-8"), hashed.encode("utf-8"))
-    except Exception:
+        return bcrypt.checkpw(pw.encode(), hashed.encode())
+    except:
         return False
 
+
 def ensure_bootstrap_admin():
-    # Eğer hiç user yoksa: demo company + consultantadmin yarat
     with db() as s:
         any_user = s.execute(select(User).limit(1)).scalar_one_or_none()
         if any_user:
@@ -27,12 +29,16 @@ def ensure_bootstrap_admin():
         s.add(c)
         s.flush()
 
-        admin_email = st.secrets.get("BOOTSTRAP_ADMIN_EMAIL", "admin@demo.com") if hasattr(st, "secrets") else "admin@demo.com"
-        admin_pw = st.secrets.get("BOOTSTRAP_ADMIN_PASSWORD", "ChangeMe123!") if hasattr(st, "secrets") else "ChangeMe123!"
+        u = User(
+            email="admin@demo.com",
+            password_hash=_hash_pw("admin123"),
+            role="consultantadmin",
+            company_id=c.id,
+        )
 
-        u = User(email=admin_email, password_hash=_hash_pw(admin_pw), role="consultantadmin", company_id=c.id)
         s.add(u)
         s.commit()
+
 
 def current_user():
     uid = st.session_state.get(SESSION_KEY)
@@ -41,20 +47,27 @@ def current_user():
     with db() as s:
         return s.get(User, uid)
 
+
 def login_view():
-    st.title("Login")
+    st.title("Giriş")
+
     email = st.text_input("Email")
-    pw = st.text_input("Password", type="password")
-    if st.button("Sign in", type="primary"):
+    pw = st.text_input("Şifre", type="password")
+
+    if st.button("Giriş yap"):
+
         with db() as s:
             u = s.execute(select(User).where(User.email == email)).scalar_one_or_none()
-            if not u or not _check_pw(pw, u.password_hash):
-                st.error("Hatalı email/şifre")
-                st.stop()
-            st.session_state[SESSION_KEY] = u.id
-            st.rerun()
+
+        if not u or not _check_pw(pw, u.password_hash):
+            st.error("Hatalı giriş")
+            return
+
+        st.session_state[SESSION_KEY] = u.id
+        st.rerun()
+
 
 def logout_button():
-    if st.button("Logout"):
+    if st.button("Çıkış"):
         st.session_state.pop(SESSION_KEY, None)
         st.rerun()
