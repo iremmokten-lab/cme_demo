@@ -1,49 +1,61 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
-from src.db.models import AuditEvent, CalculationSnapshot, Project, User
 from src.db.session import db
+from src.db.models import AuditEvent, CalculationSnapshot, Project, User
+
+
+def _safe_json(d: dict[str, Any] | None) -> str:
+    try:
+        return json.dumps(d or {}, ensure_ascii=False)
+    except Exception:
+        return "{}"
 
 
 def append_audit(
     event_type: str,
-    details: dict | None = None,
+    details: dict[str, Any] | None = None,
     *,
     user_id: int | None = None,
     company_id: int | None = None,
     entity_type: str = "",
     entity_id: int | None = None,
-):
-    """Audit log.
+) -> None:
+    """Audit log kaydı yazar.
+
     Örnek event_type:
-      - report_viewed
+      - login_success
+      - login_failed
+      - login_blocked_locked
+      - logout
+      - page_viewed
+      - report_exported
       - evidence_exported
       - snapshot_viewed
-      - snapshot_created
-      - snapshot_reused
+      - snapshot_compare_viewed
     """
-    try:
-        payload = json.dumps(details or {}, ensure_ascii=False)
-    except Exception:
-        payload = "{}"
-
     ev = AuditEvent(
         event_type=str(event_type),
-        details_json=payload,
+        details_json=_safe_json(details),
         user_id=int(user_id) if user_id is not None else None,
         company_id=int(company_id) if company_id is not None else None,
         entity_type=str(entity_type or ""),
         entity_id=int(entity_id) if entity_id is not None else None,
     )
-    with db() as s:
-        s.add(ev)
-        s.commit()
+    try:
+        with db() as s:
+            s.add(ev)
+            s.commit()
+    except Exception:
+        # Audit kritik değil: uygulama akışını bozmasın
+        return
 
 
 def infer_company_id_for_user(user: User | None) -> int | None:
     try:
-        if user and getattr(user, "company_id", None):
+        if user and getattr(user, "company_id", None) is not None:
             return int(user.company_id)
     except Exception:
         pass
