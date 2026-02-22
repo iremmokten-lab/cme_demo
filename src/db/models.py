@@ -56,7 +56,7 @@ class DatasetUpload(Base):
     sha256: Mapped[str] = mapped_column(String(64), index=True)
     schema_version: Mapped[str] = mapped_column(String(50), default="v1")
 
-    # MVP sprint1: bytes DB'de tutuluyor (sonra storage_uri'ye geçersin)
+    # MVP: dosya bytes DB'de tutuluyor
     content_bytes: Mapped[bytes] = mapped_column(LargeBinary)
 
     project: Mapped["Project"] = relationship(back_populates="uploads")
