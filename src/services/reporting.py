@@ -12,10 +12,6 @@ from src.mrv.audit import append_audit
 
 
 def _register_fonts() -> bool:
-    """
-    Repo kökünde DejaVuSans.ttf ve DejaVuSans-Bold.ttf var.
-    Türkçe karakterler için şart.
-    """
     try:
         pdfmetrics.registerFont(TTFont("DejaVuSans", "DejaVuSans.ttf"))
         pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", "DejaVuSans-Bold.ttf"))
@@ -26,25 +22,23 @@ def _register_fonts() -> bool:
 
 def _fmt_num(x, digits=2):
     try:
-        return f"{float(x):,.{digits}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        s = f"{float(x):,.{digits}f}"
+        return s.replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return str(x)
 
 
-def _draw_kv(c: canvas.Canvas, x: float, y: float, k: str, v: str, font: str):
-    c.setFont(font, 11)
+def _draw_kv(c: canvas.Canvas, x: float, y: float, k: str, v: str, body_font: str):
+    c.setFont(body_font, 11)
     c.drawString(x, y, k)
     c.drawRightString(540, y, v)
 
 
 def _draw_table(c: canvas.Canvas, x: float, y: float, headers: list[str], rows: list[list[str]], body_font: str, bold_font: str):
-    """
-    Daha düzgün tablo: kolonlar sığar, başlıklar çakışmaz.
-    """
-    col_widths = [140, 110, 130, 110]  # SKU | Risk | EU tCO2 | CBAM €
+    # SKU | Risk | EU tCO2 | CBAM €
+    col_widths = [140, 110, 130, 110]
     row_h = 18
 
-    # Header line
     c.setFont(bold_font, 11)
     xx = x
     for i, h in enumerate(headers):
@@ -58,7 +52,6 @@ def _draw_table(c: canvas.Canvas, x: float, y: float, headers: list[str], rows: 
     c.line(x, y, x + sum(col_widths), y)
     y -= 14
 
-    # Rows
     c.setFont(body_font, 10)
     for r in rows:
         xx = x
@@ -74,18 +67,11 @@ def _draw_table(c: canvas.Canvas, x: float, y: float, headers: list[str], rows: 
             c.showPage()
             y = 760
             c.setFont(body_font, 10)
+
     return y
 
 
 def build_pdf(snapshot_id: int, report_title: str, report_data: dict) -> tuple[str, str]:
-    """
-    report_data beklenen:
-      {
-        "kpis": {...},
-        "config": {...},
-        "top_skus": [{"sku":..,"risk":..,"eu_tco2":..,"cbam_eur":..}, ...]   (opsiyonel)
-      }
-    """
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     fp = Path(REPORT_DIR) / f"snapshot_{snapshot_id}.pdf"
@@ -98,7 +84,6 @@ def build_pdf(snapshot_id: int, report_title: str, report_data: dict) -> tuple[s
     w, h = A4
     margin_x = 50
 
-    # Header
     c.setFont(bold_font, 18)
     c.drawString(margin_x, h - 60, report_title or "CME Demo Raporu — CBAM + ETS (Tahmini)")
 
@@ -120,7 +105,6 @@ def build_pdf(snapshot_id: int, report_title: str, report_data: dict) -> tuple[s
     cfg = (report_data or {}).get("config", {}) or {}
     top_skus = (report_data or {}).get("top_skus", []) or []
 
-    # Genel Parametreler
     c.setFont(bold_font, 13)
     c.drawString(margin_x, y, "Genel Parametreler")
     y -= 22
@@ -130,7 +114,6 @@ def build_pdf(snapshot_id: int, report_title: str, report_data: dict) -> tuple[s
     _draw_kv(c, margin_x, y, "Free allocation (tCO2)", _fmt_num(cfg.get("free_alloc_t", 0), 4), body_font); y -= 16
     _draw_kv(c, margin_x, y, "Banked allowances (tCO2)", _fmt_num(cfg.get("banked_t", 0), 4), body_font); y -= 26
 
-    # Energy
     c.setFont(bold_font, 13)
     c.drawString(margin_x, y, "Energy (Scope 1–2) Özeti")
     y -= 22
@@ -139,21 +122,18 @@ def build_pdf(snapshot_id: int, report_title: str, report_data: dict) -> tuple[s
     _draw_kv(c, margin_x, y, "Scope 1 (tCO2)", _fmt_num(kpis.get("energy_scope1_tco2", 0), 4), body_font); y -= 16
     _draw_kv(c, margin_x, y, "Scope 2 (tCO2)", _fmt_num(kpis.get("energy_scope2_tco2", 0), 4), body_font); y -= 26
 
-    # ETS
     c.setFont(bold_font, 13)
     c.drawString(margin_x, y, "ETS Özeti (Tesis Bazlı)")
     y -= 22
     _draw_kv(c, margin_x, y, "Net EUA gereksinimi (tCO2)", _fmt_num(kpis.get("ets_net_tco2", 0), 4), body_font); y -= 16
     _draw_kv(c, margin_x, y, "ETS maliyeti (TL)", _fmt_num(kpis.get("ets_cost_tl", 0), 2), body_font); y -= 26
 
-    # CBAM
     c.setFont(bold_font, 13)
     c.drawString(margin_x, y, "CBAM Özeti (Ürün Bazlı, Demo)")
     y -= 22
     _draw_kv(c, margin_x, y, "Toplam embedded (tCO2)", _fmt_num(kpis.get("cbam_embedded_tco2", 0), 4), body_font); y -= 16
     _draw_kv(c, margin_x, y, "Toplam CBAM maliyeti (€)", _fmt_num(kpis.get("cbam_cost_eur", 0), 2), body_font); y -= 26
 
-    # Top SKU table
     if top_skus:
         c.setFont(bold_font, 13)
         c.drawString(margin_x, y, "En Yüksek Risk Skorlu İlk 10 SKU")
@@ -169,16 +149,10 @@ def build_pdf(snapshot_id: int, report_title: str, report_data: dict) -> tuple[s
                 _fmt_num(r.get("cbam_eur", 0), 2),
             ])
 
-       y = _draw_table(c, margin_x, y, headers, rows, body_font, bold_font)
-        y -= 10
+        y = _draw_table(c, margin_x, y, headers, rows, body_font, bold_font)
 
     c.setFont(body_font, 9)
-    c.drawString(
-        margin_x,
-        40,
-        "Önemli Not: Bu rapor yönetim amaçlı tahmini bir çıktıdır. Resmî beyan/uyum dokümanı değildir.",
-    )
-
+    c.drawString(margin_x, 40, "Önemli Not: Bu rapor yönetim amaçlı tahmini bir çıktıdır. Resmî beyan/uyum dokümanı değildir.")
     c.showPage()
     c.save()
 
