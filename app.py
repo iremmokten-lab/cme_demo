@@ -1,5 +1,4 @@
 import json
-from datetime import datetime, timezone
 from io import StringIO
 
 import numpy as np
@@ -17,10 +16,9 @@ from src.services.projects import (
 )
 from src.services.persistence import save_upload, save_snapshot
 
-st.set_page_config(page_title="CME Platform MVP — Sprint 1", layout="wide")
+st.set_page_config(page_title="CME Platform MVP", layout="wide")
 
 APP_VERSION = "sprint1-step1"
-
 DISCLAIMER_TEXT = (
     "Önemli Not: Bu rapor yönetim amaçlı tahmini bir allocation/hesaplama çıktısıdır.\n"
     "Resmî beyan değildir."
@@ -28,8 +26,7 @@ DISCLAIMER_TEXT = (
 
 
 def init_db():
-    # DB tablolarını oluştur
-    _ = inspect(engine)  # engine hazır mı diye
+    _ = inspect(engine)
     Base.metadata.create_all(bind=engine)
 
 
@@ -52,7 +49,7 @@ def require_cols(df, cols, name):
         raise ValueError(f"{name} eksik kolonlar: {missing}")
 
 
-def compute_energy(energy_df: pd.DataFrame):
+def compute_energy(energy_df):
     require_cols(
         energy_df,
         ["energy_carrier", "scope", "activity_amount", "emission_factor_kgco2_per_unit"],
@@ -77,7 +74,7 @@ def compute_energy(energy_df: pd.DataFrame):
     }
 
 
-def allocate_energy(prod_df: pd.DataFrame, total_energy_kgco2: float):
+def allocate_energy(prod_df, total_energy_kgco2: float):
     require_cols(prod_df, ["sku", "quantity"], "production.csv")
     df = prod_df.copy()
     df["quantity"] = df["quantity"].apply(safe_float)
@@ -93,7 +90,7 @@ def allocate_energy(prod_df: pd.DataFrame, total_energy_kgco2: float):
     return df
 
 
-def compute_cbam(prod_df: pd.DataFrame, eua_price: float, total_energy_kgco2: float):
+def compute_cbam(prod_df, eua_price: float, total_energy_kgco2: float):
     require_cols(
         prod_df,
         ["sku", "quantity", "export_to_eu_quantity", "input_emission_factor_kg_per_unit"],
@@ -129,7 +126,7 @@ def compute_ets(scope1_tco2: float, free_alloc: float, banked: float, price: flo
     return {"net": net, "cost": cost}
 
 
-# ---------- APP START ----------
+# ---- Start ----
 init_db()
 
 st.title("CME Platform MVP")
@@ -190,14 +187,8 @@ with tabs[0]:
         prod_bytes = prod_file.getvalue()
         prod_df = pd.read_csv(StringIO(prod_bytes.decode("utf-8")))
 
-    energy_calc, energy_summary = compute_energy(energy_df)
-    ets = compute_ets(
-        energy_summary["scope1_tco2"],
-        free_alloc,
-        banked,
-        eua_price,
-        fx,
-    )
+    _, energy_summary = compute_energy(energy_df)
+    ets = compute_ets(energy_summary["scope1_tco2"], free_alloc, banked, eua_price, fx)
 
     cbam_df = None
     cbam_totals = None
@@ -213,7 +204,6 @@ with tabs[0]:
     if cbam_df is not None:
         st.markdown("### CBAM SKU table")
         st.dataframe(cbam_df, use_container_width=True)
-        st.markdown("**CBAM totals**")
         st.json(cbam_totals)
 
     if st.button("Save snapshot", type="primary"):
@@ -225,11 +215,7 @@ with tabs[0]:
             u_prod = save_upload(db, project.id, "production", prod_file.name, prod_bytes)
             input_hashes["production"] = u_prod.sha256
 
-        results = {
-            "energy": energy_summary,
-            "ets": ets,
-            "cbam": cbam_totals,
-        }
+        results = {"energy": energy_summary, "ets": ets, "cbam": cbam_totals}
         snap = save_snapshot(
             db,
             project.id,
