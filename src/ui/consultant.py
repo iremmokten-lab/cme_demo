@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import bcrypt
@@ -8,7 +9,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import select
 
-from src.db.models import CalculationSnapshot, DatasetUpload, Methodology, Report, User
+from src.db.models import CalculationSnapshot, DatasetUpload, Methodology, MonitoringPlan, Report, User
 from src.db.session import db
 from src.mrv.lineage import sha256_bytes
 from src.services import projects as prj
@@ -24,7 +25,7 @@ def _hash_pw(pw: str) -> str:
 
 
 def _safe_name(name: str) -> str:
-    return (name or "").replace("/", "_").replace("\\\\", "_").strip()
+    return (name or "").replace("/", "_").replace("\\", "_").strip()
 
 
 def _fmt_tr(x, digits=2) -> str:
@@ -121,6 +122,63 @@ def _get_methodology_dict(m: Methodology | None) -> dict | None:
     }
 
 
+def _latest_monitoring_plan(facility_id: int) -> MonitoringPlan | None:
+    with db() as s:
+        return (
+            s.execute(
+                select(MonitoringPlan)
+                .where(MonitoringPlan.facility_id == facility_id)
+                .order_by(MonitoringPlan.updated_at.desc(), MonitoringPlan.created_at.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+
+
+def _upsert_monitoring_plan(
+    facility_id: int,
+    method: str,
+    tier_level: str,
+    data_source: str,
+    qa_procedure: str,
+    responsible_person: str,
+) -> None:
+    now = datetime.now(timezone.utc)
+    with db() as s:
+        mp = (
+            s.execute(
+                select(MonitoringPlan)
+                .where(MonitoringPlan.facility_id == facility_id)
+                .order_by(MonitoringPlan.updated_at.desc(), MonitoringPlan.created_at.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        if not mp:
+            mp = MonitoringPlan(
+                facility_id=facility_id,
+                method=method,
+                tier_level=tier_level,
+                data_source=data_source,
+                qa_procedure=qa_procedure,
+                responsible_person=responsible_person,
+                created_at=now,
+                updated_at=now,
+            )
+            s.add(mp)
+        else:
+            mp.method = method
+            mp.tier_level = tier_level
+            mp.data_source = data_source
+            mp.qa_procedure = qa_procedure
+            mp.responsible_person = responsible_person
+            mp.updated_at = now
+            s.add(mp)
+        s.commit()
+
+
 def consultant_app(user):
     st.title("Danışman Kontrol Paneli")
 
@@ -158,6 +216,43 @@ def consultant_app(user):
                     st.success("Tesis oluşturuldu.")
                     st.rerun()
 
+        # Monitoring Plan (ETS MRV)
+        st.divider()
+        st.markdown("### ETS Monitoring Plan")
+        if facility_id:
+            mp = _latest_monitoring_plan(int(facility_id))
+            with st.expander("Monitoring Plan (oluştur / güncelle)", expanded=False):
+                method = st.selectbox(
+                    "Yöntem",
+                    ["standard", "mass_balance", "calculation", "measurement"],
+                    index=0 if not mp else max(["standard", "mass_balance", "calculation", "measurement"].index(mp.method) if mp.method in ["standard", "mass_balance", "calculation", "measurement"] else 0, 0),
+                    key="mp_method",
+                )
+                tier = st.selectbox(
+                    "Tier seviyesi",
+                    ["Tier 1", "Tier 2", "Tier 3"],
+                    index=1 if not mp else max(["Tier 1", "Tier 2", "Tier 3"].index(mp.tier_level) if mp.tier_level in ["Tier 1", "Tier 2", "Tier 3"] else 1, 0),
+                    key="mp_tier",
+                )
+                data_source = st.text_input("Veri kaynağı", value="" if not mp else (mp.data_source or ""), key="mp_source")
+                responsible = st.text_input("Sorumlu kişi", value="" if not mp else (mp.responsible_person or ""), key="mp_resp")
+                qa_proc = st.text_area("QA prosedürü (özet)", value="" if not mp else (mp.qa_procedure or ""), key="mp_qa")
+
+                if st.button("Monitoring Plan kaydet", type="primary", key="btn_save_mp"):
+                    _upsert_monitoring_plan(
+                        facility_id=int(facility_id),
+                        method=str(method),
+                        tier_level=str(tier),
+                        data_source=str(data_source),
+                        qa_procedure=str(qa_proc),
+                        responsible_person=str(responsible),
+                    )
+                    st.success("Monitoring Plan kaydedildi ✅")
+                    st.rerun()
+        else:
+            st.caption("Monitoring Plan için önce tesis seçin.")
+
+        st.divider()
         st.markdown("### Proje")
         projects = prj.list_projects(company_id)
 
@@ -203,10 +298,29 @@ def consultant_app(user):
 
         st.divider()
         st.markdown("### Parametreler")
+
+        region = st.text_input("Bölge/Ülke (factor region)", value="TR", key="param_region")
         eua = st.slider("EUA fiyatı (€/t)", 0.0, 300.0, 80.0, key="param_eua")
         fx = st.number_input("Kur (TL/€)", value=35.0, key="param_fx")
         free_alloc = st.number_input("Ücretsiz tahsis (tCO2)", value=0.0, key="param_free")
         banked = st.number_input("Banked / devreden (tCO2)", value=0.0, key="param_banked")
+
+        st.markdown("#### Elektrik Emisyon Metodu")
+        elec_method = st.selectbox("Metod", ["location", "market"], index=0, key="param_elec_method")
+        market_override = st.number_input(
+            "Market-based grid factor override (kgCO2e/kWh) — opsiyonel",
+            value=0.0,
+            help="0 ise override uygulanmaz. Örn: REC/PPA ile market-based değer düşebilir.",
+            key="param_market_override",
+        )
+        cbam_alloc = st.selectbox("CBAM allocation basis", ["quantity", "export"], index=0, key="param_cbam_alloc")
+
+        uncertainty_notes = st.text_area(
+            "ETS belirsizlik notu (verification için)",
+            value="",
+            help="Tier metoduna göre belirsizlik hesapları ileride detaylandırılır. Şimdilik not olarak rapor payload’ına girer.",
+            key="param_uncertainty",
+        )
 
         st.divider()
         st.markdown("### Metodoloji")
@@ -234,11 +348,17 @@ def consultant_app(user):
                     st.rerun()
 
     config = {
+        "region": str(region).strip() or "TR",
         "eua_price_eur": float(eua),
         "fx_tl_per_eur": float(fx),
         "free_alloc_t": float(free_alloc),
         "banked_t": float(banked),
+        "electricity_method": str(elec_method),
+        "cbam_allocation_basis": str(cbam_alloc),
+        "uncertainty_notes": str(uncertainty_notes or ""),
     }
+    if market_override and float(market_override) > 0.0:
+        config["market_grid_factor_override"] = float(market_override)
 
     st.subheader("Proje Özeti")
     with db() as s:
@@ -247,7 +367,7 @@ def consultant_app(user):
                 select(DatasetUpload)
                 .where(DatasetUpload.project_id == project_id)
                 .order_by(DatasetUpload.uploaded_at.desc())
-                .limit(5)
+                .limit(10)
             )
             .scalars()
             .all()
@@ -265,11 +385,12 @@ def consultant_app(user):
 
     u_energy = next((u for u in last_uploads if u.dataset_type == "energy"), None)
     u_prod = next((u for u in last_uploads if u.dataset_type == "production"), None)
+    u_mat = next((u for u in last_uploads if u.dataset_type == "materials"), None)
 
     a, b, c, d = st.columns(4)
-    a.metric("Energy.csv", "Var ✅" if u_energy else "Yok ❌")
-    b.metric("Production.csv", "Var ✅" if u_prod else "Yok ❌")
-    c.metric("Snapshot (son 10)", str(len(last_snaps)))
+    a.metric("energy.csv", "Var ✅" if u_energy else "Yok ❌")
+    b.metric("production.csv", "Var ✅" if u_prod else "Yok ❌")
+    c.metric("materials.csv", "Var ✅" if u_mat else "Yok (precursor yok)")
     d.metric("Son snapshot", f"ID:{last_snaps[0].id}" if last_snaps else "-")
 
     st.divider()
@@ -288,11 +409,19 @@ def consultant_app(user):
     # Veri Yükleme
     with tabs[0]:
         st.subheader("CSV Yükleme")
-        col1, col2 = st.columns(2)
+
+        col1, col2, col3 = st.columns(3)
         with col1:
             up_energy = st.file_uploader("energy.csv yükleyin", type=["csv"], key=f"energy_{project_id}")
         with col2:
             up_prod = st.file_uploader("production.csv yükleyin", type=["csv"], key=f"prod_{project_id}")
+        with col3:
+            up_mat = st.file_uploader("materials.csv (precursor) yükleyin", type=["csv"], key=f"mat_{project_id}")
+
+        st.caption(
+            "Paket A: Precursor emisyonlar için **materials.csv** yükleyin. "
+            "Energy için yeni şema: month, facility_id, fuel_type, fuel_quantity, fuel_unit."
+        )
 
         def _handle_upload(uploaded, dtype: str):
             if uploaded is None:
@@ -309,14 +438,19 @@ def consultant_app(user):
         try:
             _handle_upload(up_energy, "energy")
             _handle_upload(up_prod, "production")
+            _handle_upload(up_mat, "materials")
         except Exception as e:
             st.error("Upload hatası")
             st.exception(e)
 
     # Hesaplama
     with tabs[1]:
-        st.subheader("Baseline Hesaplama")
-        st.caption("Not: Seçili metodoloji snapshot içine kaydedilir ve PDF/evidence pack içinde yer alır.")
+        st.subheader("Baseline Hesaplama (Regülasyon Yakın Motor)")
+        st.caption(
+            "Paket A: Direct/Indirect/Precursor ayrımı yapılır. "
+            "Metodoloji snapshot içine kaydedilir. Snapshot reuse aktiftir (aynı input+config → reuse)."
+        )
+
         if st.button("Baseline çalıştır", type="primary", key="btn_run_baseline"):
             try:
                 snap = run_full(
@@ -328,6 +462,14 @@ def consultant_app(user):
                 )
                 st.session_state["last_snapshot_id"] = snap.id
                 st.success(f"Hesaplama tamamlandı ✅ Snapshot ID: {snap.id}")
+
+                r = _read_results(snap)
+                k = (r.get("kpis") or {}) if isinstance(r, dict) else {}
+                st.info(
+                    f"Direct: {_fmt_tr(k.get('direct_tco2', 0), 3)} tCO2 | "
+                    f"Indirect: {_fmt_tr(k.get('indirect_tco2', 0), 3)} tCO2 | "
+                    f"Precursor: {_fmt_tr(((r.get('cbam') or {}).get('totals') or {}).get('precursor_tco2', 0), 3)} tCO2"
+                )
             except Exception as e:
                 st.error("Hesaplama başarısız")
                 st.exception(e)
@@ -353,6 +495,11 @@ def consultant_app(user):
             "export_mix_multiplier": float(export_mix_multiplier),
         }
 
+        st.caption(
+            "Not (Paket A): renewable_share ve supplier_factor_multiplier bu MVP’de doğrudan enerji/malzeme faktörlerini otomatik değiştirmez. "
+            "Enerji azaltımı ve export mix uygulanır. Market-based grid factor override ile dolaylı etkiler modellenebilir."
+        )
+
         if st.button("Senaryoyu çalıştır", type="primary", key="btn_run_scenario"):
             try:
                 snap = run_full(
@@ -369,19 +516,19 @@ def consultant_app(user):
                 st.error("Senaryo başarısız")
                 st.exception(e)
 
-        # Son üretilen snapshot sonucu
+        # Son snapshot KPI
         last_id = st.session_state.get("last_snapshot_id")
         if last_id:
             with db() as s:
                 last_snap = s.get(CalculationSnapshot, int(last_id))
             if last_snap and last_snap.project_id == project_id:
                 st.divider()
-                st.subheader("Son Üretilen Sonuç")
+                st.subheader("Son Üretilen Sonuç (KPI)")
                 r = _read_results(last_snap)
                 k = (r.get("kpis") or {}) if isinstance(r, dict) else {}
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Toplam Emisyon (tCO2)", _fmt_tr(k.get("energy_total_tco2", 0), 3))
-                c2.metric("Scope-1 (tCO2)", _fmt_tr(k.get("energy_scope1_tco2", 0), 3))
+                c1.metric("Direct (tCO2)", _fmt_tr(k.get("direct_tco2", 0), 3))
+                c2.metric("Indirect (tCO2)", _fmt_tr(k.get("indirect_tco2", 0), 3))
                 c3.metric("CBAM (€)", _fmt_tr(k.get("cbam_cost_eur", 0), 2))
                 c4.metric("ETS (TL)", _fmt_tr(k.get("ets_cost_tl", 0), 2))
 
@@ -419,7 +566,9 @@ def consultant_app(user):
             name = scen.get("name") if scen else ""
             lock_tag = "🔒" if getattr(sn, "locked", False) else ""
             share_tag = "👁️" if getattr(sn, "shared_with_client", False) else ""
-            labels.append(f"{lock_tag}{share_tag} ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
+            prev = getattr(sn, "previous_snapshot_hash", None)
+            chain_tag = "⛓️" if prev else ""
+            labels.append(f"{lock_tag}{share_tag}{chain_tag} ID:{sn.id} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
             id_list.append(sn.id)
 
         default_index = 0
@@ -442,8 +591,8 @@ def consultant_app(user):
         except Exception:
             snap_config = {}
 
-        # Yönetim: kilit & paylaşım
         st.markdown("#### Snapshot Yönetimi")
+        st.caption("⛓️ = hash chain aktif (previous_snapshot_hash mevcut).")
         mcol1, mcol2, mcol3 = st.columns([1, 1, 2])
 
         with mcol1:
@@ -466,8 +615,6 @@ def consultant_app(user):
                         obj = s.get(CalculationSnapshot, sn.id)
                         if obj:
                             obj.locked = True
-                            from datetime import datetime, timezone
-
                             obj.locked_at = datetime.now(timezone.utc)
                             obj.locked_by_user_id = getattr(user, "id", None)
                             s.add(obj)
@@ -487,10 +634,22 @@ def consultant_app(user):
                 st.rerun()
 
         with mcol3:
-            st.caption("🔒 Kilit: snapshot'ın final/kanıt paketi için hazır olduğunu gösterir. 👁️ Paylaş: Client Dashboard'da indirme görünür.")
+            prev_hash = getattr(sn, "previous_snapshot_hash", None)
+            st.caption(f"Engine: {getattr(sn, 'engine_version', '-')}")
+            st.caption(f"Result hash: {(sn.result_hash[:16] + '…') if getattr(sn, 'result_hash', None) else '-'}")
+            st.caption(f"Previous hash: {(prev_hash[:16] + '…') if prev_hash else '(yok)'}")
 
         st.divider()
+        st.markdown("#### KPI Özeti (Paket A)")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Direct (tCO2)", _fmt_tr(kpis.get("direct_tco2", 0), 3))
+        c2.metric("Indirect (tCO2)", _fmt_tr(kpis.get("indirect_tco2", 0), 3))
+        cbam_prec = (((results.get("cbam") or {}).get("totals") or {}).get("precursor_tco2", 0))
+        c3.metric("Precursor (tCO2)", _fmt_tr(cbam_prec, 3))
+        c4.metric("CBAM (€)", _fmt_tr(kpis.get("cbam_cost_eur", 0), 2))
+        c5.metric("ETS (TL)", _fmt_tr(kpis.get("ets_cost_tl", 0), 2))
 
+        st.divider()
         colA, colB, colC, colD, colE = st.columns(5)
 
         pdf_bytes = None
@@ -512,16 +671,19 @@ def consultant_app(user):
                         "data_sources": [
                             "energy.csv (yüklenen dosya)",
                             "production.csv (yüklenen dosya)",
+                            "materials.csv (opsiyonel, precursor)",
                             "EmissionFactor Library (DB)",
+                            "Monitoring Plan (DB, facility bazlı)",
                         ],
                         "formulas": [
-                            "Direct emissions (örnek): fuel_quantity × NCV × emission_factor",
-                            "Indirect emissions (örnek): electricity_kwh × grid_factor",
-                            "CBAM embedded (demo): ürün faktörü × AB ihracat miktarı",
+                            "Direct emissions: fuel_quantity × NCV × emission_factor × oxidation_factor",
+                            "Indirect emissions: electricity_kwh × grid_factor (location/market)",
+                            "Precursor emissions: materials.material_quantity × materials.emission_factor",
+                            "CBAM exposure (demo): embedded_tCO2 × EUA × export_share",
                         ],
                     }
 
-                    title = "CME Demo Raporu — CBAM + ETS (Tahmini)"
+                    title = "Rapor — CBAM + ETS (Regülasyon Yakın, Tahmini)"
                     scen = payload.get("scenario") or {}
                     if isinstance(scen, dict) and scen.get("name"):
                         title = f"Senaryo Raporu — {scen.get('name')} (Tahmini)"
@@ -661,6 +823,7 @@ def consultant_app(user):
                         "Kilitli": bool(getattr(sn, "locked", False)),
                         "Paylaşıldı": bool(getattr(sn, "shared_with_client", False)),
                         "Metodoloji": getattr(sn, "methodology_id", None),
+                        "Prev Hash": "Var" if getattr(sn, "previous_snapshot_hash", None) else "Yok",
                     }
                 )
             st.dataframe(rows, use_container_width=True)
