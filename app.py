@@ -1,4 +1,3 @@
-import json
 import streamlit as st
 
 from src.db.session import init_db
@@ -19,7 +18,7 @@ def main():
 
     with st.sidebar:
         st.write(f"👤 **{user.email}**")
-        st.caption(f"Role: `{user.role}`")
+        st.caption(f"Rol: `{user.role}`")
         logout_button()
 
     if user.role.startswith("consultant"):
