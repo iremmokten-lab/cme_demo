@@ -37,35 +37,43 @@ def _draw_kv(c: canvas.Canvas, x: float, y: float, k: str, v: str, font: str):
     c.drawRightString(540, y, v)
 
 
-def _draw_table(c: canvas.Canvas, x: float, y: float, headers: list[str], rows: list[list[str]], font: str):
+def _draw_table(c: canvas.Canvas, x: float, y: float, headers: list[str], rows: list[list[str]], body_font: str, bold_font: str):
     """
-    Basit tablo (canvas ile). Y sayısı aşağı indikçe azalır.
+    Daha düzgün tablo: kolonlar sığar, başlıklar çakışmaz.
     """
-    col_widths = [120, 70, 90, 90]  # SKU | Risk | EU tCO2 | CBAM €
+    col_widths = [140, 110, 130, 110]  # SKU | Risk | EU tCO2 | CBAM €
     row_h = 18
 
-    # Header
-    c.setFont("DejaVuSans-Bold" if "Bold" not in font else font, 11)
+    # Header line
+    c.setFont(bold_font, 11)
     xx = x
     for i, h in enumerate(headers):
-        c.drawString(xx, y, h)
+        if i == 0:
+            c.drawString(xx, y, h)
+        else:
+            c.drawRightString(xx + col_widths[i] - 6, y, h)
         xx += col_widths[i]
+
     y -= 10
     c.line(x, y, x + sum(col_widths), y)
-    y -= 12
+    y -= 14
 
     # Rows
-    c.setFont(font, 10)
+    c.setFont(body_font, 10)
     for r in rows:
         xx = x
         for i, cell in enumerate(r):
-            c.drawString(xx, y, str(cell))
+            txt = str(cell)
+            if i == 0:
+                c.drawString(xx, y, txt)
+            else:
+                c.drawRightString(xx + col_widths[i] - 6, y, txt)
             xx += col_widths[i]
         y -= row_h
         if y < 80:
             c.showPage()
-            c.setFont(font, 10)
             y = 760
+            c.setFont(body_font, 10)
     return y
 
 
@@ -161,7 +169,7 @@ def build_pdf(snapshot_id: int, report_title: str, report_data: dict) -> tuple[s
                 _fmt_num(r.get("cbam_eur", 0), 2),
             ])
 
-        y = _draw_table(c, margin_x, y, headers, rows, body_font)
+       y = _draw_table(c, margin_x, y, headers, rows, body_font, bold_font)
         y -= 10
 
     c.setFont(body_font, 9)
