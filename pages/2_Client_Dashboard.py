@@ -1,12 +1,14 @@
+from __future__ import annotations
+
 import streamlit as st
 
 from src.db.session import init_db
-from src.services.authz import ensure_bootstrap_admin, current_user, login_view
+from src.mrv.audit import append_audit, infer_company_id_for_user
+from src.services.authz import current_user, ensure_bootstrap_admin, login_view, logout_button
 from src.ui.client import client_app
 
 st.set_page_config(page_title="Müşteri Paneli", layout="wide")
 
-# DB init + bootstrap
 init_db()
 ensure_bootstrap_admin()
 
@@ -19,5 +21,19 @@ if not user:
 if str(user.role).startswith("consultant"):
     st.error("Bu sayfa müşteri kullanıcıları içindir. (Danışman olarak Danışman Paneli’ni kullanın.)")
     st.stop()
+
+append_audit(
+    "page_viewed",
+    {"page": "client_dashboard"},
+    user_id=getattr(user, "id", None),
+    company_id=infer_company_id_for_user(user),
+    entity_type="page",
+    entity_id=None,
+)
+
+with st.sidebar:
+    st.write(f"👤 {user.email}")
+    st.caption(f"Rol: {user.role}")
+    logout_button()
 
 client_app(user)
