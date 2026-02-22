@@ -15,7 +15,6 @@ from src.services.reporting import build_pdf
 from src.services.storage import UPLOAD_DIR, write_bytes
 from src.services.workflow import run_full
 
-# auth hashing (aynı authz.py ile uyumlu)
 import bcrypt
 
 
@@ -64,15 +63,16 @@ def _save_upload_dedup(
 ) -> str:
     sha = sha256_bytes(file_bytes)
     safe = _safe_name(file_name) or f"{dataset_type}.csv"
-
     fp = UPLOAD_DIR / f"project_{project_id}" / dataset_type / f"{sha}_{safe}"
 
     with db() as s:
         existing = _first_existing_upload(s, project_id, dataset_type, sha)
         if existing:
+            # Diskte yoksa yeniden yaz
             try:
-                if getattr(existing, "storage_uri", None):
-                    p = Path(str(existing.storage_uri))
+                uri = getattr(existing, "storage_uri", None)
+                if uri:
+                    p = Path(str(uri))
                     if not p.exists():
                         write_bytes(fp, file_bytes)
                         try:
@@ -89,7 +89,6 @@ def _save_upload_dedup(
             return existing.sha256 or sha
 
     write_bytes(fp, file_bytes)
-
     u = DatasetUpload(
         project_id=project_id,
         dataset_type=dataset_type,
@@ -98,11 +97,9 @@ def _save_upload_dedup(
         storage_uri=str(fp),
         uploaded_by_user_id=user_id,
     )
-
     with db() as s:
         s.add(u)
         s.commit()
-
     return sha
 
 
@@ -110,7 +107,7 @@ def consultant_app(user):
     st.title("Danışman Kontrol Paneli")
 
     # =======================
-    # SOL MENÜ
+    # ŞİRKET SEÇİMİ
     # =======================
     companies = prj.list_companies_for_user(user)
     if not companies:
@@ -123,6 +120,9 @@ def consultant_app(user):
         company_name = st.selectbox("Şirket seçin", list(company_map.keys()), index=0)
         company_id = company_map[company_name]
 
+        # =======================
+        # TESİS
+        # =======================
         st.markdown("### Tesis")
         facilities = prj.list_facilities(company_id)
         fac_opts = {"(yok)": None}
@@ -131,6 +131,7 @@ def consultant_app(user):
             if getattr(f, "country", None):
                 label += f" ({f.country})"
             fac_opts[label] = f.id
+
         fac_label = st.selectbox("Tesis seçin", list(fac_opts.keys()), index=0)
         facility_id = fac_opts[fac_label]
 
@@ -139,56 +140,77 @@ def consultant_app(user):
             cc = st.text_input("Ülke", value="TR", key="new_facility_country")
             ss = st.text_input("Sektör", value="", key="new_facility_sector")
             if st.button("Tesis ekle", key="btn_add_facility"):
-                if not fn.strip():
-                    st.warning("Tesis adı boş olamaz.")
-                else:
-                    prj.create_facility(company_id, fn, cc, ss)
-                    st.success("Tesis oluşturuldu.")
-                    st.rerun()
+                try:
+                    if not fn.strip():
+                        st.warning("Tesis adı boş olamaz.")
+                    else:
+                        prj.create_facility(company_id, fn, cc, ss)
+                        st.success("Tesis oluşturuldu.")
+                        st.rerun()
+                except Exception as e:
+                    st.error("Tesis oluşturulamadı.")
+                    st.exception(e)
 
+        # =======================
+        # PROJE (FIXED)
+        # =======================
         st.markdown("### Proje")
         projects = prj.list_projects(company_id)
 
+        # Yeni Streamlit davranışı: widget key'ine direkt yazma yapmayacağız.
+        NEW_LABEL = "(yeni proje oluştur)"
         proj_items = []
         for p in projects:
-            year = getattr(p, "year", "")
-            label = f"{p.name} / {year} (id:{p.id})"
-            proj_items.append((label, p.id))
+            proj_items.append((f"{p.name} / {p.year} (id:{p.id})", p.id))
 
-        NEW_LABEL = "(yeni proje oluştur)"
-        proj_labels = [lbl for (lbl, _) in proj_items] + [NEW_LABEL]
+        labels = [lbl for lbl, _ in proj_items] + [NEW_LABEL]
+        id_by_label = {lbl: pid for lbl, pid in proj_items}
 
-        if "project_select_label" not in st.session_state:
-            st.session_state["project_select_label"] = proj_labels[0] if proj_items else NEW_LABEL
+        # "seçili proje id"yi ayrı bir key'de tutuyoruz
+        if "selected_project_id" not in st.session_state:
+            st.session_state["selected_project_id"] = proj_items[0][1] if proj_items else None
 
-        psel = st.selectbox("Proje seçin", proj_labels, key="project_select_label")
+        # index hesapla (id -> label -> index)
+        default_index = 0
+        if proj_items and st.session_state["selected_project_id"]:
+            for i, (_, pid) in enumerate(proj_items):
+                if pid == st.session_state["selected_project_id"]:
+                    default_index = i
+                    break
+        else:
+            default_index = len(labels) - 1  # yeni proje oluştur
+
+        psel = st.selectbox("Proje seçin", labels, index=default_index, key="project_selectbox_ui")
 
         if psel == NEW_LABEL:
             pn = st.text_input("Proje adı", key="new_project_name")
             py = st.number_input("Yıl", 2000, 2100, 2025, key="new_project_year")
 
             if st.button("Proje oluştur", type="primary", key="btn_create_project"):
-                if not pn.strip():
-                    st.warning("Proje adı boş olamaz.")
-                else:
-                    newp = prj.create_project(company_id, facility_id, pn, int(py))
-                    new_label = f"{newp.name} / {newp.year} (id:{newp.id})"
-                    st.session_state["project_select_label"] = new_label
-                    st.success(f"Proje oluşturuldu: id={newp.id}")
-                    st.rerun()
+                try:
+                    if not pn.strip():
+                        st.warning("Proje adı boş olamaz.")
+                    else:
+                        newp = prj.create_project(company_id, facility_id, pn, int(py))
+                        # widget key'ine yazmıyoruz; sadece selected_project_id güncelliyoruz
+                        st.session_state["selected_project_id"] = newp.id
+                        st.success(f"Proje oluşturuldu: id={newp.id}")
+                        st.rerun()
+                except Exception as e:
+                    st.error("Proje oluşturulamadı.")
+                    st.exception(e)
 
             st.info("Devam etmek için proje oluşturun veya mevcut bir proje seçin.")
             st.stop()
 
-        project_id = None
-        for lbl, pid in proj_items:
-            if lbl == psel:
-                project_id = pid
-                break
-
-        if project_id is None:
+        # Seçili proje id
+        project_id = id_by_label.get(psel)
+        if not project_id:
             st.error("Seçili proje bulunamadı.")
             st.stop()
+
+        # Seçimi kalıcılaştır
+        st.session_state["selected_project_id"] = project_id
 
         st.divider()
         st.markdown("### Parametreler")
@@ -237,8 +259,17 @@ def consultant_app(user):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Energy.csv", "Var ✅" if u_energy else "Yok ❌")
     c2.metric("Production.csv", "Var ✅" if u_prod else "Yok ❌")
-    c3.metric("Snapshot sayısı", str(len(last_snaps)))
+    c3.metric("Snapshot sayısı (son 10)", str(len(last_snaps)))
     c4.metric("Son snapshot", f"ID:{last_snaps[0].id}" if last_snaps else "-")
+
+    if last_snaps:
+        r = _read_results(last_snaps[0])
+        k = (r.get("kpis") or {}) if isinstance(r, dict) else {}
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Toplam Emisyon (tCO2)", _fmt_tr(k.get("energy_total_tco2", 0), 3))
+        k2.metric("Scope-1 (tCO2)", _fmt_tr(k.get("energy_scope1_tco2", 0), 3))
+        k3.metric("CBAM (€)", _fmt_tr(k.get("cbam_cost_eur", 0), 2))
+        k4.metric("ETS (TL)", _fmt_tr(k.get("ets_cost_tl", 0), 2))
 
     st.divider()
 
@@ -256,9 +287,10 @@ def consultant_app(user):
         ]
     )
 
-    # 0) Veri Yükleme
+    # 1) Veri Yükleme
     with tabs[0]:
         st.subheader("CSV Yükleme")
+        st.caption("Aynı dosya tekrar yüklenirse yeni kayıt açılmaz (dedup).")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -285,10 +317,10 @@ def consultant_app(user):
             st.error("Upload hatası")
             st.exception(e)
 
-    # 1) Hesaplama
+    # 2) Hesaplama
     with tabs[1]:
         st.subheader("Baseline Hesaplama")
-        if st.button("Baseline çalıştır", type="primary"):
+        if st.button("Baseline çalıştır", type="primary", key="btn_run_baseline"):
             try:
                 snap = run_full(project_id, config=config, scenario=None)
                 st.success(f"Hesaplama tamamlandı ✅ Snapshot ID: {snap.id}")
@@ -296,18 +328,18 @@ def consultant_app(user):
                 st.error("Hesaplama başarısız")
                 st.exception(e)
 
-    # 2) Senaryolar
+    # 3) Senaryolar
     with tabs[2]:
         st.subheader("Senaryolar")
 
         left, right = st.columns(2)
         with left:
-            scen_name = st.text_input("Senaryo adı", value="Senaryo 1")
-            renewable_share_pct = st.slider("Yenilenebilir enerji payı (%)", 0, 100, 0)
-            energy_reduction_pct = st.slider("Enerji tüketimi azaltımı (%)", 0, 100, 0)
+            scen_name = st.text_input("Senaryo adı", value="Senaryo 1", key="scen_name")
+            renewable_share_pct = st.slider("Yenilenebilir enerji payı (%)", 0, 100, 0, key="scen_ren")
+            energy_reduction_pct = st.slider("Enerji tüketimi azaltımı (%)", 0, 100, 0, key="scen_red")
         with right:
-            supplier_factor_multiplier = st.slider("Tedarikçi emisyon faktörü çarpanı", 0.50, 2.00, 1.00, 0.05)
-            export_mix_multiplier = st.slider("AB ihracat miktarı çarpanı", 0.00, 2.00, 1.00, 0.05)
+            supplier_factor_multiplier = st.slider("Tedarikçi emisyon faktörü çarpanı", 0.50, 2.00, 1.00, 0.05, key="scen_sup")
+            export_mix_multiplier = st.slider("AB ihracat miktarı çarpanı", 0.00, 2.00, 1.00, 0.05, key="scen_exp")
 
         scenario = {
             "name": scen_name.strip() or "Senaryo",
@@ -317,7 +349,7 @@ def consultant_app(user):
             "export_mix_multiplier": float(export_mix_multiplier),
         }
 
-        if st.button("Senaryoyu çalıştır", type="primary"):
+        if st.button("Senaryoyu çalıştır", type="primary", key="btn_run_scenario"):
             try:
                 snap = run_full(project_id, config=config, scenario=scenario)
                 st.success(f"Senaryo tamamlandı ✅ Snapshot ID: {snap.id} (hash={snap.result_hash[:10]}…)")
@@ -325,7 +357,7 @@ def consultant_app(user):
                 st.error("Senaryo başarısız")
                 st.exception(e)
 
-    # 3) Raporlar
+    # 4) Raporlar
     with tabs[3]:
         st.subheader("Raporlar ve İndirme")
 
@@ -344,48 +376,56 @@ def consultant_app(user):
             st.info("Önce snapshot üretin.")
             st.stop()
 
-        labels = [f"ID:{sn.id} — {sn.created_at}" for sn in snaps]
-        sel = st.selectbox("Snapshot seçin", labels, index=0)
+        labels = [f"ID:{sn.id} — {sn.created_at}" for sn in snaps[:50]]
+        sel = st.selectbox("Snapshot seçin", labels, index=0, key="report_snap_select")
         sn = snaps[labels.index(sel)]
 
         results = _read_results(sn)
         kpis = (results.get("kpis") or {}) if isinstance(results, dict) else {}
+        try:
+            snap_config = json.loads(sn.config_json) if sn.config_json else {}
+        except Exception:
+            snap_config = {}
 
         colA, colB, colC, colD = st.columns(4)
 
         pdf_bytes = None
         with colA:
-            if st.button("PDF üret", type="primary"):
-                payload = {
-                    "kpis": kpis,
-                    "config": json.loads(sn.config_json or "{}"),
-                    "cbam_table": results.get("cbam_table", []),
-                    "scenario": results.get("scenario", {}),
-                }
-                pdf_uri, pdf_sha = build_pdf(sn.id, "CME Demo Raporu — CBAM + ETS (Tahmini)", payload)
-
-                # kayıt
+            if st.button("PDF üret", type="primary", key="btn_make_pdf"):
                 try:
-                    with db() as s:
-                        ex = (
-                            s.execute(
-                                select(Report)
-                                .where(Report.snapshot_id == sn.id, Report.report_type == "pdf", Report.sha256 == pdf_sha)
-                                .limit(1)
-                            )
-                            .scalars()
-                            .first()
-                        )
-                        if not ex:
-                            s.add(Report(snapshot_id=sn.id, report_type="pdf", storage_uri=pdf_uri, sha256=pdf_sha))
-                            s.commit()
-                except Exception:
-                    pass
+                    payload = {
+                        "kpis": kpis,
+                        "config": snap_config,
+                        "cbam_table": results.get("cbam_table", []),
+                        "scenario": results.get("scenario", {}),
+                    }
+                    pdf_uri, pdf_sha = build_pdf(sn.id, "CME Demo Raporu — CBAM + ETS (Tahmini)", payload)
 
-                p = Path(pdf_uri)
-                if p.exists():
-                    pdf_bytes = p.read_bytes()
-                st.success("PDF üretildi ✅")
+                    # duplicate report olmasın
+                    try:
+                        with db() as s:
+                            ex = (
+                                s.execute(
+                                    select(Report)
+                                    .where(Report.snapshot_id == sn.id, Report.report_type == "pdf", Report.sha256 == pdf_sha)
+                                    .limit(1)
+                                )
+                                .scalars()
+                                .first()
+                            )
+                            if not ex:
+                                s.add(Report(snapshot_id=sn.id, report_type="pdf", storage_uri=pdf_uri, sha256=pdf_sha))
+                                s.commit()
+                    except Exception:
+                        pass
+
+                    p = Path(str(pdf_uri))
+                    if p.exists():
+                        pdf_bytes = p.read_bytes()
+                    st.success("PDF üretildi ✅")
+                except Exception as e:
+                    st.error("PDF üretilemedi")
+                    st.exception(e)
 
         with colB:
             zip_bytes = build_zip(sn.id, sn.results_json or "{}")
@@ -401,7 +441,7 @@ def consultant_app(user):
         if pdf_bytes:
             st.download_button("PDF indir (az önce üretilen)", data=pdf_bytes, file_name=f"snapshot_{sn.id}.pdf", mime="application/pdf", type="primary", use_container_width=True)
 
-    # 4) Geçmiş
+    # 5) Geçmiş
     with tabs[4]:
         st.subheader("Geçmiş")
         with db() as s:
@@ -409,18 +449,24 @@ def consultant_app(user):
             snaps = s.execute(select(CalculationSnapshot).where(CalculationSnapshot.project_id == project_id).order_by(CalculationSnapshot.created_at.desc())).scalars().all()
 
         st.markdown("#### Yüklemeler")
-        st.dataframe(
-            [{"ID": u.id, "Tür": u.dataset_type, "Dosya": u.original_filename, "Tarih": u.uploaded_at} for u in uploads],
-            use_container_width=True,
-        )
+        if uploads:
+            st.dataframe(
+                [{"ID": u.id, "Tür": u.dataset_type, "Dosya": u.original_filename, "Tarih": u.uploaded_at} for u in uploads],
+                use_container_width=True,
+            )
+        else:
+            st.info("Henüz upload yok.")
 
         st.markdown("#### Snapshot'lar")
-        st.dataframe(
-            [{"ID": sn.id, "Hash": sn.result_hash[:12] + "…", "Tarih": sn.created_at, "Engine": sn.engine_version} for sn in snaps],
-            use_container_width=True,
-        )
+        if snaps:
+            st.dataframe(
+                [{"ID": sn.id, "Hash": (sn.result_hash[:12] + "…") if sn.result_hash else "", "Tarih": sn.created_at, "Engine": sn.engine_version} for sn in snaps],
+                use_container_width=True,
+            )
+        else:
+            st.info("Henüz snapshot yok.")
 
-    # 5) Kullanıcılar (YENİ)
+    # 6) Kullanıcılar
     with tabs[5]:
         st.subheader("Kullanıcı Yönetimi")
         st.caption("Client Dashboard'u test etmek için burada müşteri kullanıcı oluşturabilirsiniz.")
