@@ -71,11 +71,10 @@ def _save_upload_dedup(
                         except Exception:
                             s.rollback()
                 else:
-                    # storage_uri kolonu yoksa yine de dosyayı yazalım.
                     if not fp.exists():
                         write_bytes(fp, file_bytes)
             except Exception:
-                # Bu noktada upload ekranını patlatmak istemiyoruz.
+                # Upload ekranını patlatmak istemiyoruz.
                 pass
 
             return existing.sha256 or sha
@@ -90,7 +89,7 @@ def _save_upload_dedup(
         sha256=sha,
     )
 
-    # Repo'daki model alanları değişebileceği için "varsa set et" yaklaşımı:
+    # Model alanları sürüme göre değişebileceği için "varsa set et"
     if hasattr(u, "schema_version"):
         setattr(u, "schema_version", "v1")
     if hasattr(u, "storage_uri"):
@@ -211,6 +210,14 @@ def consultant_app(user):
         free_alloc = st.number_input("Ücretsiz tahsis (tCO2)", value=0.0)
         banked = st.number_input("Banked / devreden (tCO2)", value=0.0)
 
+    # Bu config hem baseline hem senaryolarda ortak
+    config = {
+        "eua_price_eur": float(eua),
+        "fx_tl_per_eur": float(fx),
+        "free_alloc_t": float(free_alloc),
+        "banked_t": float(banked),
+    }
+
     # =======================
     # SEKME YAPISI (TÜRKÇE)
     # =======================
@@ -261,13 +268,6 @@ def consultant_app(user):
     # =======================
     with tabs[1]:
         st.subheader("Hesaplama")
-
-        config = {
-            "eua_price_eur": float(eua),
-            "fx_tl_per_eur": float(fx),
-            "free_alloc_t": float(free_alloc),
-            "banked_t": float(banked),
-        }
 
         if st.button("Baseline çalıştır", type="primary"):
             try:
@@ -324,18 +324,31 @@ def consultant_app(user):
         )
 
         st.markdown("#### Snapshot'lar")
-        st.dataframe(
-            [
+        # Senaryo bilgisini results_json içinden çekelim (varsa)
+        rows = []
+        for sn in snaps:
+            scen_name = ""
+            try:
+                r = json.loads(sn.results_json) if sn.results_json else {}
+                scen = r.get("scenario") or {}
+                if scen:
+                    scen_name = scen.get("name") or "Senaryo"
+                else:
+                    scen_name = "Baseline"
+            except Exception:
+                scen_name = ""
+
+            rows.append(
                 {
                     "ID": sn.id,
+                    "Tür": scen_name,
                     "Hash": (sn.result_hash[:12] + "…") if getattr(sn, "result_hash", None) else "",
                     "Tarih": getattr(sn, "created_at", None),
                     "Engine": getattr(sn, "engine_version", ""),
                 }
-                for sn in snaps
-            ],
-            use_container_width=True,
-        )
+            )
+
+        st.dataframe(rows, use_container_width=True)
 
     # =======================
     # 4) RAPORLAR / EXPORT
@@ -355,7 +368,7 @@ def consultant_app(user):
             )
 
         if not snaps:
-            st.info("Önce bir snapshot üretin (Hesaplama sekmesi).")
+            st.info("Önce bir snapshot üretin (Hesaplama veya Senaryolar sekmesi).")
             st.stop()
 
         options = [f"ID:{sn.id} — {sn.created_at}" for sn in snaps]
@@ -370,11 +383,10 @@ def consultant_app(user):
 
         kpis = results.get("kpis", {})
         try:
-            config = json.loads(sn.config_json) if sn.config_json else {}
+            snap_config = json.loads(sn.config_json) if sn.config_json else {}
         except Exception:
-            config = {}
+            snap_config = {}
 
-        # KPI özet
         st.markdown("#### Özet KPI'lar")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Toplam Emisyon (tCO2)", _fmt_float(kpis.get("energy_total_tco2", 0), 3))
@@ -384,7 +396,6 @@ def consultant_app(user):
 
         st.divider()
 
-        # Export butonları
         colA, colB, colC, colD = st.columns(4)
 
         pdf_uri = None
@@ -396,7 +407,7 @@ def consultant_app(user):
                 try:
                     report_payload = {
                         "kpis": kpis,
-                        "config": config,
+                        "config": snap_config,
                         "cbam_table": results.get("cbam_table", []),
                         "scenario": results.get("scenario", {}),
                     }
@@ -432,10 +443,8 @@ def consultant_app(user):
                                 s.add(r)
                                 s.commit()
                     except Exception:
-                        # Report tablosu/kolonları değişmiş olabilir; üretimi bozmayalım.
                         pass
 
-                    # İndirme için bytes hazırlayalım
                     p = Path(pdf_uri)
                     if p.exists():
                         pdf_bytes_for_download = p.read_bytes()
@@ -486,7 +495,6 @@ def consultant_app(user):
                 st.error("JSON export başarısız.")
                 st.exception(e)
 
-        # Üretilen PDF aynı sayfada indirilsin
         if pdf_bytes_for_download:
             st.download_button(
                 "PDF indir (az önce üretilen)",
@@ -537,8 +545,124 @@ def consultant_app(user):
                         st.warning(f"{label} — Dosya disk üzerinde bulunamadı (reboot sonrası silinmiş olabilir).")
 
     # =======================
-    # 5) SENARYOLAR
+    # 5) SENARYOLAR (GERİ GELDİ ✅)
     # =======================
     with tabs[4]:
         st.subheader("Senaryolar")
-        st.info("Senaryo özellikleri bu demo sürümünde devre dışıdır / yakında eklenecektir.")
+        st.caption("Bu ekran mevcut senaryo motorunu kullanır ve yeni bir snapshot üretir.")
+
+        # Senaryo parametreleri (engine/scenarios.py ile uyumlu) :contentReference[oaicite:1]{index=1}
+        left, right = st.columns(2)
+
+        with left:
+            scen_name = st.text_input("Senaryo adı", value="Senaryo 1")
+            renewable_share_pct = st.slider("Yenilenebilir enerji payı (%)", 0, 100, 0)
+            energy_reduction_pct = st.slider("Enerji tüketimi azaltımı (%)", 0, 100, 0)
+
+        with right:
+            supplier_factor_multiplier = st.slider("Tedarikçi emisyon faktörü çarpanı", 0.50, 2.00, 1.00, 0.05)
+            export_mix_multiplier = st.slider("AB ihracat miktarı çarpanı", 0.00, 2.00, 1.00, 0.05)
+
+        scenario = {
+            "name": scen_name.strip() or "Senaryo",
+            "renewable_share": float(renewable_share_pct) / 100.0,
+            "energy_reduction_pct": float(energy_reduction_pct) / 100.0,
+            "supplier_factor_multiplier": float(supplier_factor_multiplier),
+            "export_mix_multiplier": float(export_mix_multiplier),
+        }
+
+        st.divider()
+
+        run_cols = st.columns([1, 1, 2])
+        with run_cols[0]:
+            if st.button("Senaryoyu çalıştır", type="primary"):
+                try:
+                    snap = run_full(project_id, config=config, scenario=scenario)
+                    st.success(f"Senaryo tamamlandı ✅ Snapshot ID: {snap.id} (hash={snap.result_hash[:10]}…)")
+                except Exception as e:
+                    st.error("Senaryo çalıştırma başarısız.")
+                    st.exception(e)
+
+        with run_cols[1]:
+            if st.button("Parametreleri sıfırla"):
+                st.rerun()
+
+        # Hızlı karşılaştırma: en son baseline + en son senaryo KPI
+        st.markdown("#### Hızlı Karşılaştırma (son Baseline vs son Senaryo)")
+
+        def _latest_snapshot_by_kind(kind: str):
+            # kind: "baseline" veya "scenario"
+            with db() as s:
+                snaps = (
+                    s.execute(
+                        select(CalculationSnapshot)
+                        .where(CalculationSnapshot.project_id == project_id)
+                        .order_by(CalculationSnapshot.created_at.desc())
+                    )
+                    .scalars()
+                    .all()
+                )
+            for sn in snaps:
+                try:
+                    r = json.loads(sn.results_json) if sn.results_json else {}
+                    scen = r.get("scenario") or {}
+                    is_scenario = bool(scen)
+                    if kind == "scenario" and is_scenario:
+                        return sn, r
+                    if kind == "baseline" and not is_scenario:
+                        return sn, r
+                except Exception:
+                    continue
+            return None, {}
+
+        base_sn, base_r = _latest_snapshot_by_kind("baseline")
+        scen_sn, scen_r = _latest_snapshot_by_kind("scenario")
+
+        if not base_sn and not scen_sn:
+            st.info("Henüz snapshot yok. Önce Baseline veya Senaryo çalıştırın.")
+        else:
+            base_k = (base_r or {}).get("kpis", {}) or {}
+            scen_k = (scen_r or {}).get("kpis", {}) or {}
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(
+                "Toplam Emisyon (tCO2)",
+                _fmt_float(scen_k.get("energy_total_tco2", 0), 3) if scen_sn else "-",
+                (
+                    _fmt_float((scen_k.get("energy_total_tco2", 0) - base_k.get("energy_total_tco2", 0)), 3)
+                    if (scen_sn and base_sn)
+                    else None
+                ),
+            )
+            c2.metric(
+                "Scope-1 (tCO2)",
+                _fmt_float(scen_k.get("energy_scope1_tco2", 0), 3) if scen_sn else "-",
+                (
+                    _fmt_float((scen_k.get("energy_scope1_tco2", 0) - base_k.get("energy_scope1_tco2", 0)), 3)
+                    if (scen_sn and base_sn)
+                    else None
+                ),
+            )
+            c3.metric(
+                "CBAM (€)",
+                _fmt_float(scen_k.get("cbam_cost_eur", 0), 2) if scen_sn else "-",
+                (
+                    _fmt_float((scen_k.get("cbam_cost_eur", 0) - base_k.get("cbam_cost_eur", 0)), 2)
+                    if (scen_sn and base_sn)
+                    else None
+                ),
+            )
+            c4.metric(
+                "ETS (TL)",
+                _fmt_float(scen_k.get("ets_cost_tl", 0), 2) if scen_sn else "-",
+                (
+                    _fmt_float((scen_k.get("ets_cost_tl", 0) - base_k.get("ets_cost_tl", 0)), 2)
+                    if (scen_sn and base_sn)
+                    else None
+                ),
+            )
+
+            st.caption(
+                f"Son Baseline: {base_sn.id if base_sn else '-'} | "
+                f"Son Senaryo: {scen_sn.id if scen_sn else '-'}"
+            )
