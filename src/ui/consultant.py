@@ -132,7 +132,7 @@ def consultant_app(user):
         free_alloc = st.number_input("Free allocation (tCO2)", value=0.0)
         banked = st.number_input("Banked (tCO2)", value=0.0)
 
-    tabs = st.tabs(["Yükleme", "Hesapla", "Geçmiş", "Raporlar / Export", "Senaryolar (Adım 5)"])
+   tabs = st.tabs(["Yükleme", "Hesapla", "Geçmiş", "Raporlar / İndir", "Senaryolar"])
 
     # ---------------- Upload ----------------
     with tabs[0]:
