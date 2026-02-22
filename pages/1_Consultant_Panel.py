@@ -1,6 +1,23 @@
 import streamlit as st
 
-st.set_page_config(page_title="Consultant Panel", layout="wide")
+from src.db.session import init_db
+from src.services.authz import ensure_bootstrap_admin, current_user, login_view
+from src.ui.consultant import consultant_app
 
-st.title("Consultant Panel")
-st.write("Bu sayfa şimdilik placeholder. Sonraki adımda buraya upload/run/report akışını taşıyacağız.")
+st.set_page_config(page_title="Danışman Paneli", layout="wide")
+
+# DB init + bootstrap
+init_db()
+ensure_bootstrap_admin()
+
+user = current_user()
+if not user:
+    login_view()
+    st.stop()
+
+# Yetki kontrolü
+if not str(user.role).startswith("consultant"):
+    st.error("Bu sayfa sadece danışman kullanıcılar içindir.")
+    st.stop()
+
+consultant_app(user)
