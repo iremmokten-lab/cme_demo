@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -47,14 +51,12 @@ class Project(Base):
     id = Column(Integer, primary_key=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
     facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True, index=True)
-
     name = Column(String(200), nullable=False)
     year = Column(Integer, default=2025)
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
     company = relationship("Company", back_populates="projects")
     facility = relationship("Facility", back_populates="projects")
-
     uploads = relationship("DatasetUpload", back_populates="project", cascade="all, delete-orphan")
     snapshots = relationship("CalculationSnapshot", back_populates="project", cascade="all, delete-orphan")
 
@@ -67,15 +69,49 @@ class DatasetUpload(Base):
 
     dataset_type = Column(String(50), nullable=False)  # energy / production
     uploaded_at = Column(DateTime(timezone=True), default=utcnow)
-
     original_filename = Column(String(300), nullable=False)
+
     sha256 = Column(String(64), nullable=False, index=True)
     schema_version = Column(String(50), default="v1")
-
     storage_uri = Column(String(500), nullable=False)
+
+    # Kim yükledi (opsiyonel)
     uploaded_by_user_id = Column(Integer, nullable=True)
 
+    # Evidence pack için: veri kaynağı / doküman referansı (opsiyonel)
+    source = Column(String(200), default="")
+    document_ref = Column(String(300), default="")
+
     project = relationship("Project", back_populates="uploads")
+
+
+class Methodology(Base):
+    __tablename__ = "methodologies"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False, index=True)
+    description = Column(Text, default="")
+    scope = Column(String(200), default="CBAM+ETS")
+    version = Column(String(50), default="v1")
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+    snapshots = relationship("CalculationSnapshot", back_populates="methodology")
+
+
+class EmissionFactor(Base):
+    __tablename__ = "emissionfactors"
+
+    id = Column(Integer, primary_key=True)
+
+    factor_type = Column(String(120), nullable=False, index=True)  # e.g. "grid", "fuel_natural_gas"
+    value = Column(Float, nullable=False)
+    unit = Column(String(80), nullable=False, default="kgCO2e/unit")
+    source = Column(String(300), default="")
+    year = Column(Integer, nullable=True)
+    version = Column(String(50), default="v1")
+    region = Column(String(120), default="TR")
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
 class CalculationSnapshot(Base):
@@ -90,10 +126,21 @@ class CalculationSnapshot(Base):
     config_json = Column(Text, default="{}")
     input_hashes_json = Column(Text, default="{}")
     results_json = Column(Text, default="{}")
+
+    methodology_id = Column(Integer, ForeignKey("methodologies.id"), nullable=True, index=True)
+
     result_hash = Column(String(64), nullable=False, index=True)
+
+    # MRV / governance
+    created_by_user_id = Column(Integer, nullable=True)
+    locked = Column(Boolean, default=False)
+    locked_at = Column(DateTime(timezone=True), nullable=True)
+    locked_by_user_id = Column(Integer, nullable=True)
+    shared_with_client = Column(Boolean, default=False)
 
     project = relationship("Project", back_populates="snapshots")
     reports = relationship("Report", back_populates="snapshot", cascade="all, delete-orphan")
+    methodology = relationship("Methodology", back_populates="snapshots")
 
 
 class Report(Base):
@@ -104,6 +151,7 @@ class Report(Base):
 
     created_at = Column(DateTime(timezone=True), default=utcnow)
     report_type = Column(String(50), default="pdf")
+
     storage_uri = Column(String(500), nullable=False)
     sha256 = Column(String(64), nullable=False, index=True)
 
@@ -114,11 +162,9 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
-
     email = Column(String(300), unique=True, nullable=False, index=True)
     password_hash = Column(String(200), nullable=False)
-
     role = Column(String(50), default="clientviewer")
-    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True, index=True)
 
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True, index=True)
     company = relationship("Company", back_populates="users")
