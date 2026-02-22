@@ -6,7 +6,7 @@ from sqlalchemy import select
 from src.ui.components import h2
 from src.services import projects as prj
 from src.db.session import db
-from src.db.models import DatasetUpload, CalculationSnapshot, Report, User
+from src.db.models import DatasetUpload, CalculationSnapshot, Report
 from src.services.ingestion import validate_csv
 from src.services.storage import UPLOAD_DIR, write_bytes
 from src.mrv.lineage import sha256_bytes
@@ -15,9 +15,14 @@ from src.services.workflow import run_full
 from src.services.reporting import build_pdf
 from src.services.exports import build_zip
 
+
+def _safe_name(name: str) -> str:
+    return (name or "").replace("/", "_").replace("\\", "_").strip()
+
+
 def _save_upload(project_id: int, dataset_type: str, file_name: str, file_bytes: bytes, user_id: int | None):
     sha = sha256_bytes(file_bytes)
-    safe = file_name.replace("/", "_").replace("\\", "_")
+    safe = _safe_name(file_name) or f"{dataset_type}.csv"
     fp = UPLOAD_DIR / f"project_{project_id}" / dataset_type / f"{sha}_{safe}"
     write_bytes(fp, file_bytes)
 
@@ -37,58 +42,96 @@ def _save_upload(project_id: int, dataset_type: str, file_name: str, file_bytes:
     append_audit("upload_saved", {"project_id": project_id, "type": dataset_type, "sha": sha, "uri": str(fp)})
     return sha
 
+
 def consultant_app(user):
     st.title("Consultant Panel")
 
-    # Company selection
+    # ---- sidebar selectors ----
     companies = prj.list_companies_for_user(user)
     if not companies:
         st.warning("Company yok.")
         return
 
+    # Session state keys
+    if "selected_company_id" not in st.session_state:
+        st.session_state["selected_company_id"] = companies[0].id
+    if "selected_project_id" not in st.session_state:
+        st.session_state["selected_project_id"] = None
+
     with st.sidebar:
         st.markdown("### Company")
-        company_names = ["(new)"] + [c.name for c in companies]
-        csel = st.selectbox("Select", company_names)
-        if csel == "(new)":
-            new_name = st.text_input("New company name")
-            if st.button("Create company"):
-                if new_name.strip():
-                    prj.create_company(new_name)
-                    st.rerun()
-            st.stop()
-        company = next(c for c in companies if c.name == csel)
+        company_map = {c.name: c.id for c in companies}
+        company_name = st.selectbox("Select", list(company_map.keys()), index=0)
+        company_id = company_map[company_name]
+        st.session_state["selected_company_id"] = company_id
 
         st.markdown("### Facility")
-        facilities = prj.list_facilities(company.id)
-        fac_label = ["(none)"] + [f"{f.name} ({f.country})" for f in facilities]
-        fac_sel = st.selectbox("Facility", fac_label)
-        facility_id = None
-        if fac_sel != "(none)" and facilities:
-            facility_id = facilities[fac_label.index(fac_sel)-1].id
+        facilities = prj.list_facilities(company_id)
+        fac_opts = {"(none)": None}
+        for f in facilities:
+            fac_opts[f"{f.name} ({f.country})"] = f.id
+        fac_label = st.selectbox("Facility", list(fac_opts.keys()), index=0)
+        facility_id = fac_opts[fac_label]
 
         with st.expander("Create facility"):
             fn = st.text_input("Facility name")
             cc = st.text_input("Country", value="TR")
             ss = st.text_input("Sector", value="")
             if st.button("Add facility"):
-                if fn.strip():
-                    prj.create_facility(company.id, fn, cc, ss)
-                    st.rerun()
+                try:
+                    if not fn.strip():
+                        st.warning("Facility name boş olamaz.")
+                    else:
+                        prj.create_facility(company_id, fn, cc, ss)
+                        st.success("Facility oluşturuldu.")
+                        st.rerun()
+                except Exception as e:
+                    st.exception(e)
 
         st.markdown("### Project")
-        projects = prj.list_projects(company.id)
-        proj_label = ["(new)"] + [f"{p.name} / {p.year} (id:{p.id})" for p in projects]
-        psel = st.selectbox("Project", proj_label)
+        projects = prj.list_projects(company_id)
+
+        # Build project options
+        proj_opts = {"(new)": None}
+        for p in projects:
+            proj_opts[f"{p.name} / {p.year} (id:{p.id})"] = p.id
+
+        # If selected project no longer exists, reset
+        if st.session_state["selected_project_id"] not in proj_opts.values():
+            st.session_state["selected_project_id"] = None
+
+        # Selectbox index
+        proj_labels = list(proj_opts.keys())
+        current_id = st.session_state["selected_project_id"]
+        if current_id is None:
+            proj_index = 0
+        else:
+            # find label for current_id
+            label = next(k for k, v in proj_opts.items() if v == current_id)
+            proj_index = proj_labels.index(label)
+
+        psel = st.selectbox("Project", proj_labels, index=proj_index)
+
         if psel == "(new)":
-            pn = st.text_input("Project name")
-            py = st.number_input("Year", 2000, 2100, 2025)
-            if st.button("Create project"):
-                if pn.strip():
-                    prj.create_project(company.id, facility_id, pn, int(py))
-                    st.rerun()
-            st.stop()
-        project_id = projects[proj_label.index(psel)-1].id
+            pn = st.text_input("Project name", key="new_project_name")
+            py = st.number_input("Year", 2000, 2100, 2025, key="new_project_year")
+            if st.button("Create project", type="primary"):
+                try:
+                    if not pn.strip():
+                        st.warning("Project name boş olamaz.")
+                    else:
+                        newp = prj.create_project(company_id, facility_id, pn, int(py))
+                        st.session_state["selected_project_id"] = newp.id
+                        st.success(f"Project oluşturuldu: id={newp.id}")
+                        st.rerun()
+                except Exception as e:
+                    st.exception(e)
+            # Project seçilmeden aşağıya geçme
+            st.info("Devam etmek için proje oluşturun veya mevcut bir proje seçin.")
+            return
+
+        project_id = proj_opts[psel]
+        st.session_state["selected_project_id"] = project_id
 
         st.divider()
         st.markdown("### Prices / ETS")
@@ -97,6 +140,7 @@ def consultant_app(user):
         free_alloc = st.number_input("Free allocation (tCO2)", value=0.0)
         banked = st.number_input("Banked allowances (tCO2)", value=0.0)
 
+    # ---- main tabs (only when project selected) ----
     tabs = st.tabs(["Upload", "Run", "History", "Reports/Export", "Scenarios (Step 5)"])
 
     # Upload
@@ -104,27 +148,35 @@ def consultant_app(user):
         h2("CSV Upload", "energy.csv + production.csv")
         col1, col2 = st.columns(2)
         with col1:
-            up_energy = st.file_uploader("energy.csv", type=["csv"], key="u_energy")
+            up_energy = st.file_uploader("energy.csv", type=["csv"], key=f"u_energy_{project_id}")
         with col2:
-            up_prod = st.file_uploader("production.csv", type=["csv"], key="u_prod")
+            up_prod = st.file_uploader("production.csv", type=["csv"], key=f"u_prod_{project_id}")
 
-        if up_energy:
-            df = pd.read_csv(up_energy)
-            errs = validate_csv("energy", df)
-            if errs:
-                st.error(" | ".join(errs))
-            else:
-                sha = _save_upload(project_id, "energy", up_energy.name, up_energy.getvalue(), user.id)
-                st.success(f"energy upload OK sha={sha[:10]}…")
+        if up_energy is not None:
+            try:
+                b = up_energy.getvalue()
+                df = pd.read_csv(up_energy)
+                errs = validate_csv("energy", df)
+                if errs:
+                    st.error(" | ".join(errs))
+                else:
+                    sha = _save_upload(project_id, "energy", up_energy.name, b, user.id)
+                    st.success(f"energy upload OK sha={sha[:10]}…")
+            except Exception as e:
+                st.exception(e)
 
-        if up_prod:
-            df = pd.read_csv(up_prod)
-            errs = validate_csv("production", df)
-            if errs:
-                st.error(" | ".join(errs))
-            else:
-                sha = _save_upload(project_id, "production", up_prod.name, up_prod.getvalue(), user.id)
-                st.success(f"production upload OK sha={sha[:10]}…")
+        if up_prod is not None:
+            try:
+                b = up_prod.getvalue()
+                df = pd.read_csv(up_prod)
+                errs = validate_csv("production", df)
+                if errs:
+                    st.error(" | ".join(errs))
+                else:
+                    sha = _save_upload(project_id, "production", up_prod.name, b, user.id)
+                    st.success(f"production upload OK sha={sha[:10]}…")
+            except Exception as e:
+                st.exception(e)
 
     # Run (baseline)
     with tabs[1]:
@@ -136,18 +188,25 @@ def consultant_app(user):
             "banked_t": float(banked),
         }
         if st.button("Run baseline", type="primary"):
-            snap = run_full(project_id, config=config, scenario=None)
-            st.success(f"Snapshot: {snap.id}  hash={snap.result_hash[:10]}…")
+            try:
+                snap = run_full(project_id, config=config, scenario=None)
+                st.success(f"Snapshot: {snap.id}  hash={snap.result_hash[:10]}…")
+            except Exception as e:
+                st.exception(e)
 
     # History
     with tabs[2]:
         h2("History", "Uploads + Snapshots")
         with db() as s:
             uploads = s.execute(
-                select(DatasetUpload).where(DatasetUpload.project_id == project_id).order_by(DatasetUpload.uploaded_at.desc())
+                select(DatasetUpload)
+                .where(DatasetUpload.project_id == project_id)
+                .order_by(DatasetUpload.uploaded_at.desc())
             ).scalars().all()
             snaps = s.execute(
-                select(CalculationSnapshot).where(CalculationSnapshot.project_id == project_id).order_by(CalculationSnapshot.created_at.desc())
+                select(CalculationSnapshot)
+                .where(CalculationSnapshot.project_id == project_id)
+                .order_by(CalculationSnapshot.created_at.desc())
             ).scalars().all()
 
         st.markdown("#### Uploads")
@@ -179,7 +238,9 @@ def consultant_app(user):
         h2("PDF + Export", "Seçilen snapshot için PDF/XLSX/ZIP")
         with db() as s:
             snaps = s.execute(
-                select(CalculationSnapshot).where(CalculationSnapshot.project_id == project_id).order_by(CalculationSnapshot.created_at.desc())
+                select(CalculationSnapshot)
+                .where(CalculationSnapshot.project_id == project_id)
+                .order_by(CalculationSnapshot.created_at.desc())
             ).scalars().all()
 
         if not snaps:
@@ -196,24 +257,40 @@ def consultant_app(user):
 
             with colA:
                 if st.button("Generate PDF"):
-                    pdf_uri, pdf_sha = build_pdf(sn.id, "CME Report", kpis)
-                    with db() as s:
-                        r = Report(snapshot_id=sn.id, report_type="pdf", storage_uri=pdf_uri, sha256=pdf_sha)
-                        s.add(r)
-                        s.commit()
-                    st.success("PDF üretildi.")
+                    try:
+                        pdf_uri, pdf_sha = build_pdf(sn.id, "CME Report", kpis)
+                        with db() as s:
+                            r = Report(snapshot_id=sn.id, report_type="pdf", storage_uri=pdf_uri, sha256=pdf_sha)
+                            s.add(r)
+                            s.commit()
+                        st.success("PDF üretildi.")
+                    except Exception as e:
+                        st.exception(e)
+
             with colB:
-                zip_bytes = build_zip(sn.id, sn.results_json)
-                st.download_button("Download ZIP (json+xlsx)", data=zip_bytes, file_name=f"snapshot_{sn.id}.zip")
+                try:
+                    zip_bytes = build_zip(sn.id, sn.results_json)
+                    st.download_button("Download ZIP (json+xlsx)", data=zip_bytes, file_name=f"snapshot_{sn.id}.zip")
+                except Exception as e:
+                    st.exception(e)
+
             with colC:
-                st.download_button("Download results.json", data=sn.results_json.encode("utf-8"), file_name=f"snapshot_{sn.id}_results.json")
+                st.download_button("Download results.json", data=sn.results_json.encode("utf-8"),
+                                   file_name=f"snapshot_{sn.id}_results.json")
 
             with db() as s:
-                reports = s.execute(select(Report).where(Report.snapshot_id == sn.id).order_by(Report.created_at.desc())).scalars().all()
+                reports = s.execute(
+                    select(Report).where(Report.snapshot_id == sn.id).order_by(Report.created_at.desc())
+                ).scalars().all()
             if reports:
                 st.markdown("#### Reports")
-                st.dataframe([{"id": r.id, "type": r.report_type, "uri": r.storage_uri, "sha256": r.sha256, "at": r.created_at} for r in reports],
-                             use_container_width=True)
+                st.dataframe([{
+                    "id": r.id,
+                    "type": r.report_type,
+                    "uri": r.storage_uri,
+                    "sha256": r.sha256,
+                    "at": r.created_at
+                } for r in reports], use_container_width=True)
 
     # Scenarios Step 5
     with tabs[4]:
@@ -241,14 +318,20 @@ def consultant_app(user):
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Run BEFORE (baseline)"):
-                snap_b = run_full(project_id, config=config, scenario=None)
-                st.session_state["before_id"] = snap_b.id
-                st.success(f"Before snapshot={snap_b.id}")
+                try:
+                    snap_b = run_full(project_id, config=config, scenario=None)
+                    st.session_state["before_id"] = snap_b.id
+                    st.success(f"Before snapshot={snap_b.id}")
+                except Exception as e:
+                    st.exception(e)
         with col2:
             if st.button("Run AFTER (scenario)", type="primary"):
-                snap_a = run_full(project_id, config=config, scenario=scenario)
-                st.session_state["after_id"] = snap_a.id
-                st.success(f"After snapshot={snap_a.id}")
+                try:
+                    snap_a = run_full(project_id, config=config, scenario=scenario)
+                    st.session_state["after_id"] = snap_a.id
+                    st.success(f"After snapshot={snap_a.id}")
+                except Exception as e:
+                    st.exception(e)
 
         before_id = st.session_state.get("before_id")
         after_id = st.session_state.get("after_id")
@@ -270,7 +353,6 @@ def consultant_app(user):
             c3.metric("ETS TL Before", f'{kb["ets_cost_tl"]:.2f}')
             c4.metric("ETS TL After", f'{ka["ets_cost_tl"]:.2f}', delta=f'{(ka["ets_cost_tl"]-kb["ets_cost_tl"]):.2f}')
 
-            # SKU savings (CBAM)
             dfb = pd.DataFrame(rb.get("cbam_table", []))
             dfa = pd.DataFrame(ra.get("cbam_table", []))
             if not dfb.empty and not dfa.empty:
@@ -280,7 +362,6 @@ def consultant_app(user):
                 merged = dfb.merge(dfa, on="sku", how="outer").fillna(0.0)
                 merged["savings_eur"] = merged["before_cbam_eur"] - merged["after_cbam_eur"]
                 merged = merged.sort_values("savings_eur", ascending=False)
-
                 st.markdown("### Top risk / savings SKU")
                 st.dataframe(merged, use_container_width=True)
         else:
