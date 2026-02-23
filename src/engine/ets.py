@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, List
 
 
 def _to_float(x: Any) -> float:
@@ -17,7 +17,12 @@ def ets_net_and_cost(
     allowance_price_eur_per_t: float,
     fx_tl_per_eur: float,
 ) -> dict:
-    """ETS net & cost (basit finans)."""
+    """
+    ETS net & cost (finansal görünüm).
+    - scope1_tco2: direct emissions (fuel combustion) tCO2
+    - free_alloc_t: ücretsiz tahsis tCO2
+    - banked_t: devreden / banked tCO2
+    """
     s1 = max(_to_float(scope1_tco2), 0.0)
     free_alloc = max(_to_float(free_alloc_t), 0.0)
     banked = max(_to_float(banked_t), 0.0)
@@ -33,20 +38,26 @@ def ets_net_and_cost(
         "net_tco2": float(net),
         "cost_eur": float(cost_eur),
         "cost_tl": float(cost_tl),
-        "price_eur_per_t": float(allowance_price_eur_per_t),
-        "fx_tl_per_eur": float(fx_tl_per_eur),
+        "price_eur_per_t": float(_to_float(allowance_price_eur_per_t)),
+        "fx_tl_per_eur": float(_to_float(fx_tl_per_eur)),
     }
 
 
 def ets_verification_payload(
-    fuel_rows: list[dict],
+    fuel_rows: List[dict],
     monitoring_plan: dict | None,
     uncertainty_notes: str = "",
 ) -> dict:
-    """ETS MRV yaklaşımı: activity data + QA/QC placeholder + uncertainty.
+    """
+    Paket D2: ETS “verification-ready” payload (MVP)
 
-    fuel_rows: emissions engine'den gelen satırlar.
-    monitoring_plan: DB’den okunmuş plan (dict)
+    - Fuel structure (activity data) satır bazında:
+        fuel_type, quantity, unit, ncv, ef, of, tco2, factor_source
+    - MonitoringPlan zorunlu bağ:
+        tier, method, data source, QA procedure, responsible
+      (UI tarafında tesis seçimi ile plan DB’den geliyor)
+    - Rapora girecek alanlar:
+        activity data, uncertainty notes, QA/QC summary
     """
     # Activity data summary (fuel-level)
     activity = []
@@ -64,19 +75,41 @@ def ets_verification_payload(
             }
         )
 
+    mp = monitoring_plan or {}
+
+    # Monitoring plan minimum fields (verification friendly)
+    mp_min = {
+        "id": mp.get("id"),
+        "facility_id": mp.get("facility_id"),
+        "method": mp.get("method") or "standard",
+        "tier_level": mp.get("tier_level") or "Tier 2",
+        "data_source": mp.get("data_source") or "",
+        "qa_procedure": mp.get("qa_procedure") or "",
+        "responsible_person": mp.get("responsible_person") or "",
+        "updated_at": mp.get("updated_at"),
+    }
+
+    uncertainty = {
+        "notes": (uncertainty_notes or "").strip()
+        or "Belirsizlik notu girilmedi. Verification için tier metoduna göre ölçüm/aktivite belirsizlikleri eklenmelidir.",
+        "status": "MVP",
+    }
+
+    qa_qc = {
+        "notes": (mp_min.get("qa_procedure") or "").strip()
+        or (
+            "QA/QC prosedürü girilmedi. Verification için sayaç kalibrasyonu, fatura mutabakatı, veri onay akışı ve değişiklik yönetimi tanımlanmalıdır."
+        ),
+        "status": "MVP",
+    }
+
     return {
-        "monitoring_plan": monitoring_plan or {},
+        "monitoring_plan": mp_min,
         "activity_data": activity,
-        "uncertainty": {
-            "notes": uncertainty_notes or (
-                "Belirsizlik hesapları bu MVP’de placeholder’dır. "
-                "Tier metoduna göre ölçüm/aktivite verisi belirsizlikleri eklenmelidir."
-            ),
-        },
-        "qa_qc": {
-            "notes": (
-                "QA/QC notları bu MVP’de placeholder’dır. "
-                "Sayaç kalibrasyonu, fatura mutabakatı, veri onay akışı gibi kontroller eklenmelidir."
-            )
-        },
+        "uncertainty": uncertainty,
+        "qa_qc": qa_qc,
+        "verification_notes": [
+            "Bu çıktı ETS verification-ready formatına yaklaşmak için tasarlanmış MVP’dir.",
+            "Resmî raporlama için doğrulama kapsamı, ölçüm sistemleri, belirsizlik hesapları ve kontrol prosedürleri detaylandırılmalıdır.",
+        ],
     }
