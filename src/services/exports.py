@@ -21,20 +21,45 @@ from src.services.storage import EVIDENCE_DOCS_CATEGORIES
 
 
 def build_xlsx_from_results(results_json: str) -> bytes:
+    """
+    Paket D4: XLSX export geliştirme
+      - KPIs
+      - CBAM_Table
+      - CBAM_Goods_Summary (varsa)
+      - ETS_Activity (varsa)
+    """
     results = json.loads(results_json) if results_json else {}
     kpis = results.get("kpis", {}) or {}
     table = results.get("cbam_table", []) or []
+
+    cbam_goods = []
+    try:
+        cbam_goods = (results.get("cbam") or {}).get("totals", {}).get("goods_summary", []) or []
+    except Exception:
+        cbam_goods = []
+
+    ets_activity = []
+    try:
+        ets_activity = ((results.get("ets") or {}).get("verification") or {}).get("activity_data", []) or []
+    except Exception:
+        ets_activity = []
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         pd.DataFrame([kpis]).to_excel(writer, index=False, sheet_name="KPIs")
         pd.DataFrame(table).to_excel(writer, index=False, sheet_name="CBAM_Table")
+
+        if isinstance(cbam_goods, list) and cbam_goods:
+            pd.DataFrame(cbam_goods).to_excel(writer, index=False, sheet_name="CBAM_Goods")
+
+        if isinstance(ets_activity, list) and ets_activity:
+            pd.DataFrame(ets_activity).to_excel(writer, index=False, sheet_name="ETS_Activity")
+
     return out.getvalue()
 
 
 def build_zip(snapshot_id: int, results_json: str) -> bytes:
     xlsx_bytes = build_xlsx_from_results(results_json)
-
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr(f"snapshot_{snapshot_id}_results.json", results_json or "{}")
@@ -53,6 +78,15 @@ def _safe_read_bytes(uri: str) -> bytes:
 
 
 def _snapshot_input_uris(snapshot: CalculationSnapshot) -> dict:
+    """
+    input_hashes_json yeni format:
+      {
+        "energy": {"uri":..., "sha256":..., ...},
+        "production": {...},
+        "materials": {...}
+      }
+    eski formatlarla uyumluluk da korunur.
+    """
     try:
         ih = json.loads(snapshot.input_hashes_json or "{}")
     except Exception:
@@ -77,6 +111,11 @@ def _snapshot_input_uris(snapshot: CalculationSnapshot) -> dict:
 
 
 def _ensure_pdf_for_snapshot(snapshot: CalculationSnapshot) -> tuple[bytes, str]:
+    """
+    Paket D4: PDF payload artık CBAM/ETS bölümleri + DQ içerir.
+    - Eğer DB’de aynı pdf sha ile kayıt varsa onu okur.
+    - Yoksa build_pdf ile üretir ve Report tablosuna yazar (best-effort).
+    """
     results = {}
     try:
         results = json.loads(snapshot.results_json or "{}")
@@ -86,30 +125,34 @@ def _ensure_pdf_for_snapshot(snapshot: CalculationSnapshot) -> tuple[bytes, str]
     kpis = (results.get("kpis") or {}) if isinstance(results, dict) else {}
     cbam_table = (results.get("cbam_table") or []) if isinstance(results, dict) else []
     scenario = (results.get("scenario") or {}) if isinstance(results, dict) else {}
+    cbam_section = (results.get("cbam") or {}) if isinstance(results, dict) else {}
+    ets_section = (results.get("ets") or {}) if isinstance(results, dict) else {}
 
     try:
         cfg = json.loads(snapshot.config_json or "{}")
     except Exception:
         cfg = {}
 
+    # Methodology (zengin)
     meth_payload = None
     if getattr(snapshot, "methodology_id", None):
         with db() as s:
             m = s.get(Methodology, int(snapshot.methodology_id))
-        if m:
-            meth_payload = {
-                "id": m.id,
-                "name": m.name,
-                "description": m.description,
-                "scope": m.scope,
-                "version": m.version,
-                "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
-            }
+            if m:
+                meth_payload = {
+                    "id": m.id,
+                    "name": m.name,
+                    "description": m.description,
+                    "scope": m.scope,
+                    "version": m.version,
+                    "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
+                }
 
-    title = "Rapor — CBAM + ETS (Tahmini)"
+    title = "Rapor — CBAM + ETS (Readiness)"
     if isinstance(scenario, dict) and scenario.get("name"):
-        title = f"Senaryo Raporu — {scenario.get('name')} (Tahmini)"
+        title = f"Senaryo Raporu — {scenario.get('name')} (Readiness)"
 
+    # DB’de hazır pdf var mı?
     with db() as s:
         r = (
             s.execute(
@@ -121,18 +164,52 @@ def _ensure_pdf_for_snapshot(snapshot: CalculationSnapshot) -> tuple[bytes, str]
             .scalars()
             .first()
         )
+        if r and getattr(r, "storage_uri", None):
+            pdf_bytes = _safe_read_bytes(str(r.storage_uri))
+            if pdf_bytes:
+                return pdf_bytes, getattr(r, "sha256", sha256_bytes(pdf_bytes))
 
-    if r and getattr(r, "storage_uri", None):
-        pdf_bytes = _safe_read_bytes(str(r.storage_uri))
-        if pdf_bytes:
-            return pdf_bytes, getattr(r, "sha256", sha256_bytes(pdf_bytes))
+    # Data quality (upload’lardan derive)
+    dq = {}
+    inputs = _snapshot_input_uris(snapshot)
+    try:
+        with db() as s:
+            for key in ("energy", "production", "materials"):
+                sha_val = (inputs.get(key) or {}).get("sha256") or ""
+                if not sha_val:
+                    continue
+                up = (
+                    s.execute(
+                        select(DatasetUpload)
+                        .where(
+                            DatasetUpload.project_id == snapshot.project_id,
+                            DatasetUpload.dataset_type == key,
+                            DatasetUpload.sha256 == sha_val,
+                        )
+                        .order_by(DatasetUpload.uploaded_at.desc())
+                        .limit(1)
+                    )
+                    .scalars()
+                    .first()
+                )
+                if up:
+                    try:
+                        dq_report = json.loads(up.data_quality_report_json or "{}")
+                    except Exception:
+                        dq_report = {}
+                    dq[key] = {"score": up.data_quality_score, "report": dq_report}
+    except Exception:
+        dq = {}
 
     payload = {
         "kpis": kpis,
         "config": cfg,
+        "cbam": cbam_section,
+        "ets": ets_section,
         "cbam_table": cbam_table,
         "scenario": scenario,
         "methodology": meth_payload,
+        "data_quality": dq,
         "data_sources": [
             "energy.csv (yüklenen dosya)",
             "production.csv (yüklenen dosya)",
@@ -146,6 +223,7 @@ def _ensure_pdf_for_snapshot(snapshot: CalculationSnapshot) -> tuple[bytes, str]
             "Precursor emissions: materials.material_quantity × materials.emission_factor",
         ],
     }
+
     pdf_uri, pdf_sha = build_pdf(snapshot.id, title, payload)
     pdf_bytes = _safe_read_bytes(pdf_uri)
 
@@ -171,7 +249,8 @@ def _ensure_pdf_for_snapshot(snapshot: CalculationSnapshot) -> tuple[bytes, str]
 
 
 def _hmac_signature(payload_bytes: bytes) -> str | None:
-    """Signed manifest (Paket B).
+    """
+    Signed manifest (Paket B).
     İmza anahtarı: env var EVIDENCE_SIGNING_KEY (Streamlit Cloud secrets -> env olarak set edilebilir).
     """
     key = os.getenv("EVIDENCE_SIGNING_KEY", "")
@@ -186,21 +265,22 @@ def _json_bytes(obj: dict) -> bytes:
 
 
 def build_evidence_pack(snapshot_id: int) -> bytes:
-    """Evidence pack export (ZIP) — Paket B.
-
+    """
+    Evidence pack export (ZIP) — Paket B + Paket D4 uyumlu.
     İçerik:
-    - input csv: energy/production/materials
-    - factor library
-    - methodology
-    - snapshot json
-    - report pdf
-    - evidence documents (categories)
-    - manifest.json (signature dahil)
+      - input csv: energy/production/materials
+      - factor library
+      - methodology
+      - snapshot json
+      - report pdf (CBAM/ETS/DQ bölümleri)
+      - evidence documents (categories)
+      - data_quality.json
+      - manifest.json (signature dahil)
     """
     with db() as s:
         snapshot = s.get(CalculationSnapshot, int(snapshot_id))
-    if not snapshot:
-        raise ValueError("Snapshot bulunamadı.")
+        if not snapshot:
+            raise ValueError("Snapshot bulunamadı.")
 
     inputs = _snapshot_input_uris(snapshot)
     energy_bytes = _safe_read_bytes(inputs.get("energy", {}).get("uri", ""))
@@ -210,6 +290,7 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     # Factor library
     with db() as s:
         factors = s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.year.desc())).scalars().all()
+
     factor_rows = []
     factor_versions = {}
     for f in factors:
@@ -227,6 +308,7 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         key = f"{f.factor_type}:{f.region}"
         if key not in factor_versions:
             factor_versions[key] = {"version": f.version, "year": f.year}
+
     factors_json = {"emission_factors": factor_rows}
 
     # Methodology
@@ -235,16 +317,16 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     if getattr(snapshot, "methodology_id", None):
         with db() as s:
             m = s.get(Methodology, int(snapshot.methodology_id))
-        if m:
-            methodology_version = m.version
-            meth_obj = {
-                "id": m.id,
-                "name": m.name,
-                "description": m.description,
-                "scope": m.scope,
-                "version": m.version,
-                "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
-            }
+            if m:
+                methodology_version = m.version
+                meth_obj = {
+                    "id": m.id,
+                    "name": m.name,
+                    "description": m.description,
+                    "scope": m.scope,
+                    "version": m.version,
+                    "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
+                }
 
     # Snapshot json
     try:
@@ -275,10 +357,9 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     # PDF
     pdf_bytes, report_hash = _ensure_pdf_for_snapshot(snapshot)
 
-    # Evidence docs: project bazlı (kurumsal yaklaşım)
+    # Evidence docs: project bazlı
     evidence_manifest = []
     with db() as s:
-        # snapshot.project_id -> project evidence docs
         docs = s.execute(select(EvidenceDocument).where(EvidenceDocument.project_id == snapshot.project_id)).scalars().all()
 
     evidence_files_to_zip: list[tuple[str, bytes]] = []
@@ -302,7 +383,6 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     dq = {}
     try:
         with db() as s:
-            # energy/prod/materials upload'larını sha üzerinden yakala
             for key in ("energy", "production", "materials"):
                 sha_val = (inputs.get(key) or {}).get("sha256") or ""
                 if not sha_val:
@@ -310,7 +390,11 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
                 up = (
                     s.execute(
                         select(DatasetUpload)
-                        .where(DatasetUpload.project_id == snapshot.project_id, DatasetUpload.dataset_type == key, DatasetUpload.sha256 == sha_val)
+                        .where(
+                            DatasetUpload.project_id == snapshot.project_id,
+                            DatasetUpload.dataset_type == key,
+                            DatasetUpload.sha256 == sha_val,
+                        )
                         .order_by(DatasetUpload.uploaded_at.desc())
                         .limit(1)
                     )
@@ -322,10 +406,7 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
                         dq_report = json.loads(up.data_quality_report_json or "{}")
                     except Exception:
                         dq_report = {}
-                    dq[key] = {
-                        "score": up.data_quality_score,
-                        "report": dq_report,
-                    }
+                    dq[key] = {"score": up.data_quality_score, "report": dq_report}
     except Exception:
         dq = {}
 
