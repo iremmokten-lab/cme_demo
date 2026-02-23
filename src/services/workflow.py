@@ -14,7 +14,8 @@ from src.engine.scenarios import apply_scenarios
 from src.mrv.audit import append_audit
 from src.mrv.lineage import sha256_json
 
-ENGINE_VERSION = "engine-1.0.0-packetA"
+# Paket D3: deterministik reuse (input hash + config hash)
+ENGINE_VERSION = "engine-2.0.0-packetD"
 
 
 def load_csv_from_uri(uri: str) -> pd.DataFrame:
@@ -49,7 +50,8 @@ def _latest_snapshot(project_id: int) -> CalculationSnapshot | None:
 
 
 def _monitoring_plan_for_project(project_id: int) -> dict | None:
-    """Paket A: MonitoringPlan seçimi UI'dan gelmeyebilir.
+    """
+    Paket D2: MonitoringPlan zorunlu bağ (facility bazlı)
     Varsayılan: project.facility_id varsa o tesise ait en güncel plan.
     """
     try:
@@ -59,6 +61,7 @@ def _monitoring_plan_for_project(project_id: int) -> dict | None:
             p = s.get(Project, int(project_id))
             if not p or not p.facility_id:
                 return None
+
             mp = (
                 s.execute(
                     select(MonitoringPlan)
@@ -69,18 +72,19 @@ def _monitoring_plan_for_project(project_id: int) -> dict | None:
                 .scalars()
                 .first()
             )
-        if not mp:
-            return None
-        return {
-            "id": mp.id,
-            "facility_id": mp.facility_id,
-            "method": mp.method,
-            "tier_level": mp.tier_level,
-            "data_source": mp.data_source,
-            "qa_procedure": mp.qa_procedure,
-            "responsible_person": mp.responsible_person,
-            "updated_at": (mp.updated_at.isoformat() if getattr(mp, "updated_at", None) else None),
-        }
+            if not mp:
+                return None
+
+            return {
+                "id": mp.id,
+                "facility_id": mp.facility_id,
+                "method": mp.method,
+                "tier_level": mp.tier_level,
+                "data_source": mp.data_source,
+                "qa_procedure": mp.qa_procedure,
+                "responsible_person": mp.responsible_person,
+                "updated_at": (mp.updated_at.isoformat() if getattr(mp, "updated_at", None) else None),
+            }
     except Exception:
         return None
 
@@ -110,16 +114,40 @@ def _input_hashes_payload(project_id: int, energy_u: DatasetUpload, prod_u: Data
     return payload
 
 
+def _config_hash(config: dict) -> str:
+    # sadece config -> deterministik hash (sıralı JSON)
+    return sha256_json({"config": config})
+
+
+def _inputs_hash(inputs: dict) -> str:
+    # URI yerine SHA’ları merkeze al (güvenli deterministik reuse)
+    slim = {}
+    for k, v in (inputs or {}).items():
+        if isinstance(v, dict):
+            slim[k] = {"sha256": v.get("sha256") or "", "schema_version": v.get("schema_version") or "v1"}
+    return sha256_json({"inputs": slim})
+
+
+def _deterministic_key(engine_version: str, config: dict, inputs: dict, scenario: dict, methodology_id: int | None) -> dict:
+    """
+    Paket D3: same input + same config (+ same scenario + same methodology + same engine_version) => reuse
+    """
+    cfg_h = _config_hash(config)
+    in_h = _inputs_hash(inputs)
+    sc_h = sha256_json({"scenario": scenario or {}})
+
+    return {
+        "engine_version": engine_version,
+        "config_hash": cfg_h,
+        "inputs_hash": in_h,
+        "scenario_hash": sc_h,
+        "methodology_id": methodology_id,
+    }
+
+
 def _compute_result_hash(engine_version: str, config: dict, inputs: dict, scenario: dict, methodology_id: int | None) -> str:
-    return sha256_json(
-        {
-            "engine_version": engine_version,
-            "config": config,
-            "inputs": inputs,
-            "scenario": scenario,
-            "methodology_id": methodology_id,
-        }
-    )
+    key = _deterministic_key(engine_version, config, inputs, scenario, methodology_id)
+    return sha256_json(key)
 
 
 def _try_reuse_snapshot(project_id: int, result_hash: str) -> CalculationSnapshot | None:
@@ -134,7 +162,7 @@ def _try_reuse_snapshot(project_id: int, result_hash: str) -> CalculationSnapsho
             .scalars()
             .first()
         )
-    return existing
+        return existing
 
 
 def run_full(
@@ -148,18 +176,15 @@ def run_full(
 
     energy_u = latest_upload(project_id, "energy")
     prod_u = latest_upload(project_id, "production")
-    materials_u = latest_upload(project_id, "materials")  # Paket A: precursor için
+    materials_u = latest_upload(project_id, "materials")  # precursor için
 
     if not energy_u:
         raise ValueError("energy.csv yüklenmemiş.")
     if not prod_u:
         raise ValueError("production.csv yüklenmemiş.")
 
-    energy_uri = str(energy_u.storage_uri)
-    prod_uri = str(prod_u.storage_uri)
-
-    energy_df = load_csv_from_uri(energy_uri)
-    prod_df = load_csv_from_uri(prod_uri)
+    energy_df = load_csv_from_uri(str(energy_u.storage_uri))
+    prod_df = load_csv_from_uri(str(prod_u.storage_uri))
 
     materials_df = None
     if materials_u:
@@ -168,7 +193,7 @@ def run_full(
         except Exception:
             materials_df = None
 
-    # Scenario apply
+    # Senaryo uygulama
     if scenario:
         energy_df, prod_df = apply_scenarios(
             energy_df,
@@ -179,7 +204,7 @@ def run_full(
             export_mix_multiplier=float(scenario.get("export_mix_multiplier", 1.0)),
         )
 
-    # Inputs + candidate hash (reuse)
+    # Deterministik reuse anahtarı
     input_hashes = _input_hashes_payload(project_id, energy_u, prod_u, materials_u)
     candidate_hash = _compute_result_hash(ENGINE_VERSION, config, input_hashes, scenario, methodology_id)
 
@@ -188,13 +213,18 @@ def run_full(
         try:
             append_audit(
                 "snapshot_reused",
-                {"project_id": project_id, "snapshot_id": existing.id, "hash": existing.result_hash, "engine_version": existing.engine_version},
+                {
+                    "project_id": project_id,
+                    "snapshot_id": existing.id,
+                    "hash": existing.result_hash,
+                    "engine_version": existing.engine_version,
+                },
             )
         except Exception:
             pass
         return existing
 
-    # Emissions (regulatory-like)
+    # Emissions (fuel-bazlı direct + electricity-based indirect)
     electricity_method = str(config.get("electricity_method", "location"))
     market_override = config.get("market_grid_factor_override", None)
     if market_override is not None:
@@ -212,7 +242,7 @@ def run_full(
 
     # ETS
     ets_fin = ets_net_and_cost(
-        scope1_tco2=float(emis["direct_tco2"]),
+        scope1_tco2=float(emis.get("direct_tco2", 0.0)),
         free_alloc_t=float(config.get("free_alloc_t", 0.0)),
         banked_t=float(config.get("banked_t", 0.0)),
         allowance_price_eur_per_t=float(config.get("eua_price_eur", 80.0)),
@@ -235,29 +265,32 @@ def run_full(
         allocation_basis=str(config.get("cbam_allocation_basis", "quantity")),
     )
 
-    # Methodology payload (for reporting / evidence)
+    # Methodology payload (report/evidence)
     meth_payload = None
     if methodology_id:
         with db() as s:
             m = s.get(Methodology, int(methodology_id))
-        if m:
-            meth_payload = {
-                "id": m.id,
-                "name": m.name,
-                "version": m.version,
-                "scope": m.scope,
-                "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
-            }
+            if m:
+                meth_payload = {
+                    "id": m.id,
+                    "name": m.name,
+                    "version": m.version,
+                    "scope": m.scope,
+                    "description": m.description,
+                    "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
+                }
 
+    # Paket D4: report-ready results structure (CBAM/ETS sections)
     results = {
         "kpis": {
-            "direct_tco2": float(emis["direct_tco2"]),
-            "indirect_tco2": float(emis["indirect_tco2"]),
-            "total_tco2": float(emis["total_tco2"]),
-            "ets_net_tco2": float(ets_fin["net_tco2"]),
-            "ets_cost_tl": float(ets_fin["cost_tl"]),
-            "cbam_embedded_tco2": float(cbam_totals["embedded_tco2"]),
-            "cbam_cost_eur": float(cbam_totals["cbam_cost_eur"]),
+            "direct_tco2": float(emis.get("direct_tco2", 0.0)),
+            "indirect_tco2": float(emis.get("indirect_tco2", 0.0)),
+            "total_tco2": float(emis.get("total_tco2", 0.0)),
+            "ets_net_tco2": float(ets_fin.get("net_tco2", 0.0)),
+            "ets_cost_tl": float(ets_fin.get("cost_tl", 0.0)),
+            "ets_cost_eur": float(ets_fin.get("cost_eur", 0.0)),
+            "cbam_embedded_tco2": float(cbam_totals.get("embedded_tco2", 0.0)),
+            "cbam_cost_eur": float(cbam_totals.get("cbam_cost_eur", 0.0)),
         },
         "emissions_detail": {
             "fuel_rows": emis.get("fuel_rows", []),
@@ -276,6 +309,7 @@ def run_full(
         "cbam_table": cbam_table.to_dict(orient="records"),
         "scenario": scenario,
         "methodology": meth_payload,
+        "deterministic": _deterministic_key(ENGINE_VERSION, config, input_hashes, scenario, methodology_id),
     }
 
     # Hash chain: previous snapshot hash
