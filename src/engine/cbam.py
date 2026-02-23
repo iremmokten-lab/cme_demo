@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import pandas as pd
 
@@ -22,12 +22,8 @@ def _to_float(x: Any) -> float:
 
 
 # ------------------------------------------------------------
-# Paket D1: CN Code → CBAM Goods mapping (deterministik, açıklanabilir)
-# Not: Bu MVP’de mapping “registry” olarak kod içinde deterministic tutulur.
-# Prod’da bunu DB tablosu / registry yönetimi ile UI’dan yönetebilirsin.
+# CBAM goods taxonomy (MVP)
 # ------------------------------------------------------------
-
-# Basit CBAM goods taxonomy (MVP)
 _CBAM_GOODS = {
     "iron_steel": "Demir-Çelik",
     "aluminium": "Alüminyum",
@@ -39,8 +35,7 @@ _CBAM_GOODS = {
     "other": "Diğer",
 }
 
-# CN prefix → goods (MVP deterministic)
-# CN/HS kodları regülasyon detayında daha granular olabilir; burada satılabilir “readiness” için sinyal üretir.
+# Fallback CN prefix → goods (DB registry yoksa / boşsa)
 _CN_PREFIX_TO_GOODS: List[Tuple[str, str]] = [
     ("72", "iron_steel"),
     ("73", "iron_steel"),
@@ -49,8 +44,8 @@ _CN_PREFIX_TO_GOODS: List[Tuple[str, str]] = [
     ("31", "fertilizers"),
     ("28", "chemicals"),
     ("29", "chemicals"),
-    ("2716", "electricity"),  # elektrik (HS) - bazı sınıflandırmalarda
-    ("2804", "hydrogen"),     # hidrojen: HS 2804 alt kırılım
+    ("2716", "electricity"),
+    ("2804", "hydrogen"),
 ]
 
 
@@ -60,6 +55,104 @@ def _clean_cn(cn: Any) -> str:
     return cn_s
 
 
+# ------------------------------------------------------------
+# Paket D-devam: DB tabanlı CN Registry lookup (cache’li)
+# ------------------------------------------------------------
+_REGISTRY_CACHE: dict = {
+    "loaded": False,
+    "rows": [],  # list of dicts
+}
+
+
+def _load_registry_rows() -> List[dict]:
+    """
+    DB’den aktif mappingleri çeker.
+    Streamlit Cloud / SQLite uyumlu.
+    Import başarısızsa sessizce fallback’e döner.
+    """
+    global _REGISTRY_CACHE
+
+    if _REGISTRY_CACHE.get("loaded"):
+        return _REGISTRY_CACHE.get("rows", [])
+
+    rows: List[dict] = []
+    try:
+        from sqlalchemy import select
+
+        from src.db.session import db
+        from src.db.cbam_registry import CbamCnMapping
+
+        with db() as s:
+            items = (
+                s.execute(
+                    select(CbamCnMapping)
+                    .where(CbamCnMapping.active == True)  # noqa: E712
+                    .order_by(CbamCnMapping.priority.desc())
+                )
+                .scalars()
+                .all()
+            )
+
+        for it in items:
+            rows.append(
+                {
+                    "cn_pattern": _clean_cn(getattr(it, "cn_pattern", "")),
+                    "match_type": str(getattr(it, "match_type", "prefix") or "prefix").strip().lower(),
+                    "cbam_good_key": str(getattr(it, "cbam_good_key", "other") or "other").strip().lower(),
+                    "cbam_good_name": str(getattr(it, "cbam_good_name", "") or "").strip(),
+                    "priority": int(getattr(it, "priority", 100) or 100),
+                }
+            )
+    except Exception:
+        rows = []
+
+    _REGISTRY_CACHE["loaded"] = True
+    _REGISTRY_CACHE["rows"] = rows
+    return rows
+
+
+def _registry_match(cn: str) -> Optional[dict]:
+    """
+    Eşleşme önceliği:
+      1) exact match (priority yüksek, pattern uzun)
+      2) prefix match (priority yüksek, pattern uzun)
+    """
+    cn = _clean_cn(cn)
+    if not cn:
+        return None
+
+    rows = _load_registry_rows()
+    if not rows:
+        return None
+
+    exact_hits = []
+    prefix_hits = []
+
+    for r in rows:
+        pat = r.get("cn_pattern") or ""
+        if not pat:
+            continue
+        mt = (r.get("match_type") or "prefix").lower()
+
+        if mt == "exact" and cn == pat:
+            exact_hits.append(r)
+        elif mt == "prefix" and cn.startswith(pat):
+            prefix_hits.append(r)
+
+    def _rank_key(r: dict):
+        return (int(r.get("priority", 100) or 100), len(r.get("cn_pattern", "") or ""))
+
+    if exact_hits:
+        exact_hits.sort(key=_rank_key, reverse=True)
+        return exact_hits[0]
+
+    if prefix_hits:
+        prefix_hits.sort(key=_rank_key, reverse=True)
+        return prefix_hits[0]
+
+    return None
+
+
 def cn_to_goods(cn_code: Any) -> Dict[str, str]:
     """
     Dönüş:
@@ -67,7 +160,7 @@ def cn_to_goods(cn_code: Any) -> Dict[str, str]:
         "cn_code": "7208....",
         "cbam_good_key": "iron_steel",
         "cbam_good_name": "Demir-Çelik",
-        "mapping_rule": "prefix:72"
+        "mapping_rule": "registry:exact|prefix:<pattern>" OR "fallback:prefix:<pattern>"
       }
     """
     cn = _clean_cn(cn_code)
@@ -79,7 +172,21 @@ def cn_to_goods(cn_code: Any) -> Dict[str, str]:
             "mapping_rule": "empty_cn",
         }
 
-    # En uzun prefix kazanır (örn 2716, 2804)
+    # 1) DB registry öncelikli
+    hit = _registry_match(cn)
+    if hit:
+        good_key = hit.get("cbam_good_key") or "other"
+        good_name = hit.get("cbam_good_name") or _CBAM_GOODS.get(good_key, _CBAM_GOODS["other"])
+        mt = (hit.get("match_type") or "prefix").lower()
+        pat = hit.get("cn_pattern") or ""
+        return {
+            "cn_code": cn,
+            "cbam_good_key": good_key,
+            "cbam_good_name": good_name,
+            "mapping_rule": f"registry:{mt}:{pat}",
+        }
+
+    # 2) Fallback deterministic prefix mapping
     best = None
     for pref, good in _CN_PREFIX_TO_GOODS:
         if cn.startswith(pref):
@@ -92,14 +199,14 @@ def cn_to_goods(cn_code: Any) -> Dict[str, str]:
             "cn_code": cn,
             "cbam_good_key": good,
             "cbam_good_name": _CBAM_GOODS.get(good, _CBAM_GOODS["other"]),
-            "mapping_rule": f"prefix:{pref}",
+            "mapping_rule": f"fallback:prefix:{pref}",
         }
 
     return {
         "cn_code": cn,
         "cbam_good_key": "other",
         "cbam_good_name": _CBAM_GOODS["other"],
-        "mapping_rule": "prefix:none",
+        "mapping_rule": "fallback:prefix:none",
     }
 
 
@@ -126,8 +233,6 @@ def precursor_emissions_from_materials(materials_df: pd.DataFrame) -> pd.DataFra
       - sku
       - material_quantity (numeric)
       - emission_factor (kgCO2e / material_unit varsayımı)
-
-    Not: Gerçek dünyada precursor chain / supplier EPD / LCA ile genişler.
     """
     if materials_df is None or len(materials_df) == 0:
         return pd.DataFrame(columns=["sku", "precursor_tco2"])
@@ -146,7 +251,6 @@ def precursor_emissions_from_materials(materials_df: pd.DataFrame) -> pd.DataFra
     df["material_quantity"] = df["material_quantity"].apply(_to_float)
     df["emission_factor"] = df["emission_factor"].apply(_to_float)
 
-    # emission_factor: kgCO2e / unit varsayımı
     df["precursor_kg"] = df["material_quantity"] * df["emission_factor"]
 
     out = df.groupby("sku", dropna=False)["precursor_kg"].sum().reset_index()
@@ -162,22 +266,12 @@ def cbam_compute(
     allocation_basis: str = "quantity",
 ) -> tuple[pd.DataFrame, dict]:
     """
-    Paket D1: CBAM “gerçekçi hesap” yaklaşımı (MVP)
-      - Direct emissions (fuel bazlı) + Indirect emissions (electricity) energy_breakdown’dan gelir
-      - Precursor emissions materials.csv’den sku bazında gelir
-      - SKU → CN → CBAM goods mapping
+    CBAM hesap (MVP):
+      - Direct emissions: energy_breakdown.direct_tco2 (fuel bazlı)
+      - Indirect emissions: energy_breakdown.indirect_tco2 (electricity)
+      - Precursor: materials.csv’den sku bazlı
+      - SKU → CN → Goods mapping (DB registry öncelikli)
       - Ürün bazlı embedded emissions + EU export allocation
-
-    production.csv beklenen kolonlar:
-      - sku
-      - cn_code
-      - quantity
-      - export_to_eu_quantity
-      - cbam_covered (opsiyonel override)
-
-    allocation_basis:
-      - "quantity": direct/indirect emissions üretime göre SKU’lara dağıtılır
-      - "export": dağıtım bazında export_to_eu_quantity kullanılır (export boşsa quantity fallback)
     """
     if production_df is None or len(production_df) == 0:
         empty = pd.DataFrame(
@@ -230,21 +324,15 @@ def cbam_compute(
         m = cn_to_goods(r.get("cn_code"))
         mapping_rows.append(m)
     map_df = pd.DataFrame(mapping_rows)
-    if len(map_df) > 0:
-        df = df.reset_index(drop=True)
-        df["cn_code_clean"] = map_df.get("cn_code", "")
-        df["cbam_good_key"] = map_df.get("cbam_good_key", "other")
-        df["cbam_good"] = map_df.get("cbam_good_name", _CBAM_GOODS["other"])
-        df["mapping_rule"] = map_df.get("mapping_rule", "unknown")
-    else:
-        df["cbam_good_key"] = "other"
-        df["cbam_good"] = _CBAM_GOODS["other"]
-        df["mapping_rule"] = "unknown"
+    df = df.reset_index(drop=True)
+    df["cbam_good_key"] = map_df.get("cbam_good_key", "other")
+    df["cbam_good"] = map_df.get("cbam_good_name", _CBAM_GOODS["other"])
+    df["mapping_rule"] = map_df.get("mapping_rule", "unknown")
 
     # Coverage
     df["cbam_covered_calc"] = df.apply(lambda r: bool(is_cbam_covered_row(r.to_dict())), axis=1)
 
-    # Allocation weights for energy emissions
+    # Allocation weights
     basis = _norm(allocation_basis)
     if basis == "export":
         alloc_base = df["export_to_eu_quantity"].clip(lower=0.0)
@@ -276,10 +364,10 @@ def cbam_compute(
         df["precursor_tco2"] = 0.0
     df["precursor_tco2"] = df["precursor_tco2"].fillna(0.0).apply(_to_float)
 
-    # Embedded totals per SKU
+    # Embedded
     df["embedded_tco2"] = df["direct_alloc_tco2"] + df["indirect_alloc_tco2"] + df["precursor_tco2"]
 
-    # Export allocation per SKU (export_to_eu_quantity / quantity)
+    # Export share
     df["eu_export_qty"] = df["export_to_eu_quantity"].clip(lower=0.0)
     qty_pos = df["quantity"].clip(lower=0.0)
 
@@ -288,8 +376,7 @@ def cbam_compute(
         df.loc[qty_pos > 0.0, "eu_export_qty"] / df.loc[qty_pos > 0.0, "quantity"]
     ).clip(0.0, 1.0)
 
-    # CBAM cost signal (MVP)
-    # covered_and_export: CBAM coverage ve EU export>0
+    # CBAM cost signal
     df["covered_and_export"] = (df["cbam_covered_calc"] == True) & (df["eu_export_qty"] > 0.0)
     df["cbam_cost_eur"] = 0.0
     df.loc[df["covered_and_export"], "cbam_cost_eur"] = (
@@ -316,7 +403,6 @@ def cbam_compute(
 
     table = table.rename(columns={"cbam_covered_calc": "cbam_covered"})
 
-    # Goods summary (verification/reporting friendly)
     gs = (
         table.groupby(["cbam_good"], dropna=False)[
             ["embedded_tco2", "cbam_cost_eur", "direct_alloc_tco2", "indirect_alloc_tco2", "precursor_tco2"]
@@ -337,8 +423,8 @@ def cbam_compute(
         "allocation_basis": basis,
         "goods_summary": goods_summary,
         "notes": [
-            "CBAM goods mapping MVP: CN prefix tabanlı deterministik eşleme.",
-            "CBAM maliyet sinyali MVP: embedded_tCO2 × EUA(€/t) × export_share (EU export / total production).",
+            "CN→CBAM goods eşlemesi: Önce DB registry, yoksa fallback prefix kuralları kullanılır.",
+            "CBAM maliyet sinyali (MVP): embedded_tCO2 × EUA(€/t) × export_share (EU export / total production).",
         ],
     }
 
