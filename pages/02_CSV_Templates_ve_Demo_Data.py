@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
-from io import StringIO
+from io import BytesIO
+import zipfile
 
 st.title("CSV Templates ve Demo Data")
 
@@ -18,7 +19,7 @@ Bu sayfadan sistemde kullanılan tüm veri setlerinin
 # ---------------------------------------------------
 
 def energy_demo():
-    df = pd.DataFrame(
+    return pd.DataFrame(
         [
             ["natural_gas", 120000, "m3", 0.038, 56.1, 0.99, "facility_meter"],
             ["diesel", 8000, "litre", 0.036, 74.1, 0.99, "invoice"],
@@ -34,11 +35,10 @@ def energy_demo():
             "source",
         ],
     )
-    return df
 
 
 def energy_template():
-    df = pd.DataFrame(
+    return pd.DataFrame(
         columns=[
             "fuel_type",
             "quantity",
@@ -49,7 +49,6 @@ def energy_template():
             "source",
         ]
     )
-    return df
 
 
 # ---------------------------------------------------
@@ -57,7 +56,7 @@ def energy_template():
 # ---------------------------------------------------
 
 def production_demo():
-    df = pd.DataFrame(
+    return pd.DataFrame(
         [
             ["SKU-001", "7208", 1000, 400],
             ["SKU-002", "7601", 800, 250],
@@ -69,11 +68,10 @@ def production_demo():
             "export_to_eu_quantity",
         ],
     )
-    return df
 
 
 def production_template():
-    df = pd.DataFrame(
+    return pd.DataFrame(
         columns=[
             "sku",
             "cn_code",
@@ -81,7 +79,6 @@ def production_template():
             "export_to_eu_quantity",
         ]
     )
-    return df
 
 
 # ---------------------------------------------------
@@ -89,7 +86,7 @@ def production_template():
 # ---------------------------------------------------
 
 def materials_demo():
-    df = pd.DataFrame(
+    return pd.DataFrame(
         [
             ["SKU-001", "Steel Slab", 1200, "kg", 1.9, "kgCO2/kg", "Demo Supplier"],
             ["SKU-002", "Aluminium Billet", 800, "kg", 8.5, "kgCO2/kg", "Demo Supplier"],
@@ -104,11 +101,10 @@ def materials_demo():
             "supplier",
         ],
     )
-    return df
 
 
 def materials_template():
-    df = pd.DataFrame(
+    return pd.DataFrame(
         columns=[
             "sku",
             "material_name",
@@ -119,7 +115,6 @@ def materials_template():
             "supplier",
         ]
     )
-    return df
 
 
 # ---------------------------------------------------
@@ -127,7 +122,7 @@ def materials_template():
 # ---------------------------------------------------
 
 def monitoring_demo():
-    df = pd.DataFrame(
+    return pd.DataFrame(
         [
             ["Main Plant", "Tier 2", "Standard Method", "Utility Bills", "Annual QA Check", "Energy Manager"],
         ],
@@ -140,11 +135,10 @@ def monitoring_demo():
             "responsible_person",
         ],
     )
-    return df
 
 
 def monitoring_template():
-    df = pd.DataFrame(
+    return pd.DataFrame(
         columns=[
             "facility_name",
             "tier_level",
@@ -154,83 +148,131 @@ def monitoring_template():
             "responsible_person",
         ]
     )
-    return df
 
 
 # ---------------------------------------------------
-# DOWNLOAD HELPER
+# CSV DOWNLOAD
 # ---------------------------------------------------
+
+def csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8")
+
 
 def download_button(df, filename):
-    csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label=f"{filename} indir",
-        data=csv,
+        data=csv_bytes(df),
         file_name=filename,
         mime="text/csv",
     )
 
 
 # ---------------------------------------------------
-# UI
+# ZIP DOWNLOAD
+# ---------------------------------------------------
+
+def build_demo_zip():
+
+    files = {
+        "energy_demo.csv": energy_demo(),
+        "production_demo.csv": production_demo(),
+        "materials_demo.csv": materials_demo(),
+        "monitoring_demo.csv": monitoring_demo(),
+    }
+
+    buffer = BytesIO()
+
+    with zipfile.ZipFile(buffer, "w") as z:
+
+        for name, df in files.items():
+            z.writestr(name, df.to_csv(index=False))
+
+    buffer.seek(0)
+
+    return buffer
+
+
+st.header("🚀 Tüm Demo Datasetleri")
+
+zip_file = build_demo_zip()
+
+st.download_button(
+    "Tüm Demo Datasetleri indir (ZIP)",
+    data=zip_file,
+    file_name="carbon_demo_dataset.zip",
+    mime="application/zip",
+)
+
+st.divider()
+
+# ---------------------------------------------------
+# ENERGY
 # ---------------------------------------------------
 
 st.header("Energy")
 
-col1, col2 = st.columns(2)
+c1, c2 = st.columns(2)
 
-with col1:
+with c1:
     st.subheader("Template")
     download_button(energy_template(), "energy_template.csv")
 
-with col2:
+with c2:
     st.subheader("Demo Data")
     download_button(energy_demo(), "energy_demo.csv")
 
-
 st.divider()
+
+# ---------------------------------------------------
+# PRODUCTION
+# ---------------------------------------------------
 
 st.header("Production")
 
-col1, col2 = st.columns(2)
+c1, c2 = st.columns(2)
 
-with col1:
+with c1:
     download_button(production_template(), "production_template.csv")
 
-with col2:
+with c2:
     download_button(production_demo(), "production_demo.csv")
 
-
 st.divider()
+
+# ---------------------------------------------------
+# MATERIALS
+# ---------------------------------------------------
 
 st.header("Materials (CBAM Precursor)")
 
-col1, col2 = st.columns(2)
+c1, c2 = st.columns(2)
 
-with col1:
+with c1:
     download_button(materials_template(), "materials_template.csv")
 
-with col2:
+with c2:
     download_button(materials_demo(), "materials_demo.csv")
-
 
 st.divider()
 
+# ---------------------------------------------------
+# MONITORING PLAN
+# ---------------------------------------------------
+
 st.header("Monitoring Plan (ETS)")
 
-col1, col2 = st.columns(2)
+c1, c2 = st.columns(2)
 
-with col1:
+with c1:
     download_button(monitoring_template(), "monitoring_template.csv")
 
-with col2:
+with c2:
     download_button(monitoring_demo(), "monitoring_demo.csv")
-
 
 st.divider()
 
 st.success(
 """
-Bu dosyaları indirip doğrudan **Veri Yükleme** sayfasına yükleyebilirsiniz.
+İndirilen dosyaları **Veri Yükleme** sayfasına yükleyerek sistemi hemen test edebilirsiniz.
 """
 )
