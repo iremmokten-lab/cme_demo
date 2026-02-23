@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
@@ -21,40 +21,113 @@ def _to_float(x: Any) -> float:
         return 0.0
 
 
-# Demo CBAM CN coverage yaklaşımı:
-# - production.csv'de cbam_covered varsa onu kullan (öncelikli)
-# - yoksa CN code üzerinden basit prefix eşlemesi
-# Not: Paket C'de bunu "CN registry" tablosuna taşıyacağız.
-_CBAM_CN_PREFIXES = (
-    "72",  # Iron/steel (HS Chapter 72)
-    "73",  # Articles of iron/steel (73)
-    "76",  # Aluminium (76)
-    "31",  # Fertilizers (31) - demo
-    "28",  # Inorganic chemicals (28) - demo
-    "29",  # Organic chemicals (29) - demo
-    "25",  # Cement etc (25) - demo
-)
+# ------------------------------------------------------------
+# Paket D1: CN Code → CBAM Goods mapping (deterministik, açıklanabilir)
+# Not: Bu MVP’de mapping “registry” olarak kod içinde deterministic tutulur.
+# Prod’da bunu DB tablosu / registry yönetimi ile UI’dan yönetebilirsin.
+# ------------------------------------------------------------
+
+# Basit CBAM goods taxonomy (MVP)
+_CBAM_GOODS = {
+    "iron_steel": "Demir-Çelik",
+    "aluminium": "Alüminyum",
+    "cement": "Çimento",
+    "fertilizers": "Gübre",
+    "electricity": "Elektrik",
+    "hydrogen": "Hidrojen",
+    "chemicals": "Kimyasallar",
+    "other": "Diğer",
+}
+
+# CN prefix → goods (MVP deterministic)
+# CN/HS kodları regülasyon detayında daha granular olabilir; burada satılabilir “readiness” için sinyal üretir.
+_CN_PREFIX_TO_GOODS: List[Tuple[str, str]] = [
+    ("72", "iron_steel"),
+    ("73", "iron_steel"),
+    ("76", "aluminium"),
+    ("25", "cement"),
+    ("31", "fertilizers"),
+    ("28", "chemicals"),
+    ("29", "chemicals"),
+    ("2716", "electricity"),  # elektrik (HS) - bazı sınıflandırmalarda
+    ("2804", "hydrogen"),     # hidrojen: HS 2804 alt kırılım
+]
+
+
+def _clean_cn(cn: Any) -> str:
+    cn_s = str(cn or "").strip()
+    cn_s = cn_s.replace(".", "").replace(" ", "")
+    return cn_s
+
+
+def cn_to_goods(cn_code: Any) -> Dict[str, str]:
+    """
+    Dönüş:
+      {
+        "cn_code": "7208....",
+        "cbam_good_key": "iron_steel",
+        "cbam_good_name": "Demir-Çelik",
+        "mapping_rule": "prefix:72"
+      }
+    """
+    cn = _clean_cn(cn_code)
+    if not cn:
+        return {
+            "cn_code": "",
+            "cbam_good_key": "other",
+            "cbam_good_name": _CBAM_GOODS["other"],
+            "mapping_rule": "empty_cn",
+        }
+
+    # En uzun prefix kazanır (örn 2716, 2804)
+    best = None
+    for pref, good in _CN_PREFIX_TO_GOODS:
+        if cn.startswith(pref):
+            if best is None or len(pref) > len(best[0]):
+                best = (pref, good)
+
+    if best:
+        pref, good = best
+        return {
+            "cn_code": cn,
+            "cbam_good_key": good,
+            "cbam_good_name": _CBAM_GOODS.get(good, _CBAM_GOODS["other"]),
+            "mapping_rule": f"prefix:{pref}",
+        }
+
+    return {
+        "cn_code": cn,
+        "cbam_good_key": "other",
+        "cbam_good_name": _CBAM_GOODS["other"],
+        "mapping_rule": "prefix:none",
+    }
 
 
 def is_cbam_covered_row(row: dict) -> bool:
+    """
+    Coverage belirleme:
+    1) production.csv’de cbam_covered field varsa onu kullan
+    2) yoksa CN mapping ile “other” olmayan goods => covered say
+    """
     if "cbam_covered" in row and row["cbam_covered"] is not None and str(row["cbam_covered"]).strip() != "":
         v = str(row["cbam_covered"]).strip().lower()
         return v in ("1", "true", "yes", "evet", "covered", "y", "t")
 
-    cn = str(row.get("cn_code") or "").strip()
-    cn = cn.replace(".", "").replace(" ", "")
-    if len(cn) >= 2 and cn[:2] in _CBAM_CN_PREFIXES:
-        return True
-    return False
+    cn = row.get("cn_code")
+    m = cn_to_goods(cn)
+    return m.get("cbam_good_key") != "other"
 
 
 def precursor_emissions_from_materials(materials_df: pd.DataFrame) -> pd.DataFrame:
-    """materials.csv -> sku bazında precursor tCO2.
+    """
+    materials.csv -> sku bazında precursor tCO2 (embedded, upstream)
 
-    Beklenen kolonlar:
-    - sku
-    - material_quantity (numeric)
-    - emission_factor (kgCO2e / material_unit varsayımı)
+    Beklenen kolonlar (MVP):
+      - sku
+      - material_quantity (numeric)
+      - emission_factor (kgCO2e / material_unit varsayımı)
+
+    Not: Gerçek dünyada precursor chain / supplier EPD / LCA ile genişler.
     """
     if materials_df is None or len(materials_df) == 0:
         return pd.DataFrame(columns=["sku", "precursor_tco2"])
@@ -75,6 +148,7 @@ def precursor_emissions_from_materials(materials_df: pd.DataFrame) -> pd.DataFra
 
     # emission_factor: kgCO2e / unit varsayımı
     df["precursor_kg"] = df["material_quantity"] * df["emission_factor"]
+
     out = df.groupby("sku", dropna=False)["precursor_kg"].sum().reset_index()
     out["precursor_tco2"] = out["precursor_kg"] / 1000.0
     return out[["sku", "precursor_tco2"]]
@@ -87,18 +161,51 @@ def cbam_compute(
     eua_price_eur_per_t: float,
     allocation_basis: str = "quantity",
 ) -> tuple[pd.DataFrame, dict]:
-    """CBAM: direct+indirect+precursor + EU export exposure.
-
-    - direct/indirect: energy_breakdown (tCO2)
-    - precursor: materials.csv (sku bazında)
-    - allocation: production quantity (default) veya export_to_eu_quantity
+    """
+    Paket D1: CBAM “gerçekçi hesap” yaklaşımı (MVP)
+      - Direct emissions (fuel bazlı) + Indirect emissions (electricity) energy_breakdown’dan gelir
+      - Precursor emissions materials.csv’den sku bazında gelir
+      - SKU → CN → CBAM goods mapping
+      - Ürün bazlı embedded emissions + EU export allocation
 
     production.csv beklenen kolonlar:
-    - sku, cn_code, quantity, export_to_eu_quantity, cbam_covered
+      - sku
+      - cn_code
+      - quantity
+      - export_to_eu_quantity
+      - cbam_covered (opsiyonel override)
+
+    allocation_basis:
+      - "quantity": direct/indirect emissions üretime göre SKU’lara dağıtılır
+      - "export": dağıtım bazında export_to_eu_quantity kullanılır (export boşsa quantity fallback)
     """
     if production_df is None or len(production_df) == 0:
-        empty = pd.DataFrame(columns=["sku", "cn_code", "cbam_covered", "export_to_eu_quantity", "embedded_tco2", "cbam_cost_eur"])
-        return empty, {"embedded_tco2": 0.0, "cbam_cost_eur": 0.0}
+        empty = pd.DataFrame(
+            columns=[
+                "sku",
+                "cn_code",
+                "cbam_good",
+                "cbam_covered",
+                "quantity",
+                "export_to_eu_quantity",
+                "direct_alloc_tco2",
+                "indirect_alloc_tco2",
+                "precursor_tco2",
+                "embedded_tco2",
+                "export_share",
+                "cbam_cost_eur",
+                "mapping_rule",
+            ]
+        )
+        return empty, {
+            "embedded_tco2": 0.0,
+            "cbam_cost_eur": 0.0,
+            "direct_tco2": 0.0,
+            "indirect_tco2": 0.0,
+            "precursor_tco2": 0.0,
+            "allocation_basis": _norm(allocation_basis) or "quantity",
+            "goods_summary": [],
+        }
 
     df = production_df.copy()
     df.columns = [_norm(c) for c in df.columns]
@@ -117,14 +224,30 @@ def cbam_compute(
     df["quantity"] = df["quantity"].apply(_to_float)
     df["export_to_eu_quantity"] = df["export_to_eu_quantity"].apply(_to_float)
 
+    # Mapping + goods
+    mapping_rows = []
+    for _, r in df.iterrows():
+        m = cn_to_goods(r.get("cn_code"))
+        mapping_rows.append(m)
+    map_df = pd.DataFrame(mapping_rows)
+    if len(map_df) > 0:
+        df = df.reset_index(drop=True)
+        df["cn_code_clean"] = map_df.get("cn_code", "")
+        df["cbam_good_key"] = map_df.get("cbam_good_key", "other")
+        df["cbam_good"] = map_df.get("cbam_good_name", _CBAM_GOODS["other"])
+        df["mapping_rule"] = map_df.get("mapping_rule", "unknown")
+    else:
+        df["cbam_good_key"] = "other"
+        df["cbam_good"] = _CBAM_GOODS["other"]
+        df["mapping_rule"] = "unknown"
+
     # Coverage
     df["cbam_covered_calc"] = df.apply(lambda r: bool(is_cbam_covered_row(r.to_dict())), axis=1)
 
-    # Allocation basis
+    # Allocation weights for energy emissions
     basis = _norm(allocation_basis)
     if basis == "export":
         alloc_base = df["export_to_eu_quantity"].clip(lower=0.0)
-        # export boşsa quantity fallback
         if float(alloc_base.sum()) <= 0.0:
             alloc_base = df["quantity"].clip(lower=0.0)
             basis = "quantity"
@@ -141,39 +264,43 @@ def cbam_compute(
     direct_t = float(energy_breakdown.get("direct_tco2", 0.0) or 0.0)
     indirect_t = float(energy_breakdown.get("indirect_tco2", 0.0) or 0.0)
 
-    # Allocate energy emissions across SKUs
     df["direct_alloc_tco2"] = alloc_weights * direct_t
     df["indirect_alloc_tco2"] = alloc_weights * indirect_t
 
-    # Precursor: sku bazında ekle
+    # Precursor
     prec = precursor_emissions_from_materials(materials_df) if materials_df is not None else pd.DataFrame(columns=["sku", "precursor_tco2"])
     if len(prec) > 0:
         df = df.merge(prec, on="sku", how="left")
+
     if "precursor_tco2" not in df.columns:
         df["precursor_tco2"] = 0.0
     df["precursor_tco2"] = df["precursor_tco2"].fillna(0.0).apply(_to_float)
 
+    # Embedded totals per SKU
     df["embedded_tco2"] = df["direct_alloc_tco2"] + df["indirect_alloc_tco2"] + df["precursor_tco2"]
 
-    # Exposure: sadece CBAM kapsamı ve EU export>0 olan satırlar
+    # Export allocation per SKU (export_to_eu_quantity / quantity)
     df["eu_export_qty"] = df["export_to_eu_quantity"].clip(lower=0.0)
-    df["covered_and_export"] = (df["cbam_covered_calc"] == True) & (df["eu_export_qty"] > 0.0)
-
-    # CBAM cost (demo): embedded_tco2 * EUA price * (EU export share in total production for that sku)
-    # Not: Gerçek CBAM hesaplarında ürün bazlı embedded ve AB ihracat bağlantısı farklı katmanlarda ele alınabilir.
-    # Burada satışa uygun "risk sinyali" için deterministic yaklaşım.
-    df["export_share"] = 0.0
-    # export_share = export_to_eu_quantity / quantity (eğer quantity>0)
     qty_pos = df["quantity"].clip(lower=0.0)
-    df.loc[qty_pos > 0.0, "export_share"] = (df.loc[qty_pos > 0.0, "eu_export_qty"] / df.loc[qty_pos > 0.0, "quantity"]).clip(0.0, 1.0)
 
+    df["export_share"] = 0.0
+    df.loc[qty_pos > 0.0, "export_share"] = (
+        df.loc[qty_pos > 0.0, "eu_export_qty"] / df.loc[qty_pos > 0.0, "quantity"]
+    ).clip(0.0, 1.0)
+
+    # CBAM cost signal (MVP)
+    # covered_and_export: CBAM coverage ve EU export>0
+    df["covered_and_export"] = (df["cbam_covered_calc"] == True) & (df["eu_export_qty"] > 0.0)
     df["cbam_cost_eur"] = 0.0
-    df.loc[df["covered_and_export"], "cbam_cost_eur"] = df.loc[df["covered_and_export"], "embedded_tco2"] * float(eua_price_eur_per_t) * df.loc[df["covered_and_export"], "export_share"]
+    df.loc[df["covered_and_export"], "cbam_cost_eur"] = (
+        df.loc[df["covered_and_export"], "embedded_tco2"] * float(_to_float(eua_price_eur_per_t)) * df.loc[df["covered_and_export"], "export_share"]
+    )
 
     table = df[
         [
             "sku",
             "cn_code",
+            "cbam_good",
             "cbam_covered_calc",
             "quantity",
             "export_to_eu_quantity",
@@ -183,8 +310,23 @@ def cbam_compute(
             "embedded_tco2",
             "export_share",
             "cbam_cost_eur",
+            "mapping_rule",
         ]
     ].copy()
+
+    table = table.rename(columns={"cbam_covered_calc": "cbam_covered"})
+
+    # Goods summary (verification/reporting friendly)
+    gs = (
+        table.groupby(["cbam_good"], dropna=False)[
+            ["embedded_tco2", "cbam_cost_eur", "direct_alloc_tco2", "indirect_alloc_tco2", "precursor_tco2"]
+        ]
+        .sum()
+        .reset_index()
+        .sort_values("embedded_tco2", ascending=False)
+    )
+
+    goods_summary = gs.to_dict(orient="records")
 
     totals = {
         "embedded_tco2": float(table["embedded_tco2"].sum()),
@@ -193,9 +335,11 @@ def cbam_compute(
         "indirect_tco2": float(table["indirect_alloc_tco2"].sum()),
         "precursor_tco2": float(table["precursor_tco2"].sum()),
         "allocation_basis": basis,
+        "goods_summary": goods_summary,
+        "notes": [
+            "CBAM goods mapping MVP: CN prefix tabanlı deterministik eşleme.",
+            "CBAM maliyet sinyali MVP: embedded_tCO2 × EUA(€/t) × export_share (EU export / total production).",
+        ],
     }
-
-    # UI alan isimleri için uyum
-    table = table.rename(columns={"cbam_covered_calc": "cbam_covered"})
 
     return table, totals
