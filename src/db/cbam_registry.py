@@ -20,7 +20,8 @@ class CbamCnMapping(Base):
       - prefix: cn_pattern prefix (örn: 72, 2716, 2804)
 
     priority:
-      - aynı anda birden fazla kural eşleşirse, önce priority (yüksek), sonra pattern uzunluğu (uzun) kazanır.
+      - birden fazla kural eşleşirse:
+        önce priority (yüksek), sonra pattern uzunluğu (uzun) kazanır.
     """
 
     __tablename__ = "cbam_cn_mappings"
@@ -33,7 +34,7 @@ class CbamCnMapping(Base):
     cbam_good_key = Column(String(64), nullable=False, default="other", index=True)
     cbam_good_name = Column(String(200), nullable=False, default="Diğer")
 
-    priority = Column(Integer, nullable=False, default=100)  # yüksek = daha öncelikli
+    priority = Column(Integer, nullable=False, default=100)
     active = Column(Boolean, nullable=False, default=True, index=True)
 
     notes = Column(Text, default="")
