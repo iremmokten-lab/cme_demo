@@ -33,7 +33,14 @@ class CBAMRunCreate(BaseModel):
     period_end: str
     ets_price_eur_per_tco2: float = 75.0
 
+    # CBAM-IR transitional header fields (audit ready)
+    declarant_name: str | None = None
+    installation_name: str | None = None
+    installation_country: str | None = None
+    methodology_note_tr: str | None = None
+
 class CBAMRunOut(BaseModel):
     report_id: str
     report_hash: str
     report: dict
+    checks: list[dict]
