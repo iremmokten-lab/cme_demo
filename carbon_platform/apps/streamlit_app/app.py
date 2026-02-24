@@ -29,6 +29,9 @@ page = st.sidebar.radio(
         "Dokümanlar",
         "MRV / İzleme Planı",
         "Faktör Kütüphanesi",
+        "Ürün & Malzeme Kataloğu",
+        "CBAM Veri Girişi",
+        "CBAM Hesap / Rapor",
         "Veri Toplama",
         "Hesaplamalar",
         "Evidence Pack",
@@ -38,6 +41,9 @@ page = st.sidebar.radio(
 st.sidebar.divider()
 st.sidebar.write("API:", API_BASE_URL)
 
+# -------------------------
+# GİRİŞ
+# -------------------------
 if page == "Giriş":
     st.header("Giriş / Tenant Bootstrap")
     col1, col2 = st.columns(2)
@@ -83,6 +89,9 @@ if page == "Giriş":
     if "access_token" in st.session_state:
         st.info("Giriş yapıldı. Sol menüden devam edin.")
 
+# -------------------------
+# TESİSLER
+# -------------------------
 elif page == "Tesisler":
     ensure_login()
     st.header("Tesis Yönetimi")
@@ -108,6 +117,9 @@ elif page == "Tesisler":
     else:
         st.error(r.text)
 
+# -------------------------
+# DOKÜMANLAR
+# -------------------------
 elif page == "Dokümanlar":
     ensure_login()
     st.header("Doküman Yönetimi (S3 / Local)")
@@ -145,6 +157,9 @@ elif page == "Dokümanlar":
     else:
         st.error(r.text)
 
+# -------------------------
+# MRV / İZLEME PLANI
+# -------------------------
 elif page == "MRV / İzleme Planı":
     ensure_login()
     st.header("MRV / İzleme Planı (Monitoring Plan)")
@@ -307,6 +322,9 @@ elif page == "MRV / İzleme Planı":
         else:
             st.error(r.text)
 
+# -------------------------
+# FAKTÖR KÜTÜPHANESİ
+# -------------------------
 elif page == "Faktör Kütüphanesi":
     ensure_login()
     st.header("Faktör Kütüphanesi & Governance")
@@ -328,9 +346,9 @@ elif page == "Faktör Kütüphanesi":
 
     with col2:
         st.subheader("Faktör Ekle (Önce 'proposed', sonra onay)")
-        factor_type = st.selectbox("Faktör tipi", ["NCV", "EF", "grid", "process", "oxidation"])
+        factor_type = st.selectbox("Faktör tipi", ["NCV", "EF", "grid", "process", "oxidation", "precursor"])
         value = st.number_input("Değer", value=0.0, format="%.8f")
-        unit = st.text_input("Birim (örn: tCO2e/kWh, GJ/ton, tCO2e/GJ)")
+        unit = st.text_input("Birim (örn: tCO2e/kWh, tCO2e/ton, tCO2e/GJ)")
         gas = st.text_input("Gaz (opsiyonel: CO2/CH4/N2O/CO2e)")
         source_id = st.text_input("Source ID (opsiyonel)")
         if st.button("Faktör Oluştur"):
@@ -343,7 +361,7 @@ elif page == "Faktör Kütüphanesi":
 
     st.subheader("Faktörler")
     status = st.selectbox("Filtre: status", ["", "proposed", "approved", "retired"])
-    ftype = st.selectbox("Filtre: factor_type", ["", "NCV", "EF", "grid", "process", "oxidation"])
+    ftype = st.selectbox("Filtre: factor_type", ["", "NCV", "EF", "grid", "process", "oxidation", "precursor"])
     params = {}
     if status:
         params["status"] = status
@@ -365,6 +383,253 @@ elif page == "Faktör Kütüphanesi":
     else:
         st.error(r.text)
 
+# -------------------------
+# ÜRÜN & MALZEME KATALOĞU
+# -------------------------
+elif page == "Ürün & Malzeme Kataloğu":
+    ensure_login()
+    st.header("Ürün & Malzeme (Precursor) Kataloğu")
+
+    with api_client() as c:
+        fac = c.get("/facilities/")
+    facilities = fac.json() if fac.status_code == 200 else []
+    if not facilities:
+        st.warning("Önce tesis oluşturun.")
+        st.stop()
+
+    fac_map = {f["name"]: f["id"] for f in facilities}
+    fac_name = st.selectbox("Tesis seç", list(fac_map.keys()))
+    facility_id = fac_map[fac_name]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Ürün Oluştur")
+        pcode = st.text_input("Ürün kodu")
+        pname = st.text_input("Ürün adı")
+        punit = st.text_input("Birim", value="ton")
+        cn = st.text_input("CN/KN Code (opsiyonel)")
+        if st.button("Ürün Kaydet"):
+            with api_client() as c:
+                r = c.post("/catalog/products", json={
+                    "facility_id": facility_id,
+                    "product_code": pcode,
+                    "name": pname,
+                    "unit": punit,
+                    "cn_code": cn or None
+                })
+            if r.status_code == 200:
+                st.success("Ürün kaydedildi.")
+            else:
+                st.error(r.text)
+
+        st.subheader("Ürün Listesi")
+        with api_client() as c:
+            r = c.get("/catalog/products", params={"facility_id": facility_id})
+        if r.status_code == 200:
+            st.dataframe(r.json(), use_container_width=True)
+        else:
+            st.error(r.text)
+
+    with col2:
+        st.subheader("Malzeme (Precursor) Oluştur")
+        mcode = st.text_input("Malzeme kodu")
+        mname = st.text_input("Malzeme adı")
+        munit = st.text_input("Birim", value="ton")
+        embedded_factor_id = st.text_input("Embedded factor_id (approved) (opsiyonel)")
+        if st.button("Malzeme Kaydet"):
+            with api_client() as c:
+                r = c.post("/catalog/materials", json={
+                    "material_code": mcode,
+                    "name": mname,
+                    "unit": munit,
+                    "embedded_factor_id": embedded_factor_id or None
+                })
+            if r.status_code == 200:
+                st.success("Malzeme kaydedildi.")
+            else:
+                st.error(r.text)
+
+        st.subheader("Malzeme Listesi")
+        with api_client() as c:
+            r = c.get("/catalog/materials")
+        if r.status_code == 200:
+            st.dataframe(r.json(), use_container_width=True)
+        else:
+            st.error(r.text)
+
+# -------------------------
+# CBAM VERİ GİRİŞİ
+# -------------------------
+elif page == "CBAM Veri Girişi":
+    ensure_login()
+    st.header("CBAM Veri Girişi (Üretim / Precursor / İhracat)")
+
+    with api_client() as c:
+        fac = c.get("/facilities/")
+    facilities = fac.json() if fac.status_code == 200 else []
+    if not facilities:
+        st.warning("Önce tesis oluşturun.")
+        st.stop()
+    fac_map = {f["name"]: f["id"] for f in facilities}
+    fac_name = st.selectbox("Tesis seç", list(fac_map.keys())))
+    facility_id = fac_map[fac_name]
+
+    # activity record seç
+    with api_client() as c:
+        ar = c.get("/activity/records", params={"facility_id": facility_id})
+    records = ar.json() if ar.status_code == 200 else []
+    if not records:
+        st.warning("Bu tesis için activity record yok. Önce Veri Toplama'dan oluşturun.")
+        st.stop()
+    record_id = st.selectbox("Activity Record", [x["id"] for x in records])
+
+    # products for facility
+    with api_client() as c:
+        pr = c.get("/catalog/products", params={"facility_id": facility_id})
+    products = pr.json() if pr.status_code == 200 else []
+    if not products:
+        st.warning("Bu tesis için ürün yok. Önce Ürün & Malzeme Kataloğu'ndan ürün ekleyin.")
+        st.stop()
+    prod_map = {f'{p["product_code"]} - {p["name"]}': p["id"] for p in products}
+
+    # materials
+    with api_client() as c:
+        mr = c.get("/catalog/materials")
+    materials = mr.json() if mr.status_code == 200 else []
+    mat_map = {f'{m["material_code"]} - {m["name"]}': m["id"] for m in materials} if materials else {}
+
+    st.subheader("Ürün Bazlı Üretim (ProductionRecord)")
+    prod_sel = st.selectbox("Ürün", list(prod_map.keys()))
+    prod_qty = st.number_input("Üretim miktarı", value=0.0)
+    prod_unit = st.text_input("Birim", value="ton")
+    if st.button("Üretim Kaydı Ekle"):
+        with api_client() as c:
+            r = c.post("/cbam/production", json={
+                "activity_record_id": record_id,
+                "product_id": prod_map[prod_sel],
+                "quantity": prod_qty,
+                "unit": prod_unit
+            })
+        if r.status_code == 200:
+            st.success("Üretim kaydı eklendi.")
+        else:
+            st.error(r.text)
+
+    with api_client() as c:
+        r = c.get("/cbam/production", params={"activity_record_id": record_id})
+    if r.status_code == 200:
+        st.dataframe(r.json(), use_container_width=True)
+
+    st.divider()
+    st.subheader("Ürün Bazlı Precursor / Material Input")
+    if not materials:
+        st.info("Malzeme kataloğu boş. Precursor girişi için malzeme ekleyin.")
+    else:
+        prod_sel2 = st.selectbox("Ürün (precursor için)", list(prod_map.keys()), key="prod2")
+        mat_sel = st.selectbox("Malzeme", list(mat_map.keys()))
+        mi_qty = st.number_input("Tüketim miktarı", value=0.0)
+        mi_unit = st.text_input("Birim", value="ton", key="mi_unit")
+        override_factor = st.text_input("Override embedded factor_id (approved) (opsiyonel)")
+        if st.button("Material Input Ekle"):
+            with api_client() as c:
+                r = c.post("/cbam/material-inputs", json={
+                    "activity_record_id": record_id,
+                    "product_id": prod_map[prod_sel2],
+                    "material_id": mat_map[mat_sel],
+                    "quantity": mi_qty,
+                    "unit": mi_unit,
+                    "embedded_factor_id": override_factor or None
+                })
+            if r.status_code == 200:
+                st.success("Material input eklendi.")
+            else:
+                st.error(r.text)
+
+        with api_client() as c:
+            r = c.get("/cbam/material-inputs", params={"activity_record_id": record_id})
+        if r.status_code == 200:
+            st.dataframe(r.json(), use_container_width=True)
+
+    st.divider()
+    st.subheader("İhracat (ExportRecord)")
+    period_start = st.text_input("Dönem başlangıç (YYYY-MM-DD)")
+    period_end = st.text_input("Dönem bitiş (YYYY-MM-DD)")
+    prod_sel3 = st.selectbox("Ürün (ihracat)", list(prod_map.keys()), key="prod3")
+    ex_qty = st.number_input("İhracat miktarı", value=0.0)
+    ex_unit = st.text_input("Birim", value="ton", key="ex_unit")
+    dest = st.text_input("Varış ülkesi (opsiyonel)")
+    if st.button("İhracat Kaydı Ekle"):
+        with api_client() as c:
+            r = c.post("/cbam/exports", json={
+                "facility_id": facility_id,
+                "product_id": prod_map[prod_sel3],
+                "period_start": period_start,
+                "period_end": period_end,
+                "export_qty": ex_qty,
+                "unit": ex_unit,
+                "destination": dest or None
+            })
+        if r.status_code == 200:
+            st.success("İhracat kaydı eklendi.")
+        else:
+            st.error(r.text)
+
+    with api_client() as c:
+        r = c.get("/cbam/exports", params={"facility_id": facility_id, "period_start": period_start, "period_end": period_end})
+    if r.status_code == 200:
+        st.dataframe(r.json(), use_container_width=True)
+
+# -------------------------
+# CBAM HESAP / RAPOR
+# -------------------------
+elif page == "CBAM Hesap / Rapor":
+    ensure_login()
+    st.header("CBAM Hesap / Rapor (Embedded Emissions)")
+
+    with api_client() as c:
+        fac = c.get("/facilities/")
+    facilities = fac.json() if fac.status_code == 200 else []
+    if not facilities:
+        st.warning("Önce tesis oluşturun.")
+        st.stop()
+
+    fac_map = {f["name"]: f["id"] for f in facilities}
+    fac_name = st.selectbox("Tesis seç", list(fac_map.keys()))
+    facility_id = fac_map[fac_name]
+
+    with api_client() as c:
+        ar = c.get("/activity/records", params={"facility_id": facility_id})
+    records = ar.json() if ar.status_code == 200 else []
+    if not records:
+        st.warning("Bu tesis için activity record yok.")
+        st.stop()
+    activity_record_id = st.selectbox("Activity Record", [x["id"] for x in records])
+
+    period_start = st.text_input("Dönem başlangıç (YYYY-MM-DD)", key="cbam_ps")
+    period_end = st.text_input("Dönem bitiş (YYYY-MM-DD)", key="cbam_pe")
+    ets_price = st.number_input("ETS fiyatı (EUR/tCO2)", value=75.0)
+
+    st.caption("Ön koşul: Bu activity_record için /calc/run ile facility-level hesap yapılmış olmalı.")
+
+    if st.button("CBAM Rapor Üret"):
+        with api_client() as c:
+            r = c.post("/cbam/run", json={
+                "facility_id": facility_id,
+                "activity_record_id": activity_record_id,
+                "period_start": period_start,
+                "period_end": period_end,
+                "ets_price_eur_per_tco2": ets_price
+            })
+        if r.status_code == 200:
+            out = r.json()
+            st.success(f"CBAM rapor üretildi. report_hash: {out['report_hash']}")
+            st.json(out["report"])
+        else:
+            st.error(r.text)
+
+# -------------------------
+# VERİ TOPLAMA / HESAPLAMALAR / EVIDENCE (önceki ekranlar aynı)
+# -------------------------
 elif page == "Veri Toplama":
     ensure_login()
     st.header("Veri Toplama (Activity Data)")
@@ -481,7 +746,7 @@ elif page == "Veri Toplama":
 
 elif page == "Hesaplamalar":
     ensure_login()
-    st.header("ETS + CBAM Hesaplama")
+    st.header("ETS + Facility Hesaplama")
 
     with api_client() as c:
         fac = c.get("/facilities/")
@@ -541,6 +806,5 @@ elif page == "Evidence Pack":
         if rr.status_code == 200:
             st.success("Evidence pack üretildi.")
             st.json(rr.json())
-            st.caption("Manifest storage'a yazılır; STORAGE_MODE=s3 ise S3'e, local ise LOCAL_S3_ROOT altına.")
         else:
             st.error(rr.text)
