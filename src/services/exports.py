@@ -14,7 +14,17 @@ import pandas as pd
 from sqlalchemy import select
 
 from src.db.session import db
-from src.db.models import CalculationSnapshot, DatasetUpload, EmissionFactor, EvidenceDocument, Methodology, Report
+from src.db.models import (
+    CalculationSnapshot,
+    DatasetUpload,
+    EmissionFactor,
+    EvidenceDocument,
+    Methodology,
+    Project,
+    Report,
+    VerificationCase,
+    VerificationFinding,
+)
 from src.mrv.lineage import sha256_bytes
 from src.services.reporting import build_pdf
 from src.services.storage import EVIDENCE_DOCS_CATEGORIES
@@ -46,222 +56,167 @@ def build_xlsx_from_results(results_json: str) -> bytes:
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        pd.DataFrame([kpis]).to_excel(writer, index=False, sheet_name="KPIs")
-        pd.DataFrame(table).to_excel(writer, index=False, sheet_name="CBAM_Table")
+        pd.DataFrame([kpis]).to_excel(writer, sheet_name="KPIs", index=False)
+        pd.DataFrame(table).to_excel(writer, sheet_name="CBAM_Table", index=False)
 
-        if isinstance(cbam_goods, list) and cbam_goods:
-            pd.DataFrame(cbam_goods).to_excel(writer, index=False, sheet_name="CBAM_Goods")
+        if cbam_goods:
+            pd.DataFrame(cbam_goods).to_excel(writer, sheet_name="CBAM_Goods_Summary", index=False)
 
-        if isinstance(ets_activity, list) and ets_activity:
-            pd.DataFrame(ets_activity).to_excel(writer, index=False, sheet_name="ETS_Activity")
+        if ets_activity:
+            pd.DataFrame(ets_activity).to_excel(writer, sheet_name="ETS_Activity", index=False)
 
     return out.getvalue()
 
 
-def build_zip(snapshot_id: int, results_json: str) -> bytes:
-    xlsx_bytes = build_xlsx_from_results(results_json)
+def build_zip(files: dict[str, bytes]) -> bytes:
+    """
+    Basit ZIP builder. files: path->bytes
+    """
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr(f"snapshot_{snapshot_id}_results.json", results_json or "{}")
-        z.writestr(f"snapshot_{snapshot_id}_export.xlsx", xlsx_bytes)
+        for path_in_zip, bts in files.items():
+            z.writestr(path_in_zip, bts or b"")
     return out.getvalue()
 
 
 def _safe_read_bytes(uri: str) -> bytes:
+    """
+    Streamlit Cloud uyumlu: storage_uri genelde yerel path olur (./data/.. veya /tmp/..).
+    """
+    if not uri:
+        return b""
     try:
-        p = Path(str(uri))
-        if p.exists():
+        p = Path(uri)
+        if p.exists() and p.is_file():
             return p.read_bytes()
     except Exception:
         pass
+
+    # bazı ortamlarda uri file:// olabilir
+    try:
+        if uri.startswith("file://"):
+            p = Path(uri.replace("file://", ""))
+            if p.exists() and p.is_file():
+                return p.read_bytes()
+    except Exception:
+        pass
+
+    # son çare: bytes yok
     return b""
 
 
 def _snapshot_input_uris(snapshot: CalculationSnapshot) -> dict:
     """
-    input_hashes_json yeni format:
-      {
-        "energy": {"uri":..., "sha256":..., ...},
-        "production": {...},
-        "materials": {...}
-      }
-    eski formatlarla uyumluluk da korunur.
+    input_hashes_json -> {energy:{uri,sha256,...}, production:{...}, materials:{...}}
     """
     try:
         ih = json.loads(snapshot.input_hashes_json or "{}")
     except Exception:
         ih = {}
 
-    if isinstance(ih, dict) and ("energy" in ih or "production" in ih):
-        out = {}
-        for k in ("energy", "production", "materials"):
-            v = ih.get(k) or {}
-            if isinstance(v, dict):
-                out[k] = {"uri": v.get("uri") or "", "sha256": v.get("sha256") or ""}
-        return out
+    # Paket D2: project upload kaydı yoksa ih boş olabilir.
+    # En iyi çaba ile DB'den latest upload çek.
+    if not ih:
+        with db() as s:
+            ups = (
+                s.execute(
+                    select(DatasetUpload)
+                    .where(DatasetUpload.project_id == snapshot.project_id)
+                    .order_by(DatasetUpload.uploaded_at.desc())
+                )
+                .scalars()
+                .all()
+            )
+        ih = {}
+        for u in ups:
+            if u.dataset_type not in ih:
+                ih[u.dataset_type] = {
+                    "uri": str(u.storage_uri),
+                    "sha256": u.sha256,
+                    "original_filename": u.original_filename,
+                    "schema_version": u.schema_version,
+                }
 
-    if isinstance(ih, dict):
-        return {
-            "energy": {"uri": ih.get("energy_uri") or "", "sha256": ""},
-            "production": {"uri": ih.get("production_uri") or "", "sha256": ""},
-            "materials": {"uri": "", "sha256": ""},
-        }
-
-    return {"energy": {"uri": "", "sha256": ""}, "production": {"uri": "", "sha256": ""}, "materials": {"uri": "", "sha256": ""}}
+    return ih
 
 
 def _ensure_pdf_for_snapshot(snapshot: CalculationSnapshot) -> tuple[bytes, str]:
     """
-    Paket D4: PDF payload artık CBAM/ETS bölümleri + DQ içerir.
-    - Eğer DB’de aynı pdf sha ile kayıt varsa onu okur.
-    - Yoksa build_pdf ile üretir ve Report tablosuna yazar (best-effort).
+    Snapshot için PDF raporu üretir veya DB'den son raporu reuse eder.
+    Report hash: sha256(pdf_bytes)
     """
-    results = {}
-    try:
-        results = json.loads(snapshot.results_json or "{}")
-    except Exception:
-        results = {}
-
-    kpis = (results.get("kpis") or {}) if isinstance(results, dict) else {}
-    cbam_table = (results.get("cbam_table") or []) if isinstance(results, dict) else []
-    scenario = (results.get("scenario") or {}) if isinstance(results, dict) else {}
-    cbam_section = (results.get("cbam") or {}) if isinstance(results, dict) else {}
-    ets_section = (results.get("ets") or {}) if isinstance(results, dict) else {}
-
-    try:
-        cfg = json.loads(snapshot.config_json or "{}")
-    except Exception:
-        cfg = {}
-
-    # Methodology (zengin)
-    meth_payload = None
-    if getattr(snapshot, "methodology_id", None):
-        with db() as s:
-            m = s.get(Methodology, int(snapshot.methodology_id))
-            if m:
-                meth_payload = {
-                    "id": m.id,
-                    "name": m.name,
-                    "description": m.description,
-                    "scope": m.scope,
-                    "version": m.version,
-                    "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
-                }
-
-    title = "Rapor — CBAM + ETS (Readiness)"
-    if isinstance(scenario, dict) and scenario.get("name"):
-        title = f"Senaryo Raporu — {scenario.get('name')} (Readiness)"
-
-    # DB’de hazır pdf var mı?
+    # Son report varsa reuse
     with db() as s:
-        r = (
+        rep = (
             s.execute(
                 select(Report)
-                .where(Report.snapshot_id == snapshot.id, Report.report_type == "pdf")
+                .where(Report.snapshot_id == snapshot.id)
                 .order_by(Report.created_at.desc())
                 .limit(1)
             )
             .scalars()
             .first()
         )
-        if r and getattr(r, "storage_uri", None):
-            pdf_bytes = _safe_read_bytes(str(r.storage_uri))
-            if pdf_bytes:
-                return pdf_bytes, getattr(r, "sha256", sha256_bytes(pdf_bytes))
 
-    # Data quality (upload’lardan derive)
-    dq = {}
-    inputs = _snapshot_input_uris(snapshot)
+    if rep:
+        b = _safe_read_bytes(str(rep.storage_uri))
+        if b:
+            return b, rep.sha256
+
+    # yoksa build_pdf (mevcut)
     try:
-        with db() as s:
-            for key in ("energy", "production", "materials"):
-                sha_val = (inputs.get(key) or {}).get("sha256") or ""
-                if not sha_val:
-                    continue
-                up = (
-                    s.execute(
-                        select(DatasetUpload)
-                        .where(
-                            DatasetUpload.project_id == snapshot.project_id,
-                            DatasetUpload.dataset_type == key,
-                            DatasetUpload.sha256 == sha_val,
-                        )
-                        .order_by(DatasetUpload.uploaded_at.desc())
-                        .limit(1)
-                    )
-                    .scalars()
-                    .first()
-                )
-                if up:
-                    try:
-                        dq_report = json.loads(up.data_quality_report_json or "{}")
-                    except Exception:
-                        dq_report = {}
-                    dq[key] = {"score": up.data_quality_score, "report": dq_report}
+        results = json.loads(snapshot.results_json or "{}")
     except Exception:
-        dq = {}
+        results = {}
 
-    payload = {
-        "kpis": kpis,
-        "config": cfg,
-        "cbam": cbam_section,
-        "ets": ets_section,
-        "cbam_table": cbam_table,
-        "scenario": scenario,
-        "methodology": meth_payload,
-        "data_quality": dq,
-        "data_sources": [
-            "energy.csv (yüklenen dosya)",
-            "production.csv (yüklenen dosya)",
-            "materials.csv (opsiyonel, precursor)",
-            "EmissionFactor Library (DB)",
-            "Monitoring Plan (DB, facility bazlı)",
-        ],
-        "formulas": [
-            "Direct emissions: fuel_quantity × NCV × emission_factor × oxidation_factor",
-            "Indirect emissions: electricity_kwh × grid_factor (location/market)",
-            "Precursor emissions: materials.material_quantity × materials.emission_factor",
-        ],
-    }
+    pdf = build_pdf(snapshot_id=snapshot.id, results=results)
+    if not pdf:
+        return b"", ""
 
-    pdf_uri, pdf_sha = build_pdf(snapshot.id, title, payload)
-    pdf_bytes = _safe_read_bytes(pdf_uri)
+    h = sha256(pdf).hexdigest()
 
-    if pdf_bytes:
-        try:
-            with db() as s:
-                ex = (
-                    s.execute(
-                        select(Report)
-                        .where(Report.snapshot_id == snapshot.id, Report.report_type == "pdf", Report.sha256 == pdf_sha)
-                        .limit(1)
-                    )
-                    .scalars()
-                    .first()
-                )
-                if not ex:
-                    s.add(Report(snapshot_id=snapshot.id, report_type="pdf", storage_uri=str(pdf_uri), sha256=pdf_sha))
-                    s.commit()
-        except Exception:
-            pass
+    # raporu DB'ye kaydet (storage: yerel tmp dosya)
+    try:
+        reports_dir = Path("exports")
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        out_path = reports_dir / f"report_snapshot_{snapshot.id}.pdf"
+        out_path.write_bytes(pdf)
 
-    return pdf_bytes, pdf_sha
+        with db() as s:
+            rep2 = Report(snapshot_id=snapshot.id, report_type="pdf", storage_uri=str(out_path), sha256=h)
+            s.add(rep2)
+            s.commit()
+    except Exception:
+        pass
+
+    return pdf, h
 
 
 def _hmac_signature(payload_bytes: bytes) -> str | None:
     """
-    Signed manifest (Paket B).
-    İmza anahtarı: env var EVIDENCE_SIGNING_KEY (Streamlit Cloud secrets -> env olarak set edilebilir).
+    Manifest imzası: HMAC-SHA256(base64).
+    Anahtar env: EVIDENCE_PACK_HMAC_KEY (base64 veya düz string)
     """
-    key = os.getenv("EVIDENCE_SIGNING_KEY", "")
+    key = os.getenv("EVIDENCE_PACK_HMAC_KEY", "").strip()
     if not key:
         return None
-    mac = hmac.new(key.encode("utf-8"), payload_bytes, sha256).digest()
-    return base64.b64encode(mac).decode("utf-8")
+    try:
+        # base64 ise çöz
+        try:
+            key_bytes = base64.b64decode(key.encode("utf-8"))
+            if not key_bytes:
+                key_bytes = key.encode("utf-8")
+        except Exception:
+            key_bytes = key.encode("utf-8")
+
+        sig = hmac.new(key_bytes, payload_bytes, sha256).digest()
+        return base64.b64encode(sig).decode("utf-8")
+    except Exception:
+        return None
 
 
 def _json_bytes(obj: dict) -> bytes:
-    return json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+    return json.dumps(obj or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def build_evidence_pack(snapshot_id: int) -> bytes:
@@ -275,6 +230,8 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
       - report pdf (CBAM/ETS/DQ bölümleri)
       - evidence documents (categories)
       - data_quality.json
+      - compliance_checks.json (Paket B3)
+      - verification_case.json (Paket B3, varsa)
       - manifest.json (signature dahil)
     """
     with db() as s:
@@ -354,6 +311,105 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "results": res,
     }
 
+    # Compliance checks (Paket B3): snapshot sonuçlarından çıkar
+    compliance_checks = []
+    try:
+        compliance_checks = (res or {}).get("compliance_checks", []) or []
+    except Exception:
+        compliance_checks = []
+    if not isinstance(compliance_checks, list):
+        compliance_checks = []
+
+    compliance_payload = {
+        "snapshot_id": snapshot.id,
+        "project_id": snapshot.project_id,
+        "result_hash": snapshot.result_hash,
+        "engine_version": snapshot.engine_version,
+        "compliance_checks": compliance_checks,
+    }
+
+    # Verification case (Paket B3): project + period_year bazlı dahil et (varsa)
+    period_year = None
+    try:
+        period_year = ((res or {}).get("input_bundle") or {}).get("period", {}).get("year", None)
+    except Exception:
+        period_year = None
+    if period_year is None:
+        try:
+            with db() as s:
+                p = s.get(Project, int(snapshot.project_id))
+                period_year = int(getattr(p, "year", 0) or 0) if p else None
+        except Exception:
+            period_year = None
+
+    verification_payload = {
+        "snapshot_id": snapshot.id,
+        "project_id": snapshot.project_id,
+        "period_year": period_year,
+        "cases": [],
+    }
+
+    try:
+        if period_year is not None:
+            with db() as s:
+                cases = (
+                    s.execute(
+                        select(VerificationCase)
+                        .where(
+                            VerificationCase.project_id == int(snapshot.project_id),
+                            VerificationCase.period_year == int(period_year),
+                        )
+                        .order_by(VerificationCase.created_at.desc())
+                    )
+                    .scalars()
+                    .all()
+                )
+                for c in cases:
+                    findings = (
+                        s.execute(
+                            select(VerificationFinding)
+                            .where(VerificationFinding.case_id == int(c.id))
+                            .order_by(VerificationFinding.created_at.asc())
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    verification_payload["cases"].append(
+                        {
+                            "id": c.id,
+                            "project_id": c.project_id,
+                            "facility_id": c.facility_id,
+                            "period_year": c.period_year,
+                            "verifier_org": c.verifier_org,
+                            "status": c.status,
+                            "created_at": (c.created_at.isoformat() if getattr(c, "created_at", None) else None),
+                            "created_by_user_id": getattr(c, "created_by_user_id", None),
+                            "closed_at": (c.closed_at.isoformat() if getattr(c, "closed_at", None) else None),
+                            "findings": [
+                                {
+                                    "id": f.id,
+                                    "severity": f.severity,
+                                    "description": f.description,
+                                    "corrective_action": f.corrective_action,
+                                    "due_date": f.due_date,
+                                    "status": f.status,
+                                    "created_at": (f.created_at.isoformat() if getattr(f, "created_at", None) else None),
+                                    "closed_at": (f.closed_at.isoformat() if getattr(f, "closed_at", None) else None),
+                                }
+                                for f in findings
+                            ],
+                        }
+                    )
+    except Exception:
+        # verification workflow DB tablosu yoksa export kırılmasın
+        verification_payload = {
+            "snapshot_id": snapshot.id,
+            "project_id": snapshot.project_id,
+            "period_year": period_year,
+            "cases": [],
+            "note": "Verification workflow verisi bulunamadı veya DB şeması eksik.",
+        }
+
     # PDF
     pdf_bytes, report_hash = _ensure_pdf_for_snapshot(snapshot)
 
@@ -416,6 +472,8 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     meth_json_bytes = _json_bytes(meth_obj)
     dq_json_bytes = _json_bytes(dq)
     evidence_index_bytes = _json_bytes({"evidence_documents": evidence_manifest})
+    compliance_json_bytes = _json_bytes(compliance_payload)
+    verification_json_bytes = _json_bytes(verification_payload)
 
     # Manifest (signature payload: signature alanı hariç)
     manifest_base = {
@@ -432,6 +490,8 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "methodology_hash": sha256_bytes(meth_json_bytes),
         "data_quality_hash": sha256_bytes(dq_json_bytes),
         "evidence_index_hash": sha256_bytes(evidence_index_bytes),
+        "compliance_checks_hash": sha256_bytes(compliance_json_bytes),
+        "verification_case_hash": sha256_bytes(verification_json_bytes),
     }
 
     sig = _hmac_signature(_json_bytes(manifest_base))
@@ -461,6 +521,11 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
 
         # evidence index + files
         z.writestr("evidence/evidence_index.json", evidence_index_bytes)
+
+        # compliance + verification (Paket B3)
+        z.writestr("compliance/compliance_checks.json", compliance_json_bytes)
+        z.writestr("verification/verification_case.json", verification_json_bytes)
+
         for path_in_zip, bts in evidence_files_to_zip:
             z.writestr(path_in_zip, bts or b"")
 
