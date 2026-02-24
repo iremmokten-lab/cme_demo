@@ -32,7 +32,7 @@ def _sorted_list_of_dicts(rows: List[Dict[str, Any]], keys: List[str]) -> List[D
     def kf(d: Dict[str, Any]) -> Tuple:
         return tuple(_as_str(d.get(k, "")) for k in keys)
 
-    return sorted((r or {}) for r in (rows or []), key=kf)
+    return sorted(((r or {}) for r in (rows or [])), key=kf)
 
 
 @dataclass(frozen=True)
