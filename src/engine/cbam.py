@@ -21,9 +21,6 @@ def _to_float(x: Any) -> float:
         return 0.0
 
 
-# ------------------------------------------------------------
-# CBAM goods taxonomy (MVP)
-# ------------------------------------------------------------
 _CBAM_GOODS = {
     "iron_steel": "Demir-Çelik",
     "aluminium": "Alüminyum",
@@ -56,7 +53,7 @@ def _clean_cn(cn: Any) -> str:
 
 
 # ------------------------------------------------------------
-# Paket D-devam: DB tabanlı CN Registry lookup (cache’li)
+# DB tabanlı CN Registry lookup (cache’li)
 # ------------------------------------------------------------
 _REGISTRY_CACHE: dict = {
     "loaded": False,
@@ -67,7 +64,6 @@ _REGISTRY_CACHE: dict = {
 def _load_registry_rows() -> List[dict]:
     """
     DB’den aktif mappingleri çeker.
-    Streamlit Cloud / SQLite uyumlu.
     Import başarısızsa sessizce fallback’e döner.
     """
     global _REGISTRY_CACHE
@@ -112,11 +108,6 @@ def _load_registry_rows() -> List[dict]:
 
 
 def _registry_match(cn: str) -> Optional[dict]:
-    """
-    Eşleşme önceliği:
-      1) exact match (priority yüksek, pattern uzun)
-      2) prefix match (priority yüksek, pattern uzun)
-    """
     cn = _clean_cn(cn)
     if not cn:
         return None
@@ -154,15 +145,6 @@ def _registry_match(cn: str) -> Optional[dict]:
 
 
 def cn_to_goods(cn_code: Any) -> Dict[str, str]:
-    """
-    Dönüş:
-      {
-        "cn_code": "7208....",
-        "cbam_good_key": "iron_steel",
-        "cbam_good_name": "Demir-Çelik",
-        "mapping_rule": "registry:exact|prefix:<pattern>" OR "fallback:prefix:<pattern>"
-      }
-    """
     cn = _clean_cn(cn_code)
     if not cn:
         return {
@@ -211,15 +193,12 @@ def cn_to_goods(cn_code: Any) -> Dict[str, str]:
 
 
 def is_cbam_covered_row(row: dict) -> bool:
-    """
-    Coverage belirleme:
-    1) production.csv’de cbam_covered field varsa onu kullan
-    2) yoksa CN mapping ile “other” olmayan goods => covered say
-    """
+    # 1) production.csv’de cbam_covered field varsa onu kullan
     if "cbam_covered" in row and row["cbam_covered"] is not None and str(row["cbam_covered"]).strip() != "":
         v = str(row["cbam_covered"]).strip().lower()
         return v in ("1", "true", "yes", "evet", "covered", "y", "t")
 
+    # 2) yoksa CN mapping ile “other” olmayan goods => covered say
     cn = row.get("cn_code")
     m = cn_to_goods(cn)
     return m.get("cbam_good_key") != "other"
@@ -227,12 +206,12 @@ def is_cbam_covered_row(row: dict) -> bool:
 
 def precursor_emissions_from_materials(materials_df: pd.DataFrame) -> pd.DataFrame:
     """
-    materials.csv -> sku bazında precursor tCO2 (embedded, upstream)
+    materials.csv -> sku bazında precursor tCO2 (embedded)
 
     Beklenen kolonlar (MVP):
       - sku
-      - material_quantity (numeric)
-      - emission_factor (kgCO2e / material_unit varsayımı)
+      - material_quantity
+      - emission_factor (kgCO2e / material_unit)
     """
     if materials_df is None or len(materials_df) == 0:
         return pd.DataFrame(columns=["sku", "precursor_tco2"])
@@ -267,11 +246,11 @@ def cbam_compute(
 ) -> tuple[pd.DataFrame, dict]:
     """
     CBAM hesap (MVP):
-      - Direct emissions: energy_breakdown.direct_tco2 (fuel bazlı)
+      - Direct emissions: energy_breakdown.direct_tco2 (fuel bazlı - workflow üretir)
       - Indirect emissions: energy_breakdown.indirect_tco2 (electricity)
       - Precursor: materials.csv’den sku bazlı
       - SKU → CN → Goods mapping (DB registry öncelikli)
-      - Ürün bazlı embedded emissions + EU export allocation
+      - Ürün bazlı embedded emissions + export allocation
     """
     if production_df is None or len(production_df) == 0:
         empty = pd.DataFrame(
