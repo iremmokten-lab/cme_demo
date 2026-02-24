@@ -15,6 +15,8 @@ from services.api.routers import mrv as mrv_router
 from services.api.routers import documents as documents_router
 from services.api.routers import catalog as catalog_router
 from services.api.routers import cbam as cbam_router
+from services.api.routers import verification as verification_router
+from services.api.routers import scenario as scenario_router
 
 app = FastAPI(title=settings.APP_NAME)
 
@@ -40,3 +42,6 @@ app.include_router(documents_router.router, prefix="/documents", tags=["Document
 
 app.include_router(catalog_router.router, prefix="/catalog", tags=["Catalog"])
 app.include_router(cbam_router.router, prefix="/cbam", tags=["CBAM"])
+
+app.include_router(verification_router.router, prefix="/verification", tags=["Verification"])
+app.include_router(scenario_router.router, prefix="/scenario", tags=["Scenario"])
