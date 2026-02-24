@@ -13,6 +13,8 @@ from services.api.routers import (
 )
 from services.api.routers import mrv as mrv_router
 from services.api.routers import documents as documents_router
+from services.api.routers import catalog as catalog_router
+from services.api.routers import cbam as cbam_router
 
 app = FastAPI(title=settings.APP_NAME)
 
@@ -35,3 +37,6 @@ app.include_router(jobs.router, prefix="/jobs", tags=["Jobs"])
 
 app.include_router(mrv_router.router, prefix="/mrv", tags=["MRV"])
 app.include_router(documents_router.router, prefix="/documents", tags=["Documents"])
+
+app.include_router(catalog_router.router, prefix="/catalog", tags=["Catalog"])
+app.include_router(cbam_router.router, prefix="/cbam", tags=["CBAM"])
