@@ -55,14 +55,24 @@ class Facility(Base):
 
     __table_args__ = (Index("ix_facility_tenant_name", "tenant_id", "name"),)
 
+# ---------------------------------------------------
+# Facility-scope RLS v2: user_facility_scope
+# ---------------------------------------------------
+class UserFacilityScope(Base):
+    __tablename__ = "user_facility_scope"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_user.id"), nullable=False, index=True)
+    facility_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("facility.id"), nullable=False, index=True)
+    scope_role: Mapped[str] = mapped_column(String(40), nullable=False, default="member")  # member/manager/auditor
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    __table_args__ = (Index("ux_user_facility_scope", "tenant_id", "user_id", "facility_id", unique=True),)
+
 # -----------------------------
 # Catalog: Product / Material (Precursor)
 # -----------------------------
 class Product(Base):
-    """
-    CBAM ürünleri / tesis ürünleri.
-    cn_code: CBAM kapsamı için ürün sınıflandırması (CN/KN code).
-    """
     __tablename__ = "product"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
@@ -79,10 +89,6 @@ class Product(Base):
     )
 
 class Material(Base):
-    """
-    Material/Precursor katalogu.
-    embedded_factor_id: tCO2e/unit (precursor embedded) için onaylı faktör referansı.
-    """
     __tablename__ = "material"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
@@ -269,10 +275,6 @@ class ProcessActivity(Base):
 # CBAM Product-level Activity
 # -----------------------------
 class ProductionRecord(Base):
-    """
-    Ürün bazlı üretim (allocation/intensity için).
-    activity_record ile aynı dönemi temsil eder.
-    """
     __tablename__ = "production_record"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
@@ -286,10 +288,6 @@ class ProductionRecord(Base):
     __table_args__ = (Index("ux_prod_rec_unique", "tenant_id", "activity_record_id", "product_id", unique=True),)
 
 class MaterialInput(Base):
-    """
-    Ürün bazlı precursor/material tüketimi.
-    embedded_factor_id opsiyonel: material.embedded_factor_id override edilebilir.
-    """
     __tablename__ = "material_input"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
@@ -306,9 +304,6 @@ class MaterialInput(Base):
     __table_args__ = (Index("ix_mat_input_ar_product", "tenant_id", "activity_record_id", "product_id"),)
 
 class ExportRecord(Base):
-    """
-    Ürün bazlı ihracat (CBAM rapor satırları buradan üretilir).
-    """
     __tablename__ = "export_record"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
@@ -352,10 +347,6 @@ class CalculationRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
 class CBAMReport(Base):
-    """
-    CBAM rapor çıktısı (satır bazlı JSON).
-    Transitional reporting alanlarını Aşama 3'te genişleteceğiz.
-    """
     __tablename__ = "cbam_report"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
@@ -364,6 +355,12 @@ class CBAMReport(Base):
     period_end: Mapped[str] = mapped_column(String(10), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="generated")  # generated/submitted/locked
 
+    # CBAM-IR transitional: deklaran/tesise dair üst alanlar
+    declarant_name: Mapped[str | None] = mapped_column(String(200))
+    installation_name: Mapped[str | None] = mapped_column(String(200))
+    installation_country: Mapped[str | None] = mapped_column(String(80))
+    methodology_note_tr: Mapped[str | None] = mapped_column(Text)
+
     report_json: Mapped[str] = mapped_column(Text, nullable=False)
     report_hash: Mapped[str] = mapped_column(String(64), nullable=False)
 
@@ -371,6 +368,57 @@ class CBAMReport(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
     __table_args__ = (Index("ix_cbam_report_period", "tenant_id", "period_start", "period_end"),)
+
+class CBAMReportLine(Base):
+    """
+    Normalized satırlar: audit-ready export lines.
+    """
+    __tablename__ = "cbam_report_line"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
+    cbam_report_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("cbam_report.id"), nullable=False, index=True)
+
+    export_record_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+    facility_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+    product_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+
+    cn_code: Mapped[str | None] = mapped_column(String(32))
+    product_name: Mapped[str | None] = mapped_column(String(200))
+    export_qty: Mapped[float] = mapped_column(Numeric(18, 3), nullable=False)
+    unit: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    embedded_intensity: Mapped[float] = mapped_column(Numeric(18, 9), nullable=False)  # tCO2e/unit
+    export_embedded: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)    # tCO2e
+
+    direct_allocated: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False, default=0)
+    indirect_allocated: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False, default=0)
+    precursor_embedded: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False, default=0)
+
+    destination: Mapped[str | None] = mapped_column(String(80))
+
+    __table_args__ = (Index("ix_cbam_line_report", "tenant_id", "cbam_report_id"),)
+
+class ComplianceCheck(Base):
+    """
+    Checklist / doğrulama sonuçları (CBAM-IR transitional).
+    """
+    __tablename__ = "compliance_check"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
+
+    check_type: Mapped[str] = mapped_column(String(40), nullable=False)  # CBAM/ETS/MRV
+    entity_type: Mapped[str] = mapped_column(String(80), nullable=False) # cbam_report/case/...
+    entity_id: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+
+    rule_code: Mapped[str] = mapped_column(String(80), nullable=False)   # CBAM_IR_REQUIRED_FIELD_001
+    severity: Mapped[str] = mapped_column(String(20), nullable=False)    # error/warn/info
+    status: Mapped[str] = mapped_column(String(20), nullable=False)      # pass/fail
+    message_tr: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_hint_tr: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_check_entity", "tenant_id", "check_type", "entity_type", "entity_id"),)
 
 class EvidencePack(Base):
     __tablename__ = "evidence_pack"
@@ -425,10 +473,125 @@ class Job(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
     job_type: Mapped[str] = mapped_column(String(40), nullable=False)
-    status: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, index=True)  # queued/running/succeeded/failed
     payload: Mapped[str] = mapped_column(Text, nullable=False)
     result: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
     __table_args__ = (Index("ix_job_tenant_status", "tenant_id", "status"),)
+
+# ---------------------------------------------------
+# Verification workflow (case / finding / CAPA)
+# ---------------------------------------------------
+class VerificationCase(Base):
+    __tablename__ = "verification_case"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
+
+    facility_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("facility.id"), nullable=False, index=True)
+    period_start: Mapped[str] = mapped_column(String(10), nullable=False)
+    period_end: Mapped[str] = mapped_column(String(10), nullable=False)
+
+    scope: Mapped[str] = mapped_column(String(20), nullable=False)  # ETS/CBAM/MRV
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open/in_review/closed
+    verifier_org: Mapped[str | None] = mapped_column(String(200))
+    lead_verifier: Mapped[str | None] = mapped_column(String(200))
+    notes_tr: Mapped[str | None] = mapped_column(Text)
+
+    created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_user.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_ver_case_period", "tenant_id", "facility_id", "period_start", "period_end"),)
+
+class VerificationFinding(Base):
+    __tablename__ = "verification_finding"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
+
+    case_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("verification_case.id"), nullable=False, index=True)
+
+    finding_type: Mapped[str] = mapped_column(String(40), nullable=False)  # nonconformity/observation/omission
+    severity: Mapped[str] = mapped_column(String(20), nullable=False)      # major/minor/info
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description_tr: Mapped[str] = mapped_column(Text, nullable=False)
+
+    reg_reference: Mapped[str | None] = mapped_column(String(200))
+    evidence_required_tr: Mapped[str | None] = mapped_column(Text)
+
+    status: Mapped[str] = mapped_column(String(20), default="open")        # open/acknowledged/closed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_finding_case", "tenant_id", "case_id"),)
+
+class CAPAAction(Base):
+    __tablename__ = "capa_action"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
+
+    finding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("verification_finding.id"), nullable=False, index=True)
+
+    action_type: Mapped[str] = mapped_column(String(20), nullable=False)   # corrective/preventive
+    owner: Mapped[str | None] = mapped_column(String(200))
+    due_date: Mapped[str | None] = mapped_column(String(10))               # YYYY-MM-DD
+    status: Mapped[str] = mapped_column(String(20), default="open")        # open/in_progress/done/verified
+    action_plan_tr: Mapped[str] = mapped_column(Text, nullable=False)
+
+    closure_evidence_doc_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    verifier_note_tr: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (Index("ix_capa_finding", "tenant_id", "finding_id"),)
+
+# ---------------------------------------------------
+# Scenario engine (what-if) + Optimizer
+# ---------------------------------------------------
+class Scenario(Base):
+    __tablename__ = "scenario"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
+
+    facility_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("facility.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="draft")  # draft/running/ready/archived
+
+    base_activity_record_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+    period_start: Mapped[str | None] = mapped_column(String(10))
+    period_end: Mapped[str | None] = mapped_column(String(10))
+
+    notes_tr: Mapped[str | None] = mapped_column(Text)
+
+    created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("app_user.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_scenario_facility", "tenant_id", "facility_id"),)
+
+class ScenarioAssumption(Base):
+    __tablename__ = "scenario_assumption"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
+
+    scenario_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("scenario.id"), nullable=False, index=True)
+
+    key: Mapped[str] = mapped_column(String(80), nullable=False)    # ets_price, allowances, reduction_pct, grid_factor_override...
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(40))
+    notes_tr: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (Index("ux_scenario_assumption", "tenant_id", "scenario_id", "key", unique=True),)
+
+class ScenarioRun(Base):
+    __tablename__ = "scenario_run"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=False, index=True)
+
+    scenario_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("scenario.id"), nullable=False, index=True)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+
+    status: Mapped[str] = mapped_column(String(20), default="queued")  # queued/running/succeeded/failed
+    result_json: Mapped[str | None] = mapped_column(Text)
+    result_hash: Mapped[str | None] = mapped_column(String(64))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_scenario_run", "tenant_id", "scenario_id", "created_at"),)
