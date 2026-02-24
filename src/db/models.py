@@ -44,6 +44,7 @@ class Facility(Base):
     company = relationship("Company", back_populates="facilities")
     projects = relationship("Project", back_populates="facility")
     monitoring_plans = relationship("MonitoringPlan", back_populates="facility", cascade="all, delete-orphan")
+    verification_cases = relationship("VerificationCase", back_populates="facility")
 
 
 class Project(Base):
@@ -61,6 +62,7 @@ class Project(Base):
     uploads = relationship("DatasetUpload", back_populates="project", cascade="all, delete-orphan")
     snapshots = relationship("CalculationSnapshot", back_populates="project", cascade="all, delete-orphan")
     evidence_documents = relationship("EvidenceDocument", back_populates="project", cascade="all, delete-orphan")
+    verification_cases = relationship("VerificationCase", back_populates="project", cascade="all, delete-orphan")
 
 
 class EvidenceDocument(Base):
@@ -189,6 +191,57 @@ class CalculationSnapshot(Base):
     project = relationship("Project", back_populates="snapshots")
     reports = relationship("Report", back_populates="snapshot", cascade="all, delete-orphan")
     methodology = relationship("Methodology", back_populates="snapshots")
+
+
+class VerificationCase(Base):
+    """Verification Workflow (MVP) — 2018/2067 readiness.
+
+    Case facility + period üzerinde açılır.
+    Snapshot ile birebir bağ zorunlu değil; evidence pack içinde snapshot’ın
+    project + period’ına göre dahil edilebilir.
+    """
+
+    __tablename__ = "verificationcases"
+
+    id = Column(Integer, primary_key=True)
+
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True, index=True)
+
+    period_year = Column(Integer, nullable=False, default=2025, index=True)
+    verifier_org = Column(String(200), default="")
+
+    status = Column(String(50), default="planning", index=True)  # planning/fieldwork/findings/closed
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    created_by_user_id = Column(Integer, nullable=True)
+
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+
+    project = relationship("Project", back_populates="verification_cases")
+    facility = relationship("Facility", back_populates="verification_cases")
+    findings = relationship("VerificationFinding", back_populates="case", cascade="all, delete-orphan")
+
+
+class VerificationFinding(Base):
+    """Verification bulgusu (finding)."""
+
+    __tablename__ = "verificationfindings"
+
+    id = Column(Integer, primary_key=True)
+    case_id = Column(Integer, ForeignKey("verificationcases.id"), nullable=False, index=True)
+
+    severity = Column(String(20), default="minor", index=True)  # minor/major/critical
+    description = Column(Text, default="")
+    corrective_action = Column(Text, default="")
+
+    due_date = Column(String(30), default="")  # MVP: string (YYYY-MM-DD)
+    status = Column(String(30), default="open", index=True)  # open/in_progress/closed
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+
+    case = relationship("VerificationCase", back_populates="findings")
 
 
 class Report(Base):
