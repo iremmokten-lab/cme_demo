@@ -44,6 +44,75 @@ def _read_results(snapshot: CalculationSnapshot) -> dict:
         return {}
 
 
+def _get_scenario_from_results(results: dict) -> dict:
+    """
+    UI "Senaryo" ayrımı için tek kaynak results_json içindeki `scenario` dict'idir.
+    Bazı workflow versiyonlarında senaryo farklı isimlerle taşınabiliyor; burada güvenli fallback yaparız.
+    """
+    if not isinstance(results, dict):
+        return {}
+
+    scen = results.get("scenario")
+    if isinstance(scen, dict) and scen:
+        return scen
+
+    # Fallback: bazı sürümlerde scenario_name / scenario_params vb.
+    name = results.get("scenario_name")
+    params = results.get("scenario_params")
+    if isinstance(name, str) and name.strip():
+        out = {"name": name.strip()}
+        if isinstance(params, dict):
+            out.update(params)
+        return out
+
+    return {}
+
+
+def _ensure_scenario_metadata_in_snapshot(snapshot_id: int, scenario: dict | None) -> None:
+    """
+    Senaryo çalıştırıldıktan sonra, snapshot.results_json içine `scenario` alanını garanti eder.
+    - Zaten varsa: dokunmaz
+    - Yoksa: results_json'a senaryo ekler ve commit eder
+
+    Bu, engine/workflow'u bozmadan UI'nin senaryoyu "görmesini" sağlar.
+    """
+    if not scenario or not isinstance(scenario, dict):
+        return
+
+    try:
+        with db() as s:
+            obj = s.get(CalculationSnapshot, int(snapshot_id))
+            if not obj:
+                return
+
+            try:
+                results = json.loads(obj.results_json) if obj.results_json else {}
+            except Exception:
+                results = {}
+
+            if not isinstance(results, dict):
+                results = {}
+
+            existing = results.get("scenario")
+            if isinstance(existing, dict) and existing:
+                return  # zaten var
+
+            # Enjekte et
+            results["scenario"] = scenario
+
+            try:
+                obj.results_json = json.dumps(results, ensure_ascii=False)
+            except Exception:
+                obj.results_json = json.dumps({"scenario": scenario}, ensure_ascii=False)
+
+            # result_hash vb. alanlara dokunmuyoruz (mevcut yapıyı bozmamak için)
+            s.add(obj)
+            s.commit()
+    except Exception:
+        # best-effort: UI kırılmasın
+        return
+
+
 def _first_existing_upload(session, project_id: int, dataset_type: str, sha: str):
     q = (
         select(DatasetUpload)
@@ -744,6 +813,7 @@ def consultant_app(user):
     # Senaryolar
     with tabs[3]:
         st.subheader("Senaryolar")
+        st.caption("Senaryo çalıştırınca bir snapshot oluşur. Aşağıda son senaryo snapshot’larını görebilirsiniz.")
 
         left, right = st.columns(2)
         with left:
@@ -771,6 +841,10 @@ def consultant_app(user):
                     methodology_id=methodology_id,
                     created_by_user_id=getattr(user, "id", None),
                 )
+
+                # ✅ KRİTİK FIX: UI'nin senaryoyu "görmesi" için results_json içine scenario garanti
+                _ensure_scenario_metadata_in_snapshot(int(snap.id), scenario)
+
                 st.session_state["last_snapshot_id"] = snap.id
                 append_audit(
                     "snapshot_created",
@@ -785,6 +859,40 @@ def consultant_app(user):
             except Exception as e:
                 st.error("Senaryo başarısız")
                 st.exception(e)
+
+        st.divider()
+        st.markdown("#### Son Senaryo Snapshot’ları (bu projede)")
+        with db() as s:
+            snaps = (
+                s.execute(
+                    select(CalculationSnapshot)
+                    .where(CalculationSnapshot.project_id == project_id)
+                    .order_by(CalculationSnapshot.created_at.desc())
+                    .limit(30)
+                )
+                .scalars()
+                .all()
+            )
+
+        scen_rows = []
+        for sn in snaps:
+            r = _read_results(sn)
+            scen = _get_scenario_from_results(r)
+            if scen:
+                scen_rows.append(
+                    {
+                        "Snapshot ID": sn.id,
+                        "Senaryo": scen.get("name") or "(isimsiz)",
+                        "Tarih": sn.created_at,
+                        "Kilitli": bool(getattr(sn, "locked", False)),
+                        "Paylaşıldı": bool(getattr(sn, "shared_with_client", False)),
+                    }
+                )
+
+        if scen_rows:
+            st.dataframe(scen_rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("Henüz bu projede senaryo snapshot’ı görünmüyor. (Senaryo çalıştırınca burada listelenir.)")
 
     # Raporlar ve İndirme
     with tabs[4]:
@@ -810,7 +918,7 @@ def consultant_app(user):
         id_list = []
         for sn in snaps[:50]:
             r = _read_results(sn)
-            scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
+            scen = _get_scenario_from_results(r)
             kind = "Senaryo" if scen else "Baseline"
             name = scen.get("name") if scen else ""
             lock_tag = "🔒" if getattr(sn, "locked", False) else ""
@@ -946,7 +1054,7 @@ def consultant_app(user):
                         "kpis": kpis,
                         "config": snap_config,
                         "cbam_table": results.get("cbam_table", []),
-                        "scenario": results.get("scenario", {}),
+                        "scenario": _get_scenario_from_results(results),
                         "methodology": meth_payload,
                         "data_sources": [
                             "energy.csv (yüklenen dosya)",
@@ -1146,7 +1254,7 @@ def consultant_app(user):
             rows = []
             for sn in snaps:
                 r = _read_results(sn)
-                scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
+                scen = _get_scenario_from_results(r)
                 kind = "Senaryo" if scen else "Baseline"
                 name = scen.get("name") if scen else ""
                 rows.append(
