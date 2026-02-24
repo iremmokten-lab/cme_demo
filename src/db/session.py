@@ -25,8 +25,7 @@ def init_db():
     # Base tablolar
     from src.db.models import Base
 
-    # Registry tabloları (Base metadata içine dahil olsun diye import)
-    # Not: Burada sadece import etmek yeterli; create_all tüm Base modellerini görür.
+    # CN Registry tabloları (metadata içine dahil olsun diye import)
     try:
         import src.db.cbam_registry  # noqa: F401
     except Exception:
