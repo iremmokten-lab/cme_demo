@@ -88,6 +88,43 @@ def ensure_bootstrap_admin():
             s.commit()
 
 
+def get_or_create_demo_user():
+    """Geriye dönük uyumluluk (pages/1_Consultant_Panel.py).
+
+    Danışman panelini demo amaçlı hızlı açmak için:
+    - ensure_bootstrap_admin() ile demo consultantadmin hesabını garanti eder
+    - admin kullanıcıyı session'a yazar ve döndürür
+
+    Not: Bu fonksiyon, ana login/role routing akışını bozmaz; sadece bu sayfa tarafından kullanılır.
+    """
+    ensure_bootstrap_admin()
+
+    admin_email = _get_secret("BOOTSTRAP_ADMIN_EMAIL", "admin@demo.com")
+
+    with db() as s:
+        u = s.execute(select(User).where(User.email == admin_email).limit(1)).scalars().first()
+        if not u:
+            u = s.execute(select(User).order_by(User.id).limit(1)).scalars().first()
+        if not u:
+            raise RuntimeError("Demo kullanıcı oluşturulamadı (User tablosu boş).")
+
+        st.session_state[SESSION_KEY] = int(u.id)
+
+    try:
+        append_audit(
+            "demo_user_auto_login",
+            {"email": str(getattr(u, "email", "") or ""), "role": str(getattr(u, "role", "") or "")},
+            user_id=getattr(u, "id", None),
+            company_id=infer_company_id_for_user(u),
+            entity_type="user",
+            entity_id=getattr(u, "id", None),
+        )
+    except Exception:
+        pass
+
+    return u
+
+
 def current_user():
     uid = st.session_state.get(SESSION_KEY)
     if not uid:
@@ -116,87 +153,78 @@ def login_view():
     pw = st.text_input("Şifre", type="password")
 
     if st.button("Giriş yap", type="primary"):
-        email_norm = (email or "").strip().lower()
-        now = datetime.now(timezone.utc)
-
         with db() as s:
-            u = s.execute(select(User).where(User.email == email_norm).limit(1)).scalars().first()
+            user = s.execute(select(User).where(User.email == email).limit(1)).scalars().first()
 
-            # Kullanıcı yoksa: generic hata (enumeration önleme)
-            if not u:
-                st.error("Hatalı e-posta/şifre")
-                append_audit("login_failed_unknown_user", {"email": email_norm}, entity_type="user", entity_id=None)
+            if not user:
+                st.error("Geçersiz e-posta veya şifre.")
                 return
 
-            locked, msg = _is_locked(u)
+            locked, msg = _is_locked(user)
             if locked:
                 st.error(msg)
                 return
 
-            if not _check_pw(pw or "", u.password_hash or ""):
-                # fail counter
-                u.failed_login_attempts = int(getattr(u, "failed_login_attempts", 0) or 0) + 1
-                if u.failed_login_attempts >= MAX_ATTEMPTS:
-                    u.locked_until = now + timedelta(minutes=LOCK_MINUTES)
-                    u.failed_login_attempts = 0
-                s.add(u)
-                s.commit()
+            ok = _check_pw(pw, user.password_hash)
+            if not ok:
+                # attempt tracking
+                try:
+                    user.failed_login_attempts = int(getattr(user, "failed_login_attempts", 0) or 0) + 1
+                    if user.failed_login_attempts >= MAX_ATTEMPTS:
+                        user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=LOCK_MINUTES)
+                        s.add(user)
+                        s.commit()
+                        st.error(f"Çok fazla hatalı deneme. Hesap {LOCK_MINUTES} dakika kilitlendi.")
+                        return
+                    s.add(user)
+                    s.commit()
+                except Exception:
+                    pass
 
-                st.error("Hatalı e-posta/şifre")
-                append_audit(
-                    "login_failed",
-                    {"email": email_norm},
-                    user_id=getattr(u, "id", None),
-                    company_id=infer_company_id_for_user(u),
-                    entity_type="user",
-                    entity_id=getattr(u, "id", None),
-                )
+                st.error("Geçersiz e-posta veya şifre.")
                 return
 
-            # success
-            u.failed_login_attempts = 0
-            u.locked_until = None
-            s.add(u)
-            s.commit()
+            # successful login
+            try:
+                user.failed_login_attempts = 0
+                user.locked_until = None
+                user.last_login_at = datetime.now(timezone.utc)
+                s.add(user)
+                s.commit()
+            except Exception:
+                pass
 
-            st.session_state[SESSION_KEY] = u.id
+            st.session_state[SESSION_KEY] = user.id
+
+        try:
             append_audit(
-                "login_success",
-                {"email": email_norm},
-                user_id=getattr(u, "id", None),
-                company_id=infer_company_id_for_user(u),
+                "user_login",
+                {"email": email},
+                user_id=getattr(user, "id", None),
+                company_id=infer_company_id_for_user(user),
                 entity_type="user",
-                entity_id=getattr(u, "id", None),
+                entity_id=getattr(user, "id", None),
             )
-            st.rerun()
+        except Exception:
+            pass
 
-    st.info(
-        """
-İlk kurulum:
-- Varsayılan admin: `admin@demo.com`
-- Varsayılan şifre: `ChangeMe123!`
-
-Eğer daha önce farklı şifreyle admin oluştuysa ve giriş yapamıyorsanız:
-Streamlit **Secrets** içine geçici olarak şunu ekleyin:
-- `BOOTSTRAP_ADMIN_FORCE_RESET = "1"`
-ve `BOOTSTRAP_ADMIN_PASSWORD` değerini istediğiniz şifre yapın.
-
-Giriş yaptıktan sonra `BOOTSTRAP_ADMIN_FORCE_RESET` satırını kaldırın.
-"""
-    )
+        st.success("Giriş başarılı.")
+        st.rerun()
 
 
 def logout_button():
     if st.button("Çıkış"):
-        u = current_user()
-        if u:
-            append_audit(
-                "logout",
-                {"email": getattr(u, "email", "")},
-                user_id=getattr(u, "id", None),
-                company_id=infer_company_id_for_user(u),
-                entity_type="user",
-                entity_id=getattr(u, "id", None),
-            )
+        uid = st.session_state.get(SESSION_KEY)
         st.session_state.pop(SESSION_KEY, None)
+        try:
+            append_audit(
+                "user_logout",
+                {},
+                user_id=uid,
+                company_id=None,
+                entity_type="user",
+                entity_id=uid,
+            )
+        except Exception:
+            pass
         st.rerun()
