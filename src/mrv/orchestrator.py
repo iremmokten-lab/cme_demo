@@ -208,8 +208,13 @@ def run_orchestrator(
 
     # Load activity datasets
     from src.services.workflow import latest_upload  # mevcut fonksiyon, bozmuyoruz
-    from src.services.workflow import load_csv_from_uri  # circular import kırmak için local import
+    ENGINE_VERSION_PACKET_A = "engine-3.0.0"
 
+
+def run_orchestrator(...):
+
+    from src.services.workflow import load_csv_from_uri
+    
     energy_u = latest_upload(project_id, "energy")
     prod_u = latest_upload(project_id, "production")
     materials_u = latest_upload(project_id, "materials")
