@@ -1,11 +1,17 @@
 streamlit==1.37.1
-pandas==2.2.2
+
+# Python 3.13 uyumluluğu:
+# pandas 2.2.3, Python 3.13 için uyumlu ilk sürümdür (wheel sağlar).
+pandas==2.2.3
 numpy==2.0.1
+
 SQLAlchemy==2.0.32
 python-dotenv==1.0.1
 bcrypt==4.2.0
 reportlab==4.2.2
 openpyxl==3.1.5
+
+# Bu projede API bileşenleri de bulunduğu için korunuyor:
 fastapi==0.115.0
 uvicorn==0.30.6
 pydantic==2.8.2
