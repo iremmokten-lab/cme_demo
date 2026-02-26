@@ -1,19 +1,6 @@
 streamlit==1.37.1
-
-# Python 3.13 uyumu:
-# pandas 2.2.3: Python 3.13 ile genel uyumlu ilk sürüm + wheel yayınlanır.
-pandas==2.2.3
-
-# NumPy cp313 wheel'leri güncel sürümlerde hazır gelir; 3.13'te source build riskini düşürür.
-numpy==2.3.1
-
-SQLAlchemy==2.0.32
-python-dotenv==1.0.1
-bcrypt==4.2.0
-reportlab==4.2.2
-openpyxl==3.1.5
-
-fastapi==0.115.0
-uvicorn==0.30.6
-pydantic==2.8.2
-httpx==0.27.2
+pandas==2.1.4
+numpy==1.26.4
+sqlalchemy==2.0.32
+pydantic==2.7.4
+python-dateutil==2.9.0
