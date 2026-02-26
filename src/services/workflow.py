@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from sqlalchemy import select
 
-from src.db.session import db
 from src.db.models import CalculationSnapshot, DatasetUpload
+from src.db.session import db
 from src.mrv.audit import append_audit
 from src.mrv.compliance import evaluate_compliance
 from src.mrv.lineage import sha256_json
@@ -31,7 +30,9 @@ def latest_upload(project_id: int, dataset_type: str) -> DatasetUpload | None:
 
 
 def _input_hashes_payload(project_id: int, energy_u: DatasetUpload, prod_u: DatasetUpload, materials_u: DatasetUpload | None) -> dict:
-    # DatasetUpload modelinde sha256 alanı var (content_hash değil)
+    """Activity data snapshot ref.
+    DatasetUpload modelinde içerik hash alanı `sha256` olarak tutulur.
+    """
     payload = {
         "project_id": int(project_id),
         "energy": {
@@ -98,24 +99,6 @@ def _try_reuse_snapshot(project_id: int, result_hash: str) -> CalculationSnapsho
         return existing
 
 
-def list_snapshots(project_id: int) -> list[CalculationSnapshot]:
-    with db() as s:
-        return (
-            s.execute(
-                select(CalculationSnapshot)
-                .where(CalculationSnapshot.project_id == int(project_id))
-                .order_by(CalculationSnapshot.created_at.desc())
-            )
-            .scalars()
-            .all()
-        )
-
-
-def get_snapshot(snapshot_id: int) -> CalculationSnapshot | None:
-    with db() as s:
-        return s.execute(select(CalculationSnapshot).where(CalculationSnapshot.id == int(snapshot_id))).scalar_one_or_none()
-
-
 def _latest_snapshot_hash(project_id: int) -> str | None:
     with db() as s:
         sn = (
@@ -153,9 +136,9 @@ def create_snapshot(
             config_json=json.dumps(config or {}, ensure_ascii=False, sort_keys=True, default=str),
             input_hashes_json=json.dumps(input_hashes or {}, ensure_ascii=False, sort_keys=True, default=str),
             results_json=json.dumps(results_json or {}, ensure_ascii=False, sort_keys=True, default=str),
-            methodology_id=int(methodology_id) if methodology_id is not None else None,
-            created_by_user_id=int(created_by_user_id) if created_by_user_id is not None else None,
-            previous_snapshot_hash=str(previous_snapshot_hash) if previous_snapshot_hash else None,
+            methodology_id=(int(methodology_id) if methodology_id is not None else None),
+            created_by_user_id=(int(created_by_user_id) if created_by_user_id is not None else None),
+            previous_snapshot_hash=(str(previous_snapshot_hash) if previous_snapshot_hash else None),
         )
         s.add(snap)
         s.commit()
@@ -170,16 +153,17 @@ def run_full(
     methodology_id: int | None = None,
     created_by_user_id: int | None = None,
 ) -> CalculationSnapshot:
-    """
-    Paket A:
-      - InputBundle/ResultBundle deterministik sözleşme
-      - Orchestrator deterministik compute
-      - Compliance Rule Engine hesap sonrası otomatik kontroller
-      - Sonuçlar snapshot.results_json içine deterministik şekilde yazılır
-      - Reuse güvenli: same input+config+scenario+methodology+factor_set+monitoring_plan => same snapshot
+    """Danışman panelinin kullandığı uçtan uca snapshot üretimi.
+
+    Fix kapsamı:
+    - DatasetUpload.content_hash -> sha256 düzeltildi
+    - evaluate_compliance(...) doğru imzayla çağrılır
+    - results_json.compliance_checks[] / results_json.qa_flags[] standardize edildi
+    - Snapshot reuse deterministik candidate_hash ile yapılır
     """
     scenario = scenario or {}
-    from src.mrv.orchestrator import ENGINE_VERSION_PACKET_A, run_orchestrator
+
+    from src.mrv.orchestrator import ENGINE_VERSION_PACKET_A, run_orchestrator  # circular import için local import
 
     energy_u = latest_upload(project_id, "energy")
     prod_u = latest_upload(project_id, "production")
@@ -198,9 +182,9 @@ def run_full(
     if materials_u and str(getattr(materials_u, "storage_uri", "") or ""):
         materials_df = load_csv_from_uri(str(getattr(materials_u, "storage_uri", "") or ""))
 
-    input_bundle, result_bundle, legacy = run_orchestrator(
+    input_bundle, result_bundle, legacy_results = run_orchestrator(
         project_id=int(project_id),
-        config=config or {},
+        config=(config or {}),
         scenario=scenario,
         methodology_id=methodology_id,
         activity_snapshot_ref=input_hashes,
@@ -209,14 +193,14 @@ def run_full(
         materials_df=materials_df,
     )
 
-    # Reuse anahtarı (Paket A)
-    legacy_input_bundle = legacy.get("input_bundle", {}) or {}
-    factor_set_ref = legacy_input_bundle.get("factor_set_ref", []) or []
-    monitoring_plan_ref = legacy_input_bundle.get("monitoring_plan_ref", None)
+    # Reuse key
+    ib = legacy_results.get("input_bundle", {}) or {}
+    factor_set_ref = ib.get("factor_set_ref", []) or []
+    monitoring_plan_ref = ib.get("monitoring_plan_ref", None)
 
     candidate_hash = _compute_result_hash(
         ENGINE_VERSION_PACKET_A,
-        config or {},
+        (config or {}),
         input_hashes,
         scenario,
         methodology_id,
@@ -236,24 +220,24 @@ def run_full(
     compliance_checks, qa_flags_extra = evaluate_compliance(
         input_bundle=input_bundle,
         result_bundle=result_bundle,
-        legacy_results=legacy,
+        legacy_results=legacy_results,
     )
 
-    results_json = legacy.get("results_json", {}) or {}
-    # Paket A standard output
+    results_json = legacy_results.get("results_json", {}) or {}
+
+    # Standard outputs
     results_json["compliance_checks"] = [c.to_dict() for c in compliance_checks]
-    # mevcut qa_flags + compliance qa_flags merge
     existing_qa = results_json.get("qa_flags", []) or []
-    existing_qa = existing_qa if isinstance(existing_qa, list) else []
+    if not isinstance(existing_qa, list):
+        existing_qa = []
     results_json["qa_flags"] = existing_qa + [q.to_dict() for q in qa_flags_extra]
 
-    # backward compat: compliance obj
+    # Backward compat block
     results_json["compliance"] = {
         "compliance_checks": results_json["compliance_checks"],
         "qa_flags": results_json["qa_flags"],
     }
 
-    # deterministic section güncelle (candidate hash = snapshot hash)
     det = results_json.get("deterministic", {}) or {}
     if not isinstance(det, dict):
         det = {}
@@ -266,7 +250,7 @@ def run_full(
         project_id=int(project_id),
         engine_version=ENGINE_VERSION_PACKET_A,
         result_hash=candidate_hash,
-        config=config or {},
+        config=(config or {}),
         input_hashes=input_hashes,
         results_json=results_json,
         methodology_id=methodology_id,
