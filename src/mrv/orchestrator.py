@@ -6,301 +6,370 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 from sqlalchemy import select
 
-from src.db.models import EmissionFactor, Methodology, Project
+from src.db.models import Methodology, MonitoringPlan, Project
 from src.db.session import db
 from src.engine.cbam import cbam_compute
 from src.engine.emissions import energy_emissions, resolve_factor_set_for_energy_df
-from src.engine.ets import ets_compute
-from src.mrv.compliance import QAFlag, ResultBundle
-from src.mrv.lineage import sha256_json
+from src.engine.ets import ets_net_and_cost, ets_verification_payload
+from src.mrv.bundles import FactorRef, InputBundle, MonitoringPlanRef, PriceRef, QAFlag, ResultBundle
+
 
 ENGINE_VERSION_PACKET_A = "engine-3.0.0-packetA"
 
 
 def _norm(s: Any) -> str:
-    if s is None:
-        return ""
-    return str(s).strip()
+    return str(s or "").strip()
 
 
 def _to_float(x: Any, default: float = 0.0) -> float:
     try:
-        if x is None:
-            return default
         return float(x)
     except Exception:
         return default
 
 
-def _safe_json(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
+def _period_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    period = dict((config or {}).get("period") or {})
+    # best effort year
+    if "year" not in period:
+        try:
+            period["year"] = int((config or {}).get("year"))
+        except Exception:
+            period["year"] = None
+    return period
 
 
-def _get_project(project_id: int) -> Project:
+def _facility_from_project(project: Project) -> Dict[str, Any]:
+    fac = getattr(project, "facility", None)
+    if not fac:
+        return {"id": None, "name": "", "country": "", "sector": ""}
+    return {
+        "id": int(getattr(fac, "id", 0) or 0),
+        "name": str(getattr(fac, "name", "") or ""),
+        "country": str(getattr(fac, "country", "") or ""),
+        "sector": str(getattr(fac, "sector", "") or ""),
+    }
+
+
+def _product_mapping_from_production_df(production_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if production_df is None or len(production_df) == 0:
+        return []
+    df = production_df.copy()
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    cols = set(df.columns.tolist())
+
+    def colpick(*names: str) -> str:
+        for n in names:
+            if n in cols:
+                return n
+        return ""
+
+    cn_c = colpick("cn_code", "cn", "cncode")
+    pn_c = colpick("product_name", "product")
+    pc_c = colpick("product_code", "sku", "code")
+
+    mapping: List[Dict[str, Any]] = []
+    seen = set()
+    for _, r in df.iterrows():
+        cn = str(r.get(cn_c, "") or "").strip() if cn_c else ""
+        pn = str(r.get(pn_c, "") or "").strip() if pn_c else ""
+        pc = str(r.get(pc_c, "") or "").strip() if pc_c else ""
+        key = (cn, pn, pc)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not (cn or pn or pc):
+            continue
+        mapping.append({"cn_code": cn, "product_name": pn, "product_code": pc})
+
+    mapping.sort(key=lambda x: (x.get("cn_code", ""), x.get("product_name", ""), x.get("product_code", "")))
+    return mapping
+
+
+def _latest_monitoring_plan_ref(facility_id: int | None) -> MonitoringPlanRef | None:
+    if not facility_id:
+        return None
     with db() as s:
-        proj = s.execute(select(Project).where(Project.id == project_id)).scalar_one_or_none()
-        if not proj:
-            raise ValueError("Project bulunamadı.")
-        return proj
+        mp = (
+            s.execute(
+                select(MonitoringPlan)
+                .where(MonitoringPlan.facility_id == int(facility_id))
+                .order_by(MonitoringPlan.updated_at.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        if not mp:
+            return None
+        return MonitoringPlanRef(
+            id=int(mp.id),
+            facility_id=int(mp.facility_id),
+            method=str(mp.method or ""),
+            tier_level=str(mp.tier_level or ""),
+            updated_at=(mp.updated_at.isoformat() if getattr(mp, "updated_at", None) else None),
+        )
 
 
-def _load_methodology(methodology_id: Optional[int]) -> Optional[Methodology]:
+def _methodology_ref(methodology_id: int | None) -> Dict[str, Any] | None:
     if not methodology_id:
         return None
     with db() as s:
-        m = s.execute(select(Methodology).where(Methodology.id == methodology_id)).scalar_one_or_none()
-        return m
+        m = s.get(Methodology, int(methodology_id))
+        if not m:
+            return None
+        return {
+            "id": int(m.id),
+            "name": str(m.name or ""),
+            "version": str(m.version or ""),
+            "scope": str(m.scope or ""),
+        }
 
 
-def _load_active_factors() -> List[EmissionFactor]:
-    with db() as s:
-        return (
-            s.execute(select(EmissionFactor).where(EmissionFactor.is_active == True))  # noqa: E712
-            .scalars()
-            .all()
+def _factor_refs_from_meta(factor_meta_rows: List[Dict[str, Any]]) -> List[FactorRef]:
+    refs: List[FactorRef] = []
+    for fr in factor_meta_rows or []:
+        if not isinstance(fr, dict):
+            continue
+        refs.append(
+            FactorRef(
+                id=fr.get("id"),
+                factor_type=str(fr.get("factor_type") or ""),
+                region=str(fr.get("region") or ""),
+                year=fr.get("year"),
+                version=str(fr.get("version") or ""),
+                value=float(fr.get("value")) if fr.get("value") is not None else 0.0,
+                unit=str(fr.get("unit") or ""),
+                source=str(fr.get("source") or ""),
+            )
         )
-
-
-def apply_scenarios(
-    energy_df: pd.DataFrame,
-    production_df: pd.DataFrame,
-    renewable_share: float = 0.0,
-    energy_reduction_pct: float = 0.0,
-    supplier_factor_multiplier: float = 1.0,
-    export_mix_multiplier: float = 1.0,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Senaryo uygulama: mevcut davranışı korur (basit multipliers)
-    """
-    e = energy_df.copy()
-    p = production_df.copy()
-
-    if energy_reduction_pct and "quantity" in e.columns:
-        e["quantity"] = e["quantity"].astype(float) * (1.0 - float(energy_reduction_pct) / 100.0)
-
-    # renewable_share: elektrik emisyon katsayısını düşürme gibi davranışlar
-    # burada veri formatına göre sadece placeholder bir dönüşüm yapıyoruz
-    if renewable_share and "energy_type" in e.columns and "quantity" in e.columns:
-        # elektrik tüketiminin belirli payını "renewable" olarak işaretlemek gibi basit bir işaretleme
-        pass
-
-    # supplier_factor_multiplier: precursor/material embedded factors için kullanılabilir (legacy)
-    if supplier_factor_multiplier:
-        pass
-
-    # export_mix_multiplier: export oranı gibi optimizasyonlar (legacy)
-    if export_mix_multiplier:
-        pass
-
-    return e, p
-
-
-def build_input_bundle(
-    project_id: int,
-    config: dict,
-    energy_df: pd.DataFrame,
-    production_df: pd.DataFrame,
-    materials_df: Optional[pd.DataFrame],
-    methodology_id: Optional[int],
-) -> Dict[str, Any]:
-    """
-    InputBundle: deterministik hash için normalize edilmiş input paketini üretir.
-    """
-    proj = _get_project(project_id)
-    methodology = _load_methodology(methodology_id)
-    factors = _load_active_factors()
-
-    # Factor set resolve: energy df üstünde yakıt/electricity vs için hangi faktörleri kullanacağız
-    factor_set_ref = resolve_factor_set_for_energy_df(energy_df, factors)
-
-    input_bundle = {
-        "project": {
-            "id": proj.id,
-            "name": proj.name,
-            "country": proj.country,
-            "sector": proj.sector,
-        },
-        "methodology": {
-            "id": getattr(methodology, "id", None),
-            "code": getattr(methodology, "code", None),
-            "name": getattr(methodology, "name", None),
-            "reg_reference": getattr(methodology, "reg_reference", None),
-        },
-        "config": config or {},
-        "datasets": {
-            "energy": energy_df.to_dict(orient="records"),
-            "production": production_df.to_dict(orient="records"),
-            "materials": materials_df.to_dict(orient="records") if materials_df is not None else None,
-        },
-        "factor_set_ref": factor_set_ref,
-        "monitoring_plan_ref": None,
-    }
-
-    return input_bundle
-
-
-def compute_result_bundle(
-    config: dict,
-    energy_df: pd.DataFrame,
-    production_df: pd.DataFrame,
-    materials_df: Optional[pd.DataFrame],
-    factors: List[EmissionFactor],
-) -> ResultBundle:
-    """
-    ResultBundle: ETS/CBAM emisyon hesapları + QA/Compliance flagleri
-    """
-    # Direct + Electricity emissions
-    energy_result = energy_emissions(energy_df, factors, config=config)
-
-    # ETS compute
-    ets_result = ets_compute(
-        energy_df=energy_df,
-        production_df=production_df,
-        factors=factors,
-        config=config,
-    )
-
-    # CBAM compute
-    cbam_result = cbam_compute(
-        production_df=production_df,
-        materials_df=materials_df,
-        factors=factors,
-        config=config,
-    )
-
-    flags: List[QAFlag] = []
-
-    # Basit QA: negatif değer kontrolü
-    for col in ["quantity", "value", "amount", "kwh", "mwh", "ton"]:
-        if col in energy_df.columns:
-            try:
-                if (energy_df[col].astype(float) < 0).any():
-                    flags.append(QAFlag(code="NEGATIVE_ENERGY_VALUE", severity="high", message=f"{col} negatif değer içeriyor"))
-            except Exception:
-                pass
-
-    # ResultBundle sözleşmesi
-    bundle = ResultBundle(
-        energy=energy_result,
-        ets=ets_result,
-        cbam=cbam_result,
-        qa_flags=flags,
-    )
-    return bundle
+    refs.sort(key=lambda x: (x.factor_type, x.region, x.version, str(x.id)))
+    return refs
 
 
 def run_orchestrator(
+    *,
     project_id: int,
-    config: dict,
-    scenario: dict | None = None,
-    methodology_id: int | None = None,
-    activity_snapshot_ref: dict | None = None,
-) -> Tuple[Dict[str, Any], ResultBundle, Dict[str, Any]]:
+    config: Dict[str, Any],
+    scenario: Dict[str, Any],
+    methodology_id: int | None,
+    activity_snapshot_ref: Dict[str, Any],
+    energy_df: pd.DataFrame,
+    production_df: pd.DataFrame,
+    materials_df: pd.DataFrame | None = None,
+) -> Tuple[InputBundle, ResultBundle, Dict[str, Any]]:
     """
-    Orchestrator paket A:
-      - Uploadlardan CSV yükler (services.workflow yardımcıları)
-      - InputBundle üretir
-      - Emissions/ETS/CBAM compute
-      - ResultBundle üretir (compliance/qa placeholder ile)
-      - result_hash: ResultBundle canonical json üzerinden
+    Paket A2: Deterministik Calculation Orchestrator
+
+    Aynı activity snapshot + aynı config + aynı factor/methodology versiyonu => aynı sonuç.
+    Çıktı:
+      - InputBundle (obj)
+      - ResultBundle (obj)
+      - legacy_results (UI/raporlar için geriye dönük alanlar)
     """
+
     scenario = scenario or {}
+    config = config or {}
 
-    # Load activity datasets
-    from src.services.workflow import latest_upload  # mevcut fonksiyon, bozmuyoruz
-    ENGINE_VERSION_PACKET_A = "engine-3.0.0"
+    with db() as s:
+        project = s.get(Project, int(project_id))
+        if not project:
+            raise ValueError("Proje bulunamadı.")
 
+    period = _period_from_config(config)
+    facility = _facility_from_project(project)
+    product_mapping = _product_mapping_from_production_df(production_df)
 
-def run_orchestrator(...):
+    # Factor set lock (deterministik)
+    region = str((config or {}).get("region") or facility.get("country") or "TR")
+    electricity_method = str((config or {}).get("electricity_method") or "location")
+    market_override = (config or {}).get("market_grid_factor_override", None)
+    market_override_f = float(market_override) if market_override is not None and str(market_override).strip() != "" else None
 
-    from src.services.workflow import load_csv_from_uri
-    
-    energy_u = latest_upload(project_id, "energy")
-    prod_u = latest_upload(project_id, "production")
-    materials_u = latest_upload(project_id, "materials")
-
-    if not energy_u:
-        raise ValueError("energy.csv yüklenmemiş.")
-    if not prod_u:
-        raise ValueError("production.csv yüklenmemiş.")
-
-    energy_df = load_csv_from_uri(str(energy_u.storage_uri))
-    prod_df = load_csv_from_uri(str(prod_u.storage_uri))
-    materials_df = None
-    if materials_u:
-        try:
-            materials_df = load_csv_from_uri(str(materials_u.storage_uri))
-        except Exception:
-            materials_df = None
-
-    # Senaryo uygulama (mevcut davranış korunur)
-    if scenario:
-        energy_df, prod_df = apply_scenarios(
-            energy_df,
-            prod_df,
-            renewable_share=float(scenario.get("renewable_share", 0.0)),
-            energy_reduction_pct=float(scenario.get("energy_reduction_pct", 0.0)),
-            supplier_factor_multiplier=float(scenario.get("supplier_factor_multiplier", 1.0)),
-            export_mix_multiplier=float(scenario.get("export_mix_multiplier", 1.0)),
-        )
-
-    # Input bundle (factor_set resolve dahil)
-    input_bundle = build_input_bundle(
-        project_id=project_id,
-        config=config,
+    factor_meta_rows, factor_lookup = resolve_factor_set_for_energy_df(
         energy_df=energy_df,
-        production_df=prod_df,
-        materials_df=materials_df,
-        methodology_id=methodology_id,
+        region=region or "TR",
+        electricity_method=electricity_method,
+        market_grid_factor_override=market_override_f,
+    )
+    factor_refs = _factor_refs_from_meta(factor_meta_rows)
+
+    # Monitoring plan ref (deterministik kilit)
+    mp_ref = _latest_monitoring_plan_ref(facility.get("id"))
+
+    # Price ref
+    price = PriceRef(
+        eua_price_eur_per_t=_to_float((config or {}).get("eua_price_eur_per_t", 75.0), 75.0),
+        fx_tl_per_eur=_to_float((config or {}).get("fx_tl_per_eur", 35.0), 35.0),
     )
 
-    # Active factors
-    factors = _load_active_factors()
+    # Config hash
+    from src.mrv.lineage import sha256_json
 
-    # Result bundle compute
-    result_bundle = compute_result_bundle(
+    config_hash = sha256_json(config)
+
+    input_bundle = InputBundle(
+        engine_version=ENGINE_VERSION_PACKET_A,
+        project_id=int(project_id),
+        period=period,
+        facility=facility,
+        product_mapping=product_mapping,
+        activity_snapshot_ref=activity_snapshot_ref or {},
+        monitoring_plan_ref=mp_ref,
+        factor_set_ref=factor_refs,
+        price_ref=price,
         config=config,
-        energy_df=energy_df,
-        production_df=prod_df,
-        materials_df=materials_df,
-        factors=factors,
+        config_hash=config_hash,
+        methodology_ref=_methodology_ref(methodology_id),
+        scenario=scenario,
     )
 
-    # legacy_results: UI/raporlama tarafında eski şemayı bozmadan taşımak için
-    legacy_results = {
-        "engine_version": ENGINE_VERSION_PACKET_A,
-        "input_bundle": {
-            "factor_set_ref": input_bundle.get("factor_set_ref", []),
-            "monitoring_plan_ref": input_bundle.get("monitoring_plan_ref"),
+    input_bundle_hash = input_bundle.input_bundle_hash()
+
+    # Core compute
+    energy_out = energy_emissions(
+        energy_df,
+        region=region or "TR",
+        electricity_method=electricity_method,
+        market_grid_factor_override=market_override_f,
+        factor_set_lock=[fr.to_dict() for fr in factor_refs],
+    )
+
+    # ETS cost + verification payload
+    ets_cfg = (config or {}).get("ets") or {}
+    free_alloc = _to_float(ets_cfg.get("free_alloc_t", 0.0), 0.0)
+    banked = _to_float(ets_cfg.get("banked_t", 0.0), 0.0)
+
+    ets_cost = ets_net_and_cost(
+        scope1_tco2=float(energy_out.get("direct_tco2", 0.0) or 0.0),
+        free_alloc_t=free_alloc,
+        banked_t=banked,
+        allowance_price_eur_per_t=price.eua_price_eur_per_t,
+        fx_tl_per_eur=price.fx_tl_per_eur,
+    )
+
+    mp_for_payload = mp_ref.to_dict() if mp_ref else None
+    ets_verif = ets_verification_payload(
+        fuel_rows=list(energy_out.get("fuel_rows", []) or []),
+        monitoring_plan=mp_for_payload,
+        uncertainty_notes=str((config or {}).get("uncertainty_notes", "") or ""),
+    )
+
+    # CBAM compute
+    cbam_df, cbam_totals = cbam_compute(
+        production_df=production_df,
+        energy_breakdown=energy_out,
+        materials_df=materials_df,
+        eua_price_eur_per_t=price.eua_price_eur_per_t,
+        allocation_basis=str(((config or {}).get("cbam") or {}).get("allocation_basis", "quantity") or "quantity"),
+    )
+    cbam_table = cbam_df.to_dict(orient="records") if cbam_df is not None and len(cbam_df) > 0 else []
+
+    totals = {
+        "scope1_tco2": float(energy_out.get("direct_tco2", 0.0) or 0.0),
+        "scope2_tco2": float(energy_out.get("indirect_tco2", 0.0) or 0.0),
+        "total_tco2": float(energy_out.get("total_tco2", 0.0) or 0.0),
+    }
+
+    breakdown = {
+        "energy": {
+            "direct_tco2": totals["scope1_tco2"],
+            "indirect_tco2": totals["scope2_tco2"],
+            "fuel_rows": list(energy_out.get("fuel_rows", []) or []),
+            "electricity_rows": list(energy_out.get("electricity_rows", []) or []),
         },
-        "activity_snapshot_ref": activity_snapshot_ref or {},
-        "results_json": {
-            "energy": result_bundle.energy,
-            "ets": result_bundle.ets,
-            "cbam": result_bundle.cbam,
-            "qa_flags": [f.__dict__ for f in result_bundle.qa_flags],
+        "cbam": {
+            "table": cbam_table,
+            "totals": cbam_totals or {},
         },
     }
+
+    unit_conversions = {
+        "notes": [
+            "MVP: energy hesapları yakıt birimlerini fuel_quantity üzerinden NCV ile GJ’e çevirerek tCO2 hesaplar.",
+            "Elektrik için kWh bazında grid factor (kgCO2/kWh) kullanılır.",
+        ]
+    }
+
+    source_references = {
+        "factor_set_ref": [fr.to_dict() for fr in factor_refs],
+        "monitoring_plan_ref": (mp_ref.to_dict() if mp_ref else None),
+        "methodology_ref": _methodology_ref(methodology_id),
+        "price_ref": price.to_dict(),
+    }
+
+    qa_flags: List[QAFlag] = []
+
+    # Basic QA signals (MVP)
+    if (energy_df is None) or len(energy_df) == 0:
+        qa_flags.append(QAFlag(flag_id="QA_EMPTY_ENERGY", severity="fail", message_tr="Energy dataset boş.", context={}))
+    if (production_df is None) or len(production_df) == 0:
+        qa_flags.append(QAFlag(flag_id="QA_EMPTY_PRODUCTION", severity="fail", message_tr="Production dataset boş.", context={}))
+
+    # Cost outputs (CBAM/ETS)
+    cost_outputs = {
+        "ets": ets_cost,
+        "cbam": {
+            "eua_price_eur_per_t": price.eua_price_eur_per_t,
+            "estimated_cost_eur": float((cbam_totals or {}).get("estimated_cost_eur", 0.0) or 0.0),
+            "estimated_cost_tl": float((cbam_totals or {}).get("estimated_cost_tl", 0.0) or 0.0),
+        },
+    }
+
+    # Result hash deterministik
+    from src.mrv.lineage import sha256_json as _sha256_json
+
+    tmp_rb = {
+        "engine_version": ENGINE_VERSION_PACKET_A,
+        "input_bundle_hash": input_bundle_hash,
+        "totals": totals,
+        "breakdown": breakdown,
+        "unit_conversions": unit_conversions,
+        "source_references": source_references,
+        "qa_flags": [q.to_dict() for q in qa_flags],
+        "compliance_checks": [],
+        "cost_outputs": cost_outputs,
+    }
+    result_hash = _sha256_json({"result": tmp_rb})
+
+    result_bundle = ResultBundle(
+        engine_version=ENGINE_VERSION_PACKET_A,
+        input_bundle_hash=input_bundle_hash,
+        result_hash=result_hash,
+        totals=totals,
+        breakdown=breakdown,
+        unit_conversions=unit_conversions,
+        source_references=source_references,
+        qa_flags=qa_flags,
+        compliance_checks=[],
+        cost_outputs=cost_outputs,
+    )
+
+    legacy_results: Dict[str, Any] = {
+        "kpis": {
+            "scope1_tco2": totals["scope1_tco2"],
+            "scope2_tco2": totals["scope2_tco2"],
+            "total_tco2": totals["total_tco2"],
+        },
+        "cbam_table": cbam_table,
+        "cbam": cbam_totals or {},
+        "ets": {
+            "net_and_cost": ets_cost,
+            "verification": ets_verif,
+        },
+        # Paket A sözleşmesi görünür alanlar
+        "input_bundle": input_bundle.to_canonical_dict(),
+        "deterministic": {
+            "engine_version": ENGINE_VERSION_PACKET_A,
+            "input_bundle_hash": input_bundle_hash,
+            "result_hash": result_hash,
+            "config_hash": config_hash,
+        },
+        "qa_flags": [q.to_dict() for q in qa_flags],
+        "compliance_checks": [],
+    }
+
+    # UI'nin beklediği results_json şekli
+    legacy_results["results_json"] = dict(legacy_results)
 
     return input_bundle, result_bundle, legacy_results
-
-
-def compute_result_hash(
-    engine_version: str,
-    config: dict,
-    input_hashes: dict,
-    scenario: dict,
-    methodology_id: Optional[int],
-    factor_set_ref: list,
-    monitoring_plan_ref: Optional[str],
-) -> str:
-    payload = {
-        "engine_version": engine_version,
-        "config": config or {},
-        "input_hashes": input_hashes or {},
-        "scenario": scenario or {},
-        "methodology_id": methodology_id,
-        "factor_set_ref": factor_set_ref or [],
-        "monitoring_plan_ref": monitoring_plan_ref,
-    }
-    return sha256_json(payload)
