@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 from sqlalchemy import select
@@ -12,13 +12,10 @@ from src.engine.cbam import cbam_compute
 from src.engine.emissions import energy_emissions, resolve_factor_set_for_energy_df
 from src.engine.ets import ets_net_and_cost, ets_verification_payload
 from src.mrv.bundles import FactorRef, InputBundle, MonitoringPlanRef, PriceRef, QAFlag, ResultBundle
+from src.mrv.lineage import sha256_json
 
 
 ENGINE_VERSION_PACKET_A = "engine-3.0.0-packetA"
-
-
-def _norm(s: Any) -> str:
-    return str(s or "").strip()
 
 
 def _to_float(x: Any, default: float = 0.0) -> float:
@@ -30,7 +27,6 @@ def _to_float(x: Any, default: float = 0.0) -> float:
 
 def _period_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
     period = dict((config or {}).get("period") or {})
-    # best effort year
     if "year" not in period:
         try:
             period["year"] = int((config or {}).get("year"))
@@ -158,14 +154,9 @@ def run_orchestrator(
     production_df: pd.DataFrame,
     materials_df: pd.DataFrame | None = None,
 ) -> Tuple[InputBundle, ResultBundle, Dict[str, Any]]:
-    """
-    Paket A2: Deterministik Calculation Orchestrator
+    """Paket A2: Deterministik Orchestrator.
 
-    Aynı activity snapshot + aynı config + aynı factor/methodology versiyonu => aynı sonuç.
-    Çıktı:
-      - InputBundle (obj)
-      - ResultBundle (obj)
-      - legacy_results (UI/raporlar için geriye dönük alanlar)
+    Aynı input snapshot + aynı config + aynı factor/methodology versiyonu => aynı sonuç.
     """
 
     scenario = scenario or {}
@@ -186,7 +177,7 @@ def run_orchestrator(
     market_override = (config or {}).get("market_grid_factor_override", None)
     market_override_f = float(market_override) if market_override is not None and str(market_override).strip() != "" else None
 
-    factor_meta_rows, factor_lookup = resolve_factor_set_for_energy_df(
+    factor_meta_rows, _factor_lookup = resolve_factor_set_for_energy_df(
         energy_df=energy_df,
         region=region or "TR",
         electricity_method=electricity_method,
@@ -194,7 +185,7 @@ def run_orchestrator(
     )
     factor_refs = _factor_refs_from_meta(factor_meta_rows)
 
-    # Monitoring plan ref (deterministik kilit)
+    # Monitoring plan ref
     mp_ref = _latest_monitoring_plan_ref(facility.get("id"))
 
     # Price ref
@@ -202,9 +193,6 @@ def run_orchestrator(
         eua_price_eur_per_t=_to_float((config or {}).get("eua_price_eur_per_t", 75.0), 75.0),
         fx_tl_per_eur=_to_float((config or {}).get("fx_tl_per_eur", 35.0), 35.0),
     )
-
-    # Config hash
-    from src.mrv.lineage import sha256_json
 
     config_hash = sha256_json(config)
 
@@ -286,7 +274,7 @@ def run_orchestrator(
 
     unit_conversions = {
         "notes": [
-            "MVP: energy hesapları yakıt birimlerini fuel_quantity üzerinden NCV ile GJ’e çevirerek tCO2 hesaplar.",
+            "MVP: enerji hesapları yakıt birimlerini NCV ile GJ'e çevirerek tCO2 hesaplar.",
             "Elektrik için kWh bazında grid factor (kgCO2/kWh) kullanılır.",
         ]
     }
@@ -299,14 +287,11 @@ def run_orchestrator(
     }
 
     qa_flags: List[QAFlag] = []
-
-    # Basic QA signals (MVP)
     if (energy_df is None) or len(energy_df) == 0:
         qa_flags.append(QAFlag(flag_id="QA_EMPTY_ENERGY", severity="fail", message_tr="Energy dataset boş.", context={}))
     if (production_df is None) or len(production_df) == 0:
         qa_flags.append(QAFlag(flag_id="QA_EMPTY_PRODUCTION", severity="fail", message_tr="Production dataset boş.", context={}))
 
-    # Cost outputs (CBAM/ETS)
     cost_outputs = {
         "ets": ets_cost,
         "cbam": {
@@ -315,9 +300,6 @@ def run_orchestrator(
             "estimated_cost_tl": float((cbam_totals or {}).get("estimated_cost_tl", 0.0) or 0.0),
         },
     }
-
-    # Result hash deterministik
-    from src.mrv.lineage import sha256_json as _sha256_json
 
     tmp_rb = {
         "engine_version": ENGINE_VERSION_PACKET_A,
@@ -330,7 +312,7 @@ def run_orchestrator(
         "compliance_checks": [],
         "cost_outputs": cost_outputs,
     }
-    result_hash = _sha256_json({"result": tmp_rb})
+    result_hash = sha256_json({"result": tmp_rb})
 
     result_bundle = ResultBundle(
         engine_version=ENGINE_VERSION_PACKET_A,
@@ -357,7 +339,6 @@ def run_orchestrator(
             "net_and_cost": ets_cost,
             "verification": ets_verif,
         },
-        # Paket A sözleşmesi görünür alanlar
         "input_bundle": input_bundle.to_canonical_dict(),
         "deterministic": {
             "engine_version": ENGINE_VERSION_PACKET_A,
@@ -369,7 +350,6 @@ def run_orchestrator(
         "compliance_checks": [],
     }
 
-    # UI'nin beklediği results_json şekli
     legacy_results["results_json"] = dict(legacy_results)
 
     return input_bundle, result_bundle, legacy_results
