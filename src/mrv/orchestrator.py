@@ -189,8 +189,12 @@ def run_orchestrator(
     mp_ref = _latest_monitoring_plan_ref(facility.get("id"))
 
     # Price ref
+    # UI geriye uyumluluk: Consultant panel top-level "eua_price_eur" kullanabilir.
+    eua_price_in = (config or {}).get("eua_price_eur_per_t", None)
+    if eua_price_in is None:
+        eua_price_in = (config or {}).get("eua_price_eur", 75.0)
     price = PriceRef(
-        eua_price_eur_per_t=_to_float((config or {}).get("eua_price_eur_per_t", 75.0), 75.0),
+        eua_price_eur_per_t=_to_float(eua_price_in, 75.0),
         fx_tl_per_eur=_to_float((config or {}).get("fx_tl_per_eur", 35.0), 35.0),
     )
 
@@ -225,8 +229,16 @@ def run_orchestrator(
 
     # ETS cost + verification payload
     ets_cfg = (config or {}).get("ets") or {}
-    free_alloc = _to_float(ets_cfg.get("free_alloc_t", 0.0), 0.0)
-    banked = _to_float(ets_cfg.get("banked_t", 0.0), 0.0)
+    # UI geriye uyumluluk: free_alloc_t / banked_t top-level gelebilir.
+    free_alloc_in = ets_cfg.get("free_alloc_t", None)
+    if free_alloc_in is None:
+        free_alloc_in = (config or {}).get("free_alloc_t", 0.0)
+    banked_in = ets_cfg.get("banked_t", None)
+    if banked_in is None:
+        banked_in = (config or {}).get("banked_t", 0.0)
+
+    free_alloc = _to_float(free_alloc_in, 0.0)
+    banked = _to_float(banked_in, 0.0)
 
     ets_cost = ets_net_and_cost(
         scope1_tco2=float(energy_out.get("direct_tco2", 0.0) or 0.0),
@@ -244,12 +256,17 @@ def run_orchestrator(
     )
 
     # CBAM compute
+    cbam_cfg = (config or {}).get("cbam") or {}
+    allocation_basis_in = cbam_cfg.get("allocation_basis", None)
+    if allocation_basis_in is None:
+        allocation_basis_in = (config or {}).get("cbam_allocation_basis", "quantity")
+
     cbam_df, cbam_totals = cbam_compute(
         production_df=production_df,
         energy_breakdown=energy_out,
         materials_df=materials_df,
         eua_price_eur_per_t=price.eua_price_eur_per_t,
-        allocation_basis=str(((config or {}).get("cbam") or {}).get("allocation_basis", "quantity") or "quantity"),
+        allocation_basis=str(allocation_basis_in or "quantity"),
     )
     cbam_table = cbam_df.to_dict(orient="records") if cbam_df is not None and len(cbam_df) > 0 else []
 
@@ -292,12 +309,14 @@ def run_orchestrator(
     if (production_df is None) or len(production_df) == 0:
         qa_flags.append(QAFlag(flag_id="QA_EMPTY_PRODUCTION", severity="fail", message_tr="Production dataset boş.", context={}))
 
+    # Not: cbam_compute totals anahtarları: cbam_cost_eur, embedded_tco2 vb.
     cost_outputs = {
         "ets": ets_cost,
         "cbam": {
             "eua_price_eur_per_t": price.eua_price_eur_per_t,
-            "estimated_cost_eur": float((cbam_totals or {}).get("estimated_cost_eur", 0.0) or 0.0),
-            "estimated_cost_tl": float((cbam_totals or {}).get("estimated_cost_tl", 0.0) or 0.0),
+            "cbam_cost_eur": float((cbam_totals or {}).get("cbam_cost_eur", 0.0) or 0.0),
+            "cbam_cost_tl": float((cbam_totals or {}).get("cbam_cost_eur", 0.0) or 0.0) * float(price.fx_tl_per_eur or 0.0),
+            "embedded_tco2": float((cbam_totals or {}).get("embedded_tco2", 0.0) or 0.0),
         },
     }
 
@@ -327,18 +346,32 @@ def run_orchestrator(
         cost_outputs=cost_outputs,
     )
 
+    # UI sözleşmesi: kpis alanında direct/indirect/total + cbam/ets maliyetleri bekleniyor.
+    legacy_kpis: Dict[str, Any] = {
+        # UI-friendly
+        "direct_tco2": totals["scope1_tco2"],
+        "indirect_tco2": totals["scope2_tco2"],
+        "total_tco2": totals["total_tco2"],
+        "ets_net_tco2": float(ets_cost.get("net_tco2", 0.0) or 0.0),
+        "ets_cost_eur": float(ets_cost.get("cost_eur", 0.0) or 0.0),
+        "ets_cost_tl": float(ets_cost.get("cost_tl", 0.0) or 0.0),
+        "cbam_embedded_tco2": float((cbam_totals or {}).get("embedded_tco2", 0.0) or 0.0),
+        "cbam_cost_eur": float((cbam_totals or {}).get("cbam_cost_eur", 0.0) or 0.0),
+        # legacy
+        "scope1_tco2": totals["scope1_tco2"],
+        "scope2_tco2": totals["scope2_tco2"],
+    }
+
     legacy_results: Dict[str, Any] = {
-        "kpis": {
-            "scope1_tco2": totals["scope1_tco2"],
-            "scope2_tco2": totals["scope2_tco2"],
-            "total_tco2": totals["total_tco2"],
-        },
+        "kpis": legacy_kpis,
         "cbam_table": cbam_table,
-        "cbam": cbam_totals or {},
+        "cbam": {"totals": cbam_totals or {}},
         "ets": {
             "net_and_cost": ets_cost,
             "verification": ets_verif,
         },
+        "scenario": (scenario or {}),
+        "methodology": _methodology_ref(methodology_id),
         "input_bundle": input_bundle.to_canonical_dict(),
         "deterministic": {
             "engine_version": ENGINE_VERSION_PACKET_A,
@@ -348,6 +381,7 @@ def run_orchestrator(
         },
         "qa_flags": [q.to_dict() for q in qa_flags],
         "compliance_checks": [],
+        "cost_outputs": cost_outputs,
     }
 
     legacy_results["results_json"] = dict(legacy_results)
