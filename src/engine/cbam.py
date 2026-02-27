@@ -62,8 +62,8 @@ _REGISTRY_CACHE: dict = {
 
 
 def _load_registry_rows() -> List[dict]:
-    """
-    DB’den aktif mappingleri çeker.
+    """DB’den aktif mappingleri çeker.
+
     Import başarısızsa sessizce fallback’e döner.
     """
     global _REGISTRY_CACHE
@@ -205,8 +205,7 @@ def is_cbam_covered_row(row: dict) -> bool:
 
 
 def precursor_emissions_from_materials(materials_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    materials.csv -> sku bazında precursor tCO2 (embedded)
+    """materials.csv -> sku bazında precursor tCO2 (embedded).
 
     Beklenen kolonlar (MVP):
       - sku
@@ -243,14 +242,20 @@ def cbam_compute(
     materials_df: pd.DataFrame | None,
     eua_price_eur_per_t: float,
     allocation_basis: str = "quantity",
+    allocation_by_sku: dict | None = None,
+    allocation_meta: dict | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    """
-    CBAM hesap (MVP):
-      - Direct emissions: energy_breakdown.direct_tco2 (fuel bazlı - workflow üretir)
-      - Indirect emissions: energy_breakdown.indirect_tco2 (electricity)
-      - Precursor: materials.csv’den sku bazlı
-      - SKU → CN → Goods mapping (DB registry öncelikli)
-      - Ürün bazlı embedded emissions + export allocation
+    """CBAM hesap (FAZ 1 genişletilmiş).
+
+    - Direct emissions: enerji_breakdown.direct_tco2
+    - Indirect emissions: enerji_breakdown.indirect_tco2
+    - Precursor: materials.csv’den sku bazlı
+    - SKU → CN → Goods mapping (DB registry öncelikli)
+    - Ürün bazlı embedded emissions + export allocation
+
+    Allocation:
+      - allocation_by_sku verilirse direct/indirect dağılımı oradan alınır (allocation engine).
+      - verilmezse legacy allocation_basis ile quantity/export share üzerinden dağıtılır.
     """
     if production_df is None or len(production_df) == 0:
         empty = pd.DataFrame(
@@ -268,6 +273,8 @@ def cbam_compute(
                 "export_share",
                 "cbam_cost_eur",
                 "mapping_rule",
+                "allocation_method",
+                "allocation_hash",
             ]
         )
         return empty, {
@@ -277,6 +284,8 @@ def cbam_compute(
             "indirect_tco2": 0.0,
             "precursor_tco2": 0.0,
             "allocation_basis": _norm(allocation_basis) or "quantity",
+            "allocation_method": (allocation_meta or {}).get("allocation_method") if isinstance(allocation_meta, dict) else None,
+            "allocation_hash": (allocation_meta or {}).get("allocation_hash") if isinstance(allocation_meta, dict) else None,
             "goods_summary": [],
         }
 
@@ -296,6 +305,7 @@ def cbam_compute(
 
     df["quantity"] = df["quantity"].apply(_to_float)
     df["export_to_eu_quantity"] = df["export_to_eu_quantity"].apply(_to_float)
+    df["sku"] = df["sku"].astype(str).fillna("").apply(lambda x: str(x).strip())
 
     # Mapping + goods
     mapping_rows = []
@@ -311,28 +321,61 @@ def cbam_compute(
     # Coverage
     df["cbam_covered_calc"] = df.apply(lambda r: bool(is_cbam_covered_row(r.to_dict())), axis=1)
 
-    # Allocation weights
-    basis = _norm(allocation_basis)
-    if basis == "export":
-        alloc_base = df["export_to_eu_quantity"].clip(lower=0.0)
-        if float(alloc_base.sum()) <= 0.0:
-            alloc_base = df["quantity"].clip(lower=0.0)
-            basis = "quantity"
-    else:
-        alloc_base = df["quantity"].clip(lower=0.0)
-        basis = "quantity"
-
-    alloc_sum = float(alloc_base.sum())
-    if alloc_sum <= 0.0:
-        alloc_weights = pd.Series([0.0] * len(df))
-    else:
-        alloc_weights = alloc_base / alloc_sum
-
     direct_t = float(energy_breakdown.get("direct_tco2", 0.0) or 0.0)
     indirect_t = float(energy_breakdown.get("indirect_tco2", 0.0) or 0.0)
 
-    df["direct_alloc_tco2"] = alloc_weights * direct_t
-    df["indirect_alloc_tco2"] = alloc_weights * indirect_t
+    alloc_method = None
+    alloc_hash = None
+    if isinstance(allocation_meta, dict):
+        alloc_method = allocation_meta.get("allocation_method")
+        alloc_hash = allocation_meta.get("allocation_hash")
+
+    # Allocation
+    if allocation_by_sku and isinstance(allocation_by_sku, dict):
+        # SKU bazında map: {sku:{direct_alloc_tco2, indirect_alloc_tco2}}
+        df["direct_alloc_tco2"] = 0.0
+        df["indirect_alloc_tco2"] = 0.0
+        for i, r in df.iterrows():
+            sku = str(r.get("sku", "") or "").strip()
+            m = allocation_by_sku.get(sku, {}) if sku else {}
+            df.at[i, "direct_alloc_tco2"] = float((m or {}).get("direct_alloc_tco2", 0.0) or 0.0)
+            df.at[i, "indirect_alloc_tco2"] = float((m or {}).get("indirect_alloc_tco2", 0.0) or 0.0)
+
+        # Eğer aynı sku birden fazla satırsa, aynı allocation tekrar yazılmış olur.
+        # Bu durumda embedded satır bazında şişebilir. Çözüm: sku bazında aggregate edip tekrar dağıt.
+        # Basit deterministik yaklaşım: sku bazında allocation'ı satır içindeki quantity payına göre böl.
+        sku_counts = df.groupby("sku")["sku"].transform("count")
+        if (sku_counts > 1).any():
+            # sku bazında quantity payı ile dağıt
+            q = df["quantity"].clip(lower=0.0)
+            qsum = df.groupby("sku")["quantity"].transform("sum").replace(0.0, np.nan)
+            share = (q / qsum).fillna(0.0)
+
+            # önce sku bazında unique allocation değerini al
+            uniq_direct = df.groupby("sku")["direct_alloc_tco2"].transform("max")
+            uniq_indirect = df.groupby("sku")["indirect_alloc_tco2"].transform("max")
+            df["direct_alloc_tco2"] = uniq_direct * share
+            df["indirect_alloc_tco2"] = uniq_indirect * share
+    else:
+        # Legacy allocation weights
+        basis = _norm(allocation_basis)
+        if basis == "export":
+            alloc_base = df["export_to_eu_quantity"].clip(lower=0.0)
+            if float(alloc_base.sum()) <= 0.0:
+                alloc_base = df["quantity"].clip(lower=0.0)
+                basis = "quantity"
+        else:
+            alloc_base = df["quantity"].clip(lower=0.0)
+            basis = "quantity"
+
+        alloc_sum = float(alloc_base.sum())
+        if alloc_sum <= 0.0:
+            alloc_weights = pd.Series([0.0] * len(df))
+        else:
+            alloc_weights = alloc_base / alloc_sum
+
+        df["direct_alloc_tco2"] = alloc_weights * direct_t
+        df["indirect_alloc_tco2"] = alloc_weights * indirect_t
 
     # Precursor
     prec = precursor_emissions_from_materials(materials_df) if materials_df is not None else pd.DataFrame(columns=["sku", "precursor_tco2"])
@@ -359,8 +402,13 @@ def cbam_compute(
     df["covered_and_export"] = (df["cbam_covered_calc"] == True) & (df["eu_export_qty"] > 0.0)
     df["cbam_cost_eur"] = 0.0
     df.loc[df["covered_and_export"], "cbam_cost_eur"] = (
-        df.loc[df["covered_and_export"], "embedded_tco2"] * float(_to_float(eua_price_eur_per_t)) * df.loc[df["covered_and_export"], "export_share"]
+        df.loc[df["covered_and_export"], "embedded_tco2"]
+        * float(_to_float(eua_price_eur_per_t))
+        * df.loc[df["covered_and_export"], "export_share"]
     )
+
+    df["allocation_method"] = alloc_method or ""
+    df["allocation_hash"] = alloc_hash or ""
 
     table = df[
         [
@@ -377,6 +425,8 @@ def cbam_compute(
             "export_share",
             "cbam_cost_eur",
             "mapping_rule",
+            "allocation_method",
+            "allocation_hash",
         ]
     ].copy()
 
@@ -399,11 +449,14 @@ def cbam_compute(
         "direct_tco2": float(table["direct_alloc_tco2"].sum()),
         "indirect_tco2": float(table["indirect_alloc_tco2"].sum()),
         "precursor_tco2": float(table["precursor_tco2"].sum()),
-        "allocation_basis": basis,
+        "allocation_basis": _norm(allocation_basis) or "quantity",
+        "allocation_method": alloc_method,
+        "allocation_hash": alloc_hash,
         "goods_summary": goods_summary,
         "notes": [
             "CN→CBAM goods eşlemesi: Önce DB registry, yoksa fallback prefix kuralları kullanılır.",
             "CBAM maliyet sinyali (MVP): embedded_tCO2 × EUA(€/t) × export_share (EU export / total production).",
+            "FAZ 1: allocation engine aktifse direct/indirect dağılımı sku bazında kilitlenmiş allocation_hash ile takip edilir.",
         ],
     }
 
