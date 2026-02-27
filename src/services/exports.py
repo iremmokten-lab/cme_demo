@@ -168,28 +168,46 @@ def _ensure_pdf_for_snapshot(snapshot: CalculationSnapshot) -> tuple[bytes, str]
         results = json.loads(snapshot.results_json or "{}")
     except Exception:
         results = {}
+    if not isinstance(results, dict):
+        results = {}
 
-    pdf = build_pdf(snapshot_id=snapshot.id, results=results)
-    if not pdf:
-        return b"", ""
-
-    h = sha256(pdf).hexdigest()
-
-    # raporu DB'ye kaydet (storage: yerel tmp dosya)
+    # reporting.build_pdf sözleşmesi: (snapshot_id, report_title, report_data) -> (uri, sha)
+    # Evidence pack içinde rapor "read-only" amaçlıdır; UI'deki rapor formatıyla uyumlu payload üret.
     try:
-        reports_dir = Path("exports")
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        out_path = reports_dir / f"report_snapshot_{snapshot.id}.pdf"
-        out_path.write_bytes(pdf)
-
-        with db() as s:
-            rep2 = Report(snapshot_id=snapshot.id, report_type="pdf", storage_uri=str(out_path), sha256=h)
-            s.add(rep2)
-            s.commit()
+        cfg = json.loads(snapshot.config_json or "{}")
     except Exception:
-        pass
+        cfg = {}
 
-    return pdf, h
+    report_title = f"Rapor — Snapshot {snapshot.id}"
+    report_payload = {
+        "kpis": (results.get("kpis") or {}) if isinstance(results.get("kpis"), dict) else {},
+        "config": cfg if isinstance(cfg, dict) else {},
+        "cbam": results.get("cbam") or {},
+        "cbam_table": results.get("cbam_table") or [],
+        "scenario": results.get("scenario") or {},
+        "methodology": results.get("methodology") or None,
+        "data_quality": results.get("data_quality") or {},
+        "data_sources": [
+            "energy.csv (yüklenen dosya)",
+            "production.csv (yüklenen dosya)",
+            "materials.csv (opsiyonel, precursor)",
+            "EmissionFactor Library (DB)",
+            "Monitoring Plan (DB, facility bazlı)",
+        ],
+        "formulas": [
+            "Direct: fuel_quantity × NCV × EF × OF",
+            "Indirect: electricity_kwh × grid_factor (location/market)",
+            "Precursor: materials.material_quantity × materials.emission_factor",
+        ],
+    }
+
+    uri, sha = build_pdf(snapshot.id, report_title, report_payload)
+    try:
+        b = _safe_read_bytes(str(uri))
+    except Exception:
+        b = b""
+
+    return b or b"", sha or ""
 
 
 def _hmac_signature(payload_bytes: bytes) -> str | None:
@@ -240,81 +258,78 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
             raise ValueError("Snapshot bulunamadı.")
 
     inputs = _snapshot_input_uris(snapshot)
-    energy_bytes = _safe_read_bytes(inputs.get("energy", {}).get("uri", ""))
-    prod_bytes = _safe_read_bytes(inputs.get("production", {}).get("uri", ""))
-    mat_bytes = _safe_read_bytes(inputs.get("materials", {}).get("uri", ""))
 
-    # Factor library
+    energy_bytes = _safe_read_bytes(str((inputs.get("energy") or {}).get("uri") or ""))
+    prod_bytes = _safe_read_bytes(str((inputs.get("production") or {}).get("uri") or ""))
+    mat_bytes = _safe_read_bytes(str((inputs.get("materials") or {}).get("uri") or ""))
+
+    # Factor library: DB'den dump
+    factors_json = {"emission_factors": []}
+    factor_versions = []
     with db() as s:
-        factors = s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.year.desc())).scalars().all()
-
-    factor_rows = []
-    factor_versions = {}
-    for f in factors:
-        factor_rows.append(
-            {
-                "factor_type": f.factor_type,
-                "value": f.value,
-                "unit": f.unit,
-                "source": f.source,
-                "year": f.year,
-                "version": f.version,
-                "region": f.region,
-            }
-        )
-        key = f"{f.factor_type}:{f.region}"
-        if key not in factor_versions:
-            factor_versions[key] = {"version": f.version, "year": f.year}
-
-    factors_json = {"emission_factors": factor_rows}
+        facs = s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.region, EmissionFactor.year)).scalars().all()
+        for f in facs:
+            factors_json["emission_factors"].append(
+                {
+                    "id": f.id,
+                    "factor_type": f.factor_type,
+                    "region": f.region,
+                    "year": f.year,
+                    "version": f.version,
+                    "value": f.value,
+                    "unit": f.unit,
+                    "source": f.source,
+                    "created_at": (f.created_at.isoformat() if getattr(f, "created_at", None) else None),
+                }
+            )
+            factor_versions.append({"factor_type": f.factor_type, "region": f.region, "version": f.version, "year": f.year})
+    factor_versions = sorted(factor_versions, key=lambda x: (x.get("factor_type", ""), x.get("region", ""), str(x.get("year", "")), x.get("version", "")))
 
     # Methodology
+    meth_obj = {}
     methodology_version = None
-    meth_obj: dict = {}
-    if getattr(snapshot, "methodology_id", None):
+    try:
         with db() as s:
-            m = s.get(Methodology, int(snapshot.methodology_id))
-            if m:
-                methodology_version = m.version
-                meth_obj = {
-                    "id": m.id,
-                    "name": m.name,
-                    "description": m.description,
-                    "scope": m.scope,
-                    "version": m.version,
-                    "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
-                }
+            if snapshot.methodology_id:
+                m = s.get(Methodology, int(snapshot.methodology_id))
+                if m:
+                    meth_obj = {
+                        "id": m.id,
+                        "name": m.name,
+                        "description": m.description,
+                        "scope": m.scope,
+                        "version": m.version,
+                        "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
+                    }
+                    methodology_version = m.version
+    except Exception:
+        meth_obj = {}
+        methodology_version = None
 
-    # Snapshot json
-    try:
-        cfg = json.loads(snapshot.config_json or "{}")
-    except Exception:
-        cfg = {}
-    try:
-        ih = json.loads(snapshot.input_hashes_json or "{}")
-    except Exception:
-        ih = {}
+    # Snapshot payload
     try:
         res = json.loads(snapshot.results_json or "{}")
     except Exception:
         res = {}
+    if not isinstance(res, dict):
+        res = {}
 
     snapshot_payload = {
-        "snapshot_id": snapshot.id,
-        "created_at": (snapshot.created_at.isoformat() if getattr(snapshot, "created_at", None) else None),
+        "id": snapshot.id,
+        "project_id": snapshot.project_id,
         "engine_version": snapshot.engine_version,
-        "methodology_id": getattr(snapshot, "methodology_id", None),
-        "previous_snapshot_hash": getattr(snapshot, "previous_snapshot_hash", None),
+        "created_at": (snapshot.created_at.isoformat() if getattr(snapshot, "created_at", None) else None),
         "result_hash": snapshot.result_hash,
-        "config": cfg,
-        "input_hashes": ih,
+        "previous_snapshot_hash": getattr(snapshot, "previous_snapshot_hash", None),
+        "shared_with_client": bool(getattr(snapshot, "shared_with_client", False)),
+        "locked": bool(getattr(snapshot, "locked", False)),
+        "locked_at": (snapshot.locked_at.isoformat() if getattr(snapshot, "locked_at", None) else None),
         "results": res,
     }
 
-    # Compliance checks (Paket B3): snapshot sonuçlarından çıkar
     compliance_checks = []
     try:
-        compliance_checks = (res or {}).get("compliance_checks", []) or []
+        compliance_checks = res.get("compliance_checks", []) or []
     except Exception:
         compliance_checks = []
     if not isinstance(compliance_checks, list):
