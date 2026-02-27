@@ -32,6 +32,37 @@ class Company(Base):
     users = relationship("User", back_populates="company", cascade="all, delete-orphan")
 
 
+class User(Base):
+    """Uygulama kullanıcıları.
+
+    Rol örnekleri:
+      - consultantadmin / consultant
+      - client
+      - verifier
+
+    Not: RLS (row-level security) bu demo repo'da uygulama katmanında uygulanır.
+    """
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+
+    email = Column(String(320), unique=True, nullable=False, index=True)
+    password_hash = Column(String(200), nullable=False)
+
+    role = Column(String(80), nullable=False, default="client", index=True)
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+
+    # Login güvenliği
+    failed_login_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime(timezone=True), nullable=True)
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+    company = relationship("Company", back_populates="users")
+
+
 class Facility(Base):
     __tablename__ = "facilities"
 
@@ -194,12 +225,7 @@ class CalculationSnapshot(Base):
 
 
 class VerificationCase(Base):
-    """Verification Workflow (MVP) — 2018/2067 readiness.
-
-    Case facility + period üzerinde açılır.
-    Snapshot ile birebir bağ zorunlu değil; evidence pack içinde snapshot’ın
-    project + period’ına göre dahil edilebilir.
-    """
+    """Verification Workflow (MVP) — 2018/2067 readiness."""
 
     __tablename__ = "verificationcases"
 
@@ -260,33 +286,19 @@ class Report(Base):
 
 
 class AuditEvent(Base):
+    """Audit/Event log (MVP)."""
+
     __tablename__ = "auditevents"
 
     id = Column(Integer, primary_key=True)
+
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
 
-    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-
     event_type = Column(String(120), nullable=False, index=True)
-    entity_type = Column(String(120), default="", index=True)  # snapshot/report/evidence/upload
-    entity_id = Column(Integer, nullable=True, index=True)
-
     details_json = Column(Text, default="{}")
 
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True)
-    email = Column(String(300), unique=True, nullable=False, index=True)
-    password_hash = Column(String(200), nullable=False)
-    role = Column(String(50), default="clientviewer")
-
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=True, index=True)
-    company = relationship("Company", back_populates="users")
 
-    # Paket C: login güvenliği alanları
-    last_login_at = Column(DateTime(timezone=True), nullable=True)
-    failed_login_attempts = Column(Integer, default=0)
-    locked_until = Column(DateTime(timezone=True), nullable=True)
+    entity_type = Column(String(120), default="", index=True)
+    entity_id = Column(Integer, nullable=True, index=True)
