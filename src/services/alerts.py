@@ -8,7 +8,7 @@ from sqlalchemy import desc, select
 
 from src.db.models import Alert, CalculationSnapshot, Project
 from src.db.session import db
-from src.services.projects import is_consultant, require_company_id
+from src.services.projects import require_company_id
 
 
 def _utcnow():
@@ -29,29 +29,27 @@ def _read_results_json(snapshot: CalculationSnapshot) -> dict:
         return {}
 
 
-def _extract_compliance_status(results: dict) -> tuple[str, int, int]:
-    checks = (results.get("compliance_checks") or []) if isinstance(results, dict) else []
+def _extract_compliance_counts(results: dict) -> tuple[int, int]:
+    checks = results.get("compliance_checks") if isinstance(results, dict) else []
     if not isinstance(checks, list):
-        checks = []
+        return 0, 0
     fail = 0
     warn = 0
     for c in checks:
-        st = str((c or {}).get("status", "") or "").lower()
-        if st == "fail":
+        stt = str((c or {}).get("status", "") or "").lower().strip()
+        if stt == "fail":
             fail += 1
-        elif st in ("warn", "warning"):
+        elif stt in ("warn", "warning"):
             warn += 1
-    status = str((results.get("compliance") or {}).get("status", "") or "").lower().strip() or (
-        "fail" if fail else ("warn" if warn else "pass")
-    )
-    return status, int(fail), int(warn)
+    return int(fail), int(warn)
 
 
 def generate_alerts_for_snapshot(company_id: int, snapshot: CalculationSnapshot) -> List[dict]:
     results = _read_results_json(snapshot)
+    fail, warn = _extract_compliance_counts(results)
+
     out: List[dict] = []
 
-    _stt, fail, warn = _extract_compliance_status(results)
     if fail > 0:
         out.append(
             {
@@ -59,7 +57,7 @@ def generate_alerts_for_snapshot(company_id: int, snapshot: CalculationSnapshot)
                 "severity": "critical",
                 "title": "Uyum Kontrolleri: FAIL",
                 "message": f"Snapshot #{snapshot.id} için {fail} adet FAIL kontrolü var.",
-                "meta": {"snapshot_id": snapshot.id, "fail": fail, "warn": warn},
+                "meta": {"snapshot_id": int(snapshot.id), "fail": fail, "warn": warn},
             }
         )
     elif warn > 0:
@@ -69,7 +67,19 @@ def generate_alerts_for_snapshot(company_id: int, snapshot: CalculationSnapshot)
                 "severity": "warn",
                 "title": "Uyum Kontrolleri: WARN",
                 "message": f"Snapshot #{snapshot.id} için {warn} adet WARN kontrolü var.",
-                "meta": {"snapshot_id": snapshot.id, "fail": fail, "warn": warn},
+                "meta": {"snapshot_id": int(snapshot.id), "fail": fail, "warn": warn},
+            }
+        )
+
+    qa_flags = results.get("qa_flags") if isinstance(results, dict) else []
+    if isinstance(qa_flags, list) and len(qa_flags) > 0:
+        out.append(
+            {
+                "alert_type": "data_quality",
+                "severity": "warn",
+                "title": "Veri Kalitesi: QA Bayrakları",
+                "message": f"Snapshot #{snapshot.id} için {len(qa_flags)} adet QA flag var.",
+                "meta": {"snapshot_id": int(snapshot.id), "qa_flags": qa_flags[:50]},
             }
         )
 
@@ -81,10 +91,10 @@ def upsert_alerts(company_id: int, snapshot: CalculationSnapshot) -> int:
     if not alerts:
         return 0
 
+    created = 0
     with db() as s:
-        created = 0
         for a in alerts:
-            atype = str(a.get("alert_type", ""))
+            atype = str(a.get("alert_type", "generic"))
             existing = (
                 s.execute(
                     select(Alert)
@@ -108,34 +118,38 @@ def upsert_alerts(company_id: int, snapshot: CalculationSnapshot) -> int:
             else:
                 obj = Alert(
                     company_id=int(company_id),
-                    project_id=int(snapshot.project_id) if getattr(snapshot, "project_id", None) else None,
+                    project_id=int(getattr(snapshot, "project_id", 0) or 0),
                     snapshot_id=int(snapshot.id),
                     alert_type=atype,
                     severity=str(a.get("severity", "warn")),
                     title=str(a.get("title", "")),
                     message=str(a.get("message", "")),
                     status="open",
-                    created_at=_utcnow(),
                     meta_json=_safe_json(a.get("meta", {}) or {}),
+                    created_at=_utcnow(),
                 )
                 s.add(obj)
                 created += 1
-
         s.commit()
-
     return int(created)
 
 
 def list_open_alerts_for_user(user: Any, limit: int = 200) -> List[Alert]:
     cid = require_company_id(user)
+    role = str(getattr(user, "role", "") or "").lower()
+
     with db() as s:
         q = select(Alert).where(Alert.company_id == int(cid), Alert.status == "open")
-        if not is_consultant(user):
+        if role.startswith("client") or role.startswith("verifier"):
+            proj_ids = s.execute(select(Project.id).where(Project.company_id == int(cid))).scalars().all()
+            if not proj_ids:
+                return []
             shared_snap_ids = (
                 s.execute(
-                    select(CalculationSnapshot.id)
-                    .join(Project, Project.id == CalculationSnapshot.project_id)
-                    .where(Project.company_id == int(cid), CalculationSnapshot.shared_with_client == True)  # noqa: E712
+                    select(CalculationSnapshot.id).where(
+                        CalculationSnapshot.project_id.in_(proj_ids),
+                        CalculationSnapshot.shared_with_client == True,  # noqa: E712
+                    )
                 )
                 .scalars()
                 .all()
@@ -143,23 +157,23 @@ def list_open_alerts_for_user(user: Any, limit: int = 200) -> List[Alert]:
             if not shared_snap_ids:
                 return []
             q = q.where(Alert.snapshot_id.in_(shared_snap_ids))
+
         return s.execute(q.order_by(desc(Alert.created_at)).limit(int(limit))).scalars().all()
 
 
 def resolve_alert(user: Any, alert_id: int) -> Alert:
     cid = require_company_id(user)
-    if not is_consultant(user):
+    role = str(getattr(user, "role", "") or "").lower()
+    if not role.startswith("consult"):
         raise PermissionError("Alert kapatma sadece danışman rolünde açıktır.")
+
     with db() as s:
         a = s.get(Alert, int(alert_id))
         if not a or int(a.company_id) != int(cid):
             raise PermissionError("Alert bulunamadı veya erişim yok.")
         a.status = "resolved"
         a.resolved_at = _utcnow()
-        try:
-            a.resolved_by_user_id = int(getattr(user, "id", None) or 0) or None
-        except Exception:
-            a.resolved_by_user_id = None
+        a.resolved_by_user_id = int(getattr(user, "id", 0) or 0) or None
         s.add(a)
         s.commit()
         s.refresh(a)
