@@ -14,8 +14,7 @@ from src.engine.emissions import energy_emissions, resolve_factor_set_for_energy
 from src.engine.ets import ets_net_and_cost, ets_verification_payload
 from src.mrv.bundles import FactorRef, InputBundle, MonitoringPlanRef, PriceRef, QAFlag, ResultBundle
 from src.mrv.lineage import sha256_json
-from src.services.cbam_reporting import build_cbam_reporting_structure
-from src.services.ets_reporting import build_ets_reporting_structure
+from src.services.cbam_xml import build_cbam_reporting
 
 
 ENGINE_VERSION_PACKET_A = "engine-3.0.0-packetA"
@@ -47,6 +46,16 @@ def _facility_from_project(project: Project) -> Dict[str, Any]:
         "name": str(getattr(fac, "name", "") or ""),
         "country": str(getattr(fac, "country", "") or ""),
         "sector": str(getattr(fac, "sector", "") or ""),
+    }
+
+
+def _company_from_project(project: Project) -> Dict[str, Any]:
+    comp = getattr(project, "company", None)
+    if not comp:
+        return {"id": None, "name": ""}
+    return {
+        "id": int(getattr(comp, "id", 0) or 0),
+        "name": str(getattr(comp, "name", "") or ""),
     }
 
 
@@ -157,12 +166,13 @@ def run_orchestrator(
     production_df: pd.DataFrame,
     materials_df: pd.DataFrame | None = None,
 ) -> Tuple[InputBundle, ResultBundle, Dict[str, Any]]:
-    """Deterministik orchestrator.
+    """Paket A2: Deterministik Orchestrator (FAZ 1 son hali).
 
-    FAZ 1 ekleri:
-      - Allocation engine: ürün bazlı direct/indirect dağıtım + allocation_hash
-      - CBAM reporting: results_json.cbam_reporting (XML-ready)
-      - ETS reporting: results_json.ets_reporting (MRR-ready)
+    Notlar:
+      - 1.2 ETS reporting (MRR rapor çıktısı) eklenmedi.
+      - ETS tarafı sadece maliyet/verification payload olarak kalır (mevcut davranış korunur).
+      - 1.3 Allocation engine: direct+indirect emisyonlar ürünlere deterministik dağıtılır (varsa).
+      - 1.1 CBAM XML-ready reporting: results_json.cbam_reporting üretilir.
     """
 
     scenario = scenario or {}
@@ -175,6 +185,7 @@ def run_orchestrator(
 
     period = _period_from_config(config)
     facility = _facility_from_project(project)
+    company = _company_from_project(project)
     product_mapping = _product_mapping_from_production_df(production_df)
 
     # Factor set lock (deterministik)
@@ -194,12 +205,9 @@ def run_orchestrator(
     # Monitoring plan ref
     mp_ref = _latest_monitoring_plan_ref(facility.get("id"))
 
-    # Price ref (UI geriye uyumluluk)
-    eua_price_in = (config or {}).get("eua_price_eur_per_t", None)
-    if eua_price_in is None:
-        eua_price_in = (config or {}).get("eua_price_eur", 75.0)
+    # Price ref
     price = PriceRef(
-        eua_price_eur_per_t=_to_float(eua_price_in, 75.0),
+        eua_price_eur_per_t=_to_float((config or {}).get("eua_price_eur_per_t", 75.0), 75.0),
         fx_tl_per_eur=_to_float((config or {}).get("fx_tl_per_eur", 35.0), 35.0),
     )
 
@@ -223,9 +231,7 @@ def run_orchestrator(
 
     input_bundle_hash = input_bundle.input_bundle_hash()
 
-    # ------------------------------------------------------------
     # Core compute
-    # ------------------------------------------------------------
     energy_out = energy_emissions(
         energy_df,
         region=region or "TR",
@@ -234,37 +240,13 @@ def run_orchestrator(
         factor_set_lock=[fr.to_dict() for fr in factor_refs],
     )
 
-    direct_t = float(energy_out.get("direct_tco2", 0.0) or 0.0)
-    indirect_t = float(energy_out.get("indirect_tco2", 0.0) or 0.0)
-
-    # ------------------------------------------------------------
-    # Allocation engine (FAZ 1)
-    # ------------------------------------------------------------
-    alloc_method_cfg = str((config or {}).get("allocation_method") or (config or {}).get("allocation_basis") or "quantity_based")
-    allocation_df, allocation_meta = allocate_product_emissions(
-        production_df,
-        direct_tco2_total=direct_t,
-        indirect_tco2_total=indirect_t,
-        method=alloc_method_cfg,
-    )
-    allocation_by_sku = allocation_map_from_df(allocation_df)
-
-    # ------------------------------------------------------------
-    # ETS cost + verification payload
-    # ------------------------------------------------------------
+    # ETS cost + verification payload (mevcut davranış korunur)
     ets_cfg = (config or {}).get("ets") or {}
-    free_alloc_in = ets_cfg.get("free_alloc_t", None)
-    if free_alloc_in is None:
-        free_alloc_in = (config or {}).get("free_alloc_t", 0.0)
-    banked_in = ets_cfg.get("banked_t", None)
-    if banked_in is None:
-        banked_in = (config or {}).get("banked_t", 0.0)
-
-    free_alloc = _to_float(free_alloc_in, 0.0)
-    banked = _to_float(banked_in, 0.0)
+    free_alloc = _to_float(ets_cfg.get("free_alloc_t", 0.0), 0.0)
+    banked = _to_float(ets_cfg.get("banked_t", 0.0), 0.0)
 
     ets_cost = ets_net_and_cost(
-        scope1_tco2=direct_t,
+        scope1_tco2=float(energy_out.get("direct_tco2", 0.0) or 0.0),
         free_alloc_t=free_alloc,
         banked_t=banked,
         allowance_price_eur_per_t=price.eua_price_eur_per_t,
@@ -278,66 +260,53 @@ def run_orchestrator(
         uncertainty_notes=str((config or {}).get("uncertainty_notes", "") or ""),
     )
 
-    # ------------------------------------------------------------
-    # CBAM compute
-    # ------------------------------------------------------------
-    cbam_cfg = (config or {}).get("cbam") or {}
-    allocation_basis_in = cbam_cfg.get("allocation_basis", None)
-    if allocation_basis_in is None:
-        allocation_basis_in = (config or {}).get("cbam_allocation_basis", "quantity")
+    # 1.3 Allocation engine (deterministik)
+    alloc_cfg = (config or {}).get("allocation") or {}
+    alloc_method = str(alloc_cfg.get("method") or (config or {}).get("allocation_method") or "quantity_based")
+    allocation_df, allocation_meta = allocate_product_emissions(
+        production_df,
+        direct_tco2_total=float(energy_out.get("direct_tco2", 0.0) or 0.0),
+        indirect_tco2_total=float(energy_out.get("indirect_tco2", 0.0) or 0.0),
+        method=alloc_method,
+    )
+    allocation_by_sku = allocation_map_from_df(allocation_df)
 
+    # CBAM compute
+    cbam_cfg = (config or {}).get("cbam") or {}
     cbam_df, cbam_totals = cbam_compute(
         production_df=production_df,
         energy_breakdown=energy_out,
         materials_df=materials_df,
         eua_price_eur_per_t=price.eua_price_eur_per_t,
-        allocation_basis=str(allocation_basis_in or "quantity"),
+        allocation_basis=str(cbam_cfg.get("allocation_basis", "quantity") or "quantity"),
         allocation_by_sku=allocation_by_sku,
         allocation_meta=allocation_meta,
     )
     cbam_table = cbam_df.to_dict(orient="records") if cbam_df is not None and len(cbam_df) > 0 else []
 
-    # ------------------------------------------------------------
-    # Reporting structures (FAZ 1)
-    # ------------------------------------------------------------
-    declarant = {
-        "company_name": str(getattr(getattr(project, "company", None), "name", "") or ""),
-        "company_id": int(getattr(project, "company_id", 0) or 0),
-        "eori": str((config or {}).get("cbam_eori", "") or ""),
-        "country": str(facility.get("country") or region or ""),
-        "contact_email": str((config or {}).get("contact_email", "") or ""),
-    }
-    installation = {
-        "facility_id": facility.get("id"),
-        "facility_name": facility.get("name"),
-        "country": facility.get("country") or region,
-        "sector": facility.get("sector"),
-    }
-
-    cbam_reporting = build_cbam_reporting_structure(
+    # 1.1 CBAM XML-ready reporting (results_json.cbam_reporting)
+    cbam_reporting = build_cbam_reporting(
         period=period,
-        declarant=declarant,
-        installation=installation,
-        cbam_table_rows=cbam_table,
-        allocation_meta=allocation_meta,
+        declarant={
+            "company_name": company.get("name", ""),
+            "company_id": company.get("id"),
+            "eori": str((config or {}).get("cbam_eori", "") or ""),
+            "country": str(facility.get("country") or region or ""),
+            "contact_email": str((config or {}).get("contact_email", "") or ""),
+        },
+        installation={
+            "facility_id": facility.get("id"),
+            "facility_name": facility.get("name"),
+            "country": str(facility.get("country") or region or ""),
+            "sector": str(facility.get("sector") or ""),
+        },
+        cbam_table=cbam_table,
         methodology_note_tr=str((config or {}).get("cbam_methodology_note_tr", "") or ""),
     )
 
-    ets_reporting = build_ets_reporting_structure(
-        period=period,
-        installation=installation,
-        monitoring_plan_ref=(mp_ref.to_dict() if mp_ref else None),
-        energy_breakdown=energy_out,
-        price_ref=price.to_dict(),
-        config=config,
-    )
-
-    # ------------------------------------------------------------
-    # Bundles
-    # ------------------------------------------------------------
     totals = {
-        "scope1_tco2": direct_t,
-        "scope2_tco2": indirect_t,
+        "scope1_tco2": float(energy_out.get("direct_tco2", 0.0) or 0.0),
+        "scope2_tco2": float(energy_out.get("indirect_tco2", 0.0) or 0.0),
         "total_tco2": float(energy_out.get("total_tco2", 0.0) or 0.0),
     }
 
@@ -349,8 +318,9 @@ def run_orchestrator(
             "electricity_rows": list(energy_out.get("electricity_rows", []) or []),
         },
         "allocation": {
-            "meta": allocation_meta,
-            "by_sku": allocation_df.to_dict(orient="records") if allocation_df is not None and len(allocation_df) > 0 else [],
+            "allocation_method": allocation_meta.get("allocation_method"),
+            "allocation_hash": allocation_meta.get("allocation_hash"),
+            "rows": allocation_df.to_dict(orient="records") if allocation_df is not None and len(allocation_df) > 0 else [],
         },
         "cbam": {
             "table": cbam_table,
@@ -382,9 +352,8 @@ def run_orchestrator(
         "ets": ets_cost,
         "cbam": {
             "eua_price_eur_per_t": price.eua_price_eur_per_t,
-            "cbam_cost_eur": float((cbam_totals or {}).get("cbam_cost_eur", 0.0) or 0.0),
-            "cbam_cost_tl": float((cbam_totals or {}).get("cbam_cost_eur", 0.0) or 0.0) * float(price.fx_tl_per_eur or 0.0),
-            "embedded_tco2": float((cbam_totals or {}).get("embedded_tco2", 0.0) or 0.0),
+            "estimated_cost_eur": float((cbam_totals or {}).get("cbam_cost_eur", 0.0) or 0.0),
+            "estimated_cost_tl": float((cbam_totals or {}).get("cbam_cost_tl", 0.0) or 0.0),
         },
     }
 
@@ -414,46 +383,30 @@ def run_orchestrator(
         cost_outputs=cost_outputs,
     )
 
-    # UI KPIs
-    legacy_kpis: Dict[str, Any] = {
-        "direct_tco2": totals["scope1_tco2"],
-        "indirect_tco2": totals["scope2_tco2"],
-        "total_tco2": totals["total_tco2"],
-        "ets_net_tco2": float(ets_cost.get("net_tco2", 0.0) or 0.0),
-        "ets_cost_eur": float(ets_cost.get("cost_eur", 0.0) or 0.0),
-        "ets_cost_tl": float(ets_cost.get("cost_tl", 0.0) or 0.0),
-        "cbam_embedded_tco2": float((cbam_totals or {}).get("embedded_tco2", 0.0) or 0.0),
-        "cbam_cost_eur": float((cbam_totals or {}).get("cbam_cost_eur", 0.0) or 0.0),
-        "scope1_tco2": totals["scope1_tco2"],
-        "scope2_tco2": totals["scope2_tco2"],
-        # Allocation tracking
-        "allocation_method": allocation_meta.get("allocation_method") if isinstance(allocation_meta, dict) else None,
-        "allocation_hash": allocation_meta.get("allocation_hash") if isinstance(allocation_meta, dict) else None,
-    }
-
     legacy_results: Dict[str, Any] = {
-        "kpis": legacy_kpis,
+        "kpis": {
+            "scope1_tco2": totals["scope1_tco2"],
+            "scope2_tco2": totals["scope2_tco2"],
+            "total_tco2": totals["total_tco2"],
+        },
         "cbam_table": cbam_table,
-        "cbam": {"totals": cbam_totals or {}},
+        "cbam": cbam_totals or {},
+        "cbam_reporting": cbam_reporting,
+        "allocation": allocation_meta,
         "ets": {
             "net_and_cost": ets_cost,
             "verification": ets_verif,
         },
-        "cbam_reporting": cbam_reporting,
-        "ets_reporting": ets_reporting,
-        "allocation": allocation_meta,
-        "scenario": (scenario or {}),
-        "methodology": _methodology_ref(methodology_id),
         "input_bundle": input_bundle.to_canonical_dict(),
         "deterministic": {
             "engine_version": ENGINE_VERSION_PACKET_A,
             "input_bundle_hash": input_bundle_hash,
             "result_hash": result_hash,
             "config_hash": config_hash,
+            "allocation_hash": allocation_meta.get("allocation_hash"),
         },
         "qa_flags": [q.to_dict() for q in qa_flags],
         "compliance_checks": [],
-        "cost_outputs": cost_outputs,
     }
 
     legacy_results["results_json"] = dict(legacy_results)
