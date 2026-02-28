@@ -172,12 +172,12 @@ def _compute_result_hash(
     return sha256_json(payload)
 
 
-def _try_reuse_snapshot(project_id: int, result_hash: str) -> CalculationSnapshot | None:
+def _try_reuse_snapshot(project_id: int, input_hash: str, result_hash: str) -> CalculationSnapshot | None:
     with db() as s:
         existing = (
             s.execute(
                 select(CalculationSnapshot)
-                .where(CalculationSnapshot.project_id == int(project_id), CalculationSnapshot.result_hash == str(result_hash))
+                .where(CalculationSnapshot.project_id == int(project_id), CalculationSnapshot.input_hash == str(input_hash), CalculationSnapshot.result_hash == str(result_hash))
                 .order_by(CalculationSnapshot.created_at.desc())
             )
             .scalars()
@@ -207,29 +207,52 @@ def create_snapshot(
     *,
     project_id: int,
     engine_version: str,
+    # Audit-ready hashes
+    input_hash: str,
     result_hash: str,
     config: dict,
     input_hashes: dict,
     results_json: dict,
     methodology_id: int | None = None,
+    factor_set_id: int | None = None,
+    monitoring_plan_id: int | None = None,
     created_by_user_id: int | None = None,
     previous_snapshot_hash: str | None = None,
 ) -> CalculationSnapshot:
+    """Persist immutable-by-policy snapshot.
+
+    - locked=False başlangıçta draft; lock edildikten sonra değiştirilemez/silinemez.
+    - input_hash = canonical input bundle hash (config + dataset hashes + factor refs + methodology ref)
+    - result_hash = canonical result bundle hash
+    """
     with db() as s:
         snap = CalculationSnapshot(
             project_id=int(project_id),
             engine_version=str(engine_version),
+            input_hash=str(input_hash),
             result_hash=str(result_hash),
             config_json=json.dumps(config or {}, ensure_ascii=False, sort_keys=True, default=str),
             input_hashes_json=json.dumps(input_hashes or {}, ensure_ascii=False, sort_keys=True, default=str),
             results_json=json.dumps(results_json or {}, ensure_ascii=False, sort_keys=True, default=str),
-            methodology_id=(int(methodology_id) if methodology_id is not None else None),
-            created_by_user_id=(int(created_by_user_id) if created_by_user_id is not None else None),
-            previous_snapshot_hash=(str(previous_snapshot_hash) if previous_snapshot_hash else None),
+            methodology_id=int(methodology_id) if methodology_id is not None else None,
+            factor_set_id=int(factor_set_id) if factor_set_id is not None else None,
+            monitoring_plan_id=int(monitoring_plan_id) if monitoring_plan_id is not None else None,
+            previous_snapshot_hash=str(previous_snapshot_hash) if previous_snapshot_hash else None,
+            created_by_user_id=int(created_by_user_id) if created_by_user_id is not None else None,
         )
         s.add(snap)
         s.commit()
         s.refresh(snap)
+
+        if append_audit:
+            append_audit(
+                "snapshot_created",
+                {"snapshot_id": snap.id, "input_hash": input_hash, "result_hash": result_hash},
+                user_id=created_by_user_id,
+                company_id=None,
+                entity_type="snapshot",
+                entity_id=str(snap.id),
+            )
         return snap
 
 
@@ -295,7 +318,7 @@ def run_full(
         monitoring_plan_ref,
     )
 
-    existing = _try_reuse_snapshot(project_id, candidate_hash)
+    existing = _try_reuse_snapshot(project_id, input_hash=candidate_hash, result_hash=result_bundle.result_hash)
     if existing:
         try:
             append_audit("snapshot_reused", {"snapshot_id": existing.id, "result_hash": candidate_hash})
@@ -344,7 +367,8 @@ def run_full(
     snap = create_snapshot(
         project_id=int(project_id),
         engine_version=ENGINE_VERSION_PACKET_A,
-        result_hash=candidate_hash,
+        input_hash=candidate_hash,
+        result_hash=str(result_bundle.result_hash),
         config=(config or {}),
         input_hashes=input_hashes,
         results_json=results_json,
