@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any
 
 from src.compliance.qa_qc import build_qaqc_checks
 from src.mrv.lineage import sha256_json
@@ -24,12 +24,10 @@ def build_ets_reporting_dataset(
 ) -> dict:
     """
     EU ETS / MRR 2018/2066 için audit-ready ETS reporting dataset.
-    (Zorunlu alanlar + QA/QC + tier/uncertainty placeholder)
     """
     energy = (results or {}).get("energy") or {}
     kpis = (results or {}).get("kpis") or {}
 
-    # source streams (fuel bazlı)
     streams = {}
     for r in (energy.get("direct_rows") or []):
         if not isinstance(r, dict):
@@ -40,6 +38,7 @@ def build_ets_reporting_dataset(
         streams[ft]["emissions_tco2"] += _f(r.get("tco2"), 0.0)
 
     source_streams = []
+    qaqc = build_qaqc_checks(energy_df=energy_df, production_df=production_df)
     for ft, v in sorted(streams.items(), key=lambda x: x[0]):
         source_streams.append(
             {
@@ -51,13 +50,9 @@ def build_ets_reporting_dataset(
                 "tier": "TIER_2",
                 "tier_justification": "Standart hesap motoru + versioned factor set (minimum).",
                 "uncertainty_note": "Belirsizlik notu: ölçüm ekipmanı, numuneleme ve veri sistemine göre güncellenmelidir.",
-                "qa_qc": [],
+                "qa_qc": qaqc.get("checks", []),
             }
         )
-
-    qaqc = build_qaqc_checks(energy_df=energy_df, production_df=production_df)
-    for s in source_streams:
-        s["qa_qc"] = qaqc.get("checks", [])
 
     out = {
         "schema": "ets_reporting.v1",
