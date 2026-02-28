@@ -37,6 +37,10 @@ def get_tr_ets_mode() -> bool:
     return _get_bool(v, False)
 
 
+# Backward-compat: bazı modüller sabit bekliyor
+TR_ETS_MODE: bool = get_tr_ets_mode()
+
+
 def get_evidence_pack_hmac_key() -> str:
     """Evidence pack imzası için HMAC key.
 
