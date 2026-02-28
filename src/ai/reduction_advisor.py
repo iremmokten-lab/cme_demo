@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, List
 
 from src.engine.advisor import build_reduction_advice
 from src.mrv.lineage import sha256_json
@@ -14,19 +14,7 @@ def _f(x: Any, default: float = 0.0) -> float:
         return default
 
 
-def build_reduction_recommendations(
-    *,
-    project_id: int,
-    snapshot_id: int,
-    results: dict,
-    config: dict,
-) -> dict:
-    """
-    AI/Advisor çıktısı:
-      - hotspot + aksiyon önerileri
-      - her öneri: beklenen azaltım, maliyet etkisi, evidence ihtiyaçları
-      - calculation_reference: snapshot + varsayım hash
-    """
+def build_reduction_recommendations(*, project_id: int, snapshot_id: int, results: dict, config: dict) -> dict:
     energy = (results or {}).get("energy") or {}
     cbam = (results or {}).get("cbam") or {}
     cbam_table = (results or {}).get("cbam_table") or []
