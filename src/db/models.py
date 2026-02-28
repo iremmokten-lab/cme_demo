@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
+import datetime
 from sqlalchemy import (
     Boolean,
     Column,
@@ -12,293 +11,264 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import relationship
 
-Base = declarative_base()
-
-
-def utcnow():
-    return datetime.now(timezone.utc)
+from src.db.session import Base
 
 
+# ----------------------------
+# Core auth / tenancy
+# ----------------------------
 class Company(Base):
     __tablename__ = "companies"
 
     id = Column(Integer, primary_key=True)
-    name = Column(String(200), unique=True, nullable=False, index=True)
+    name = Column(String(200), nullable=False, unique=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-    facilities = relationship("Facility", back_populates="company", cascade="all, delete-orphan")
-    projects = relationship("Project", back_populates="company", cascade="all, delete-orphan")
-    users = relationship("User", back_populates="company", cascade="all, delete-orphan")
+    users = relationship("User", back_populates="company")
+    facilities = relationship("Facility", back_populates="company")
+    projects = relationship("Project", back_populates="company")
 
 
 class User(Base):
-    """Uygulama kullanıcıları.
-
-    Rol örnekleri:
-      - consultantadmin / consultant
-      - client
-      - verifier
-
-    Not: RLS (row-level security) bu demo repo'da uygulama katmanında uygulanır.
-    """
-
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
-
-    email = Column(String(320), unique=True, nullable=False, index=True)
-    password_hash = Column(String(200), nullable=False)
-
-    role = Column(String(80), nullable=False, default="client", index=True)
-    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
-
-    # Login güvenliği
-    failed_login_attempts = Column(Integer, default=0)
-    locked_until = Column(DateTime(timezone=True), nullable=True)
-    last_login_at = Column(DateTime(timezone=True), nullable=True)
-
-    created_at = Column(DateTime(timezone=True), default=utcnow)
+    email = Column(String(200), nullable=False, unique=True)
+    password_hash = Column(String(500), nullable=False)
+    role = Column(String(50), nullable=False, default="client")  # consultant / client / verifier
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     company = relationship("Company", back_populates="users")
 
 
+# ----------------------------
+# Facilities / Projects
+# ----------------------------
 class Facility(Base):
     __tablename__ = "facilities"
 
     id = Column(Integer, primary_key=True)
-    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
     name = Column(String(200), nullable=False)
-    country = Column(String(100), default="TR")
-    sector = Column(String(200), default="")
+    country_code = Column(String(10), nullable=True, default="TR")
+    country = Column(String(100), nullable=True, default="TR")  # backward compat
+    sector = Column(String(200), nullable=True, default="")
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     company = relationship("Company", back_populates="facilities")
     projects = relationship("Project", back_populates="facility")
-    monitoring_plans = relationship("MonitoringPlan", back_populates="facility", cascade="all, delete-orphan")
-    verification_cases = relationship("VerificationCase", back_populates="facility")
+    monitoring_plans = relationship("MonitoringPlan", back_populates="facility")
 
 
 class Project(Base):
     __tablename__ = "projects"
 
     id = Column(Integer, primary_key=True)
-    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
-    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True)
+
     name = Column(String(200), nullable=False)
-    year = Column(Integer, default=2025)
-    created_at = Column(DateTime(timezone=True), default=utcnow)
+    description = Column(Text, nullable=True)
+    year = Column(Integer, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     company = relationship("Company", back_populates="projects")
     facility = relationship("Facility", back_populates="projects")
-    uploads = relationship("DatasetUpload", back_populates="project", cascade="all, delete-orphan")
-    snapshots = relationship("CalculationSnapshot", back_populates="project", cascade="all, delete-orphan")
-    evidence_documents = relationship("EvidenceDocument", back_populates="project", cascade="all, delete-orphan")
-    verification_cases = relationship("VerificationCase", back_populates="project", cascade="all, delete-orphan")
+    uploads = relationship("DatasetUpload", back_populates="project")
+    snapshots = relationship("CalculationSnapshot", back_populates="project")
 
 
-class EvidenceDocument(Base):
-    __tablename__ = "evidencedocuments"
-
-    id = Column(Integer, primary_key=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
-
-    category = Column(String(50), nullable=False, default="documents")  # documents / meter_readings / invoices / contracts
-    uploaded_at = Column(DateTime(timezone=True), default=utcnow)
-    original_filename = Column(String(300), nullable=False)
-
-    sha256 = Column(String(64), nullable=False, index=True)
-    storage_uri = Column(String(500), nullable=False)
-
-    uploaded_by_user_id = Column(Integer, nullable=True)
-
-    notes = Column(Text, default="")
-
-    project = relationship("Project", back_populates="evidence_documents")
-    dataset_uploads = relationship("DatasetUpload", back_populates="evidence_document")
-
-
+# ----------------------------
+# Uploads & datasets
+# ----------------------------
 class DatasetUpload(Base):
-    __tablename__ = "datasetuploads"
+    __tablename__ = "dataset_uploads"
 
     id = Column(Integer, primary_key=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
 
     dataset_type = Column(String(50), nullable=False)  # energy / production / materials
-    uploaded_at = Column(DateTime(timezone=True), default=utcnow)
-    original_filename = Column(String(300), nullable=False)
+    original_filename = Column(String(300), nullable=True)
+    storage_uri = Column(Text, nullable=False)
 
-    sha256 = Column(String(64), nullable=False, index=True)
-    schema_version = Column(String(50), default="v1")
-    storage_uri = Column(String(500), nullable=False)
+    sha256 = Column(String(64), nullable=True)
+    schema_version = Column(String(50), nullable=True, default="v1")
 
-    uploaded_by_user_id = Column(Integer, nullable=True)
+    data_quality_score = Column(Float, nullable=True)
+    data_quality_report_json = Column(Text, nullable=True)
 
-    # Evidence / lineage meta
-    source = Column(String(200), default="")
-    document_ref = Column(String(300), default="")
-
-    evidence_document_id = Column(Integer, ForeignKey("evidencedocuments.id"), nullable=True, index=True)
-
-    # Data quality
-    data_quality_score = Column(Integer, nullable=True)  # 0-100
-    data_quality_report_json = Column(Text, default="{}")
+    uploaded_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     project = relationship("Project", back_populates="uploads")
-    evidence_document = relationship("EvidenceDocument", back_populates="dataset_uploads")
+
+
+# ----------------------------
+# MRV / factors / methodology
+# ----------------------------
+class EmissionFactor(Base):
+    __tablename__ = "emission_factors"
+
+    id = Column(Integer, primary_key=True)
+    factor_type = Column(String(100), nullable=False)  # e.g., fuel_co2, grid_factor
+    value = Column(Float, nullable=False, default=0.0)
+    unit = Column(String(100), nullable=True)
+    source = Column(String(500), nullable=True)
+
+    year = Column(Integer, nullable=True)
+    version = Column(String(50), nullable=True, default="v1")
+    region = Column(String(50), nullable=True, default="TR")
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 class Methodology(Base):
     __tablename__ = "methodologies"
 
     id = Column(Integer, primary_key=True)
-    name = Column(String(200), nullable=False, index=True)
-    description = Column(Text, default="")
-    scope = Column(String(200), default="CBAM+ETS")
-    version = Column(String(50), default="v1")
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-
-    snapshots = relationship("CalculationSnapshot", back_populates="methodology")
-
-
-class EmissionFactor(Base):
-    __tablename__ = "emissionfactors"
-
-    id = Column(Integer, primary_key=True)
-
-    factor_type = Column(String(120), nullable=False, index=True)
-    value = Column(Float, nullable=False)
-    unit = Column(String(80), nullable=False, default="")
-    source = Column(String(300), default="")
-    year = Column(Integer, nullable=True)
-    version = Column(String(50), default="v1")
-    region = Column(String(120), default="TR")
-
-    created_at = Column(DateTime(timezone=True), default=utcnow)
+    name = Column(String(200), nullable=False, default="Default Methodology")
+    description = Column(Text, nullable=True)
+    scope = Column(String(200), nullable=True, default="CBAM/ETS")
+    version = Column(String(50), nullable=True, default="v1")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 class MonitoringPlan(Base):
-    __tablename__ = "monitoringplans"
+    __tablename__ = "monitoring_plans"
 
     id = Column(Integer, primary_key=True)
-    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=False, index=True)
+    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=False)
 
-    method = Column(String(120), default="standard")
-    tier_level = Column(String(50), default="Tier 2")
-    data_source = Column(String(200), default="")
-    qa_procedure = Column(Text, default="")
-    responsible_person = Column(String(200), default="")
+    method = Column(String(100), nullable=True, default="")
+    tier_level = Column(String(50), nullable=True, default="")
 
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-    updated_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     facility = relationship("Facility", back_populates="monitoring_plans")
 
 
+# ----------------------------
+# Snapshots / reports / evidence
+# ----------------------------
 class CalculationSnapshot(Base):
-    __tablename__ = "calculationsnapshots"
+    __tablename__ = "calculation_snapshots"
 
     id = Column(Integer, primary_key=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
 
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-    engine_version = Column(String(50), default="engine-0.1.0")
+    engine_version = Column(String(100), nullable=True, default="")
+    result_hash = Column(String(128), nullable=True)
 
-    config_json = Column(Text, default="{}")
-    input_hashes_json = Column(Text, default="{}")
-    results_json = Column(Text, default="{}")
+    config_json = Column(Text, nullable=True)
+    input_hashes_json = Column(Text, nullable=True)
+    results_json = Column(Text, nullable=True)
 
-    methodology_id = Column(Integer, ForeignKey("methodologies.id"), nullable=True, index=True)
+    methodology_id = Column(Integer, ForeignKey("methodologies.id"), nullable=True)
 
-    result_hash = Column(String(64), nullable=False, index=True)
+    previous_snapshot_hash = Column(String(128), nullable=True)
 
-    previous_snapshot_hash = Column(String(64), nullable=True, index=True)
-
-    created_by_user_id = Column(Integer, nullable=True)
     locked = Column(Boolean, default=False)
-    locked_at = Column(DateTime(timezone=True), nullable=True)
-    locked_by_user_id = Column(Integer, nullable=True)
     shared_with_client = Column(Boolean, default=False)
 
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
     project = relationship("Project", back_populates="snapshots")
-    reports = relationship("Report", back_populates="snapshot", cascade="all, delete-orphan")
-    methodology = relationship("Methodology", back_populates="snapshots")
-
-
-class VerificationCase(Base):
-    """Verification Workflow (MVP) — 2018/2067 readiness."""
-
-    __tablename__ = "verificationcases"
-
-    id = Column(Integer, primary_key=True)
-
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
-    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True, index=True)
-
-    period_year = Column(Integer, nullable=False, default=2025, index=True)
-    verifier_org = Column(String(200), default="")
-
-    status = Column(String(50), default="planning", index=True)  # planning/fieldwork/findings/closed
-
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-    created_by_user_id = Column(Integer, nullable=True)
-
-    closed_at = Column(DateTime(timezone=True), nullable=True)
-
-    project = relationship("Project", back_populates="verification_cases")
-    facility = relationship("Facility", back_populates="verification_cases")
-    findings = relationship("VerificationFinding", back_populates="case", cascade="all, delete-orphan")
-
-
-class VerificationFinding(Base):
-    """Verification bulgusu (finding)."""
-
-    __tablename__ = "verificationfindings"
-
-    id = Column(Integer, primary_key=True)
-    case_id = Column(Integer, ForeignKey("verificationcases.id"), nullable=False, index=True)
-
-    severity = Column(String(20), default="minor", index=True)  # minor/major/critical
-    description = Column(Text, default="")
-    corrective_action = Column(Text, default="")
-
-    due_date = Column(String(30), default="")  # MVP: string (YYYY-MM-DD)
-    status = Column(String(30), default="open", index=True)  # open/in_progress/closed
-
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-    closed_at = Column(DateTime(timezone=True), nullable=True)
-
-    case = relationship("VerificationCase", back_populates="findings")
 
 
 class Report(Base):
     __tablename__ = "reports"
 
     id = Column(Integer, primary_key=True)
-    snapshot_id = Column(Integer, ForeignKey("calculationsnapshots.id"), nullable=False, index=True)
-
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-    report_type = Column(String(50), default="pdf")
-
-    storage_uri = Column(String(500), nullable=False)
-    sha256 = Column(String(64), nullable=False, index=True)
-
-    snapshot = relationship("CalculationSnapshot", back_populates="reports")
+    snapshot_id = Column(Integer, ForeignKey("calculation_snapshots.id"), nullable=False)
+    storage_uri = Column(Text, nullable=False)
+    sha256 = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
-class AuditEvent(Base):
-    """Audit/Event log (MVP)."""
+class EvidenceDocument(Base):
+    __tablename__ = "evidence_documents"
 
-    __tablename__ = "auditevents"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    category = Column(String(50), nullable=True, default="documents")
+
+    original_filename = Column(String(300), nullable=True)
+    storage_uri = Column(Text, nullable=False)
+    sha256 = Column(String(64), nullable=True)
+
+    uploaded_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ----------------------------
+# Verification workflow
+# ----------------------------
+class VerificationCase(Base):
+    __tablename__ = "verification_cases"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True)
+    period_year = Column(Integer, nullable=False, default=2025)
+
+    verifier_org = Column(String(200), nullable=True)
+    status = Column(String(50), nullable=True, default="open")
+
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
+
+    # Faz 2 - sampling notes / size (migration-like eklenir)
+    sampling_notes = Column(Text, nullable=True)
+    sampling_size = Column(Integer, nullable=True)
+
+    findings = relationship("VerificationFinding", back_populates="case")
+
+
+class VerificationFinding(Base):
+    __tablename__ = "verification_findings"
+
+    id = Column(Integer, primary_key=True)
+    case_id = Column(Integer, ForeignKey("verification_cases.id"), nullable=False)
+
+    severity = Column(String(50), nullable=True, default="minor")
+    description = Column(Text, nullable=True)
+    corrective_action = Column(Text, nullable=True)
+    due_date = Column(String(50), nullable=True)
+    status = Column(String(50), nullable=True, default="open")
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
+
+    case = relationship("VerificationCase", back_populates="findings")
+
+
+# ----------------------------
+# Alerts (Faz 2)
+# ----------------------------
+class Alert(Base):
+    __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True)
 
-    created_at = Column(DateTime(timezone=True), default=utcnow, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    snapshot_id = Column(Integer, ForeignKey("calculation_snapshots.id"), nullable=True)
 
-    event_type = Column(String(120), nullable=False, index=True)
-    details_json = Column(Text, default="{}")
+    alert_type = Column(String(100), nullable=False, default="generic")
+    severity = Column(String(20), nullable=False, default="warn")  # info/warn/critical
+    title = Column(String(300), nullable=True)
+    message = Column(Text, nullable=True)
 
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True, index=True)
+    status = Column(String(20), nullable=False, default="open")  # open/resolved
+    meta_json = Column(Text, nullable=True)
 
-    entity_type = Column(String(120), default="", index=True)
-    entity_id = Column(Integer, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    resolved_at = Column(DateTime, nullable=True)
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
