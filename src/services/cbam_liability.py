@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-
-# CBAM phase-in / free allocation alignment:
-# EU ETS amendment sets a "CBAM factor" (remaining free allocation share),
-# which implies payable share = 1 - cbam_factor.
-# Source values are aligned to the ETS phase-out schedule (2026-2033).
+# EU ETS free allocation phase-out alignment for CBAM certificates (CBAM factor = remaining free allocation share)
 _CBAM_FACTOR = {
     2026: 0.975,
     2027: 0.95,
@@ -17,21 +13,23 @@ _CBAM_FACTOR = {
     2031: 0.39,
     2032: 0.265,
     2033: 0.14,
-    2034: 0.0,  # From 2034, no CBAM factor applies => full obligation
+    2034: 0.0,
 }
 
 
 def cbam_payable_share(year: int) -> float:
-    """Returns payable share of embedded emissions for year (0..1)."""
+    """
+    Payable share of embedded emissions (0..1).
+    Transitional period (<=2025) => reporting only => 0
+    2026+ => increases based on phase-in.
+    """
     y = int(year)
-    if y < 2026:
-        return 0.0  # transitional period: reporting only
+    if y <= 2025:
+        return 0.0
     if y in _CBAM_FACTOR:
         return max(0.0, min(1.0, 1.0 - float(_CBAM_FACTOR[y])))
-    # After 2034: full obligation
     if y > 2034:
         return 1.0
-    # fallback: linear-ish conservative
     return 1.0
 
 
@@ -68,13 +66,12 @@ def compute_cbam_liability(
     eu_ets_price_eur_per_t: float,
     carbon_price_paid_eur_per_t: float = 0.0,
 ) -> CBAMLiability:
-    """Compute CBAM liability estimate.
-
-    - During transitional period (2023-2025), payable_share is 0 -> certificates_required 0.
-    - From 2026, payable_share increases according to EU ETS free allocation phase-out alignment.
-    - Carbon price paid abroad can reduce certificates to avoid double pricing.
-      We model this as ratio = min(carbon_price_paid / eu_ets_price, 1).
-      certificates_required = payable_emissions * (1 - ratio)
+    """
+    CBAM liability estimate:
+      payable_emissions = embedded_emissions * payable_share
+      effective_paid_ratio = min(carbon_price_paid / eu_ets_price, 1)
+      certificates_required = payable_emissions * (1 - effective_paid_ratio)
+      payable_amount = certificates_required * eu_ets_price
     """
     ee = max(0.0, float(embedded_emissions_tco2 or 0.0))
     price = max(0.0, float(eu_ets_price_eur_per_t or 0.0))
