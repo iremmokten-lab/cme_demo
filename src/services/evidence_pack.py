@@ -2,29 +2,27 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
-from src.services.exports import export_evidence_pack  # exports.py içindeki fonksiyon
+from src.services.exports import build_evidence_pack
 from src.mrv.replay import replay
 from src.mrv.snapshot_store import snapshot_payload
 
 
-def build_evidence_pack(
-    *,
-    project_id: int,
-    snapshot_id: int,
-) -> Tuple[bytes, Dict[str, Any]]:
+def export_evidence_pack_zip(project_id: int, snapshot_id: int) -> Tuple[bytes, Dict[str, Any]]:
     """
-    Tek giriş noktası:
-      - evidence pack zip bytes
-      - manifest dict (hash zinciri)
+    UI/Service için tek giriş noktası:
+      - ZIP bytes
+      - manifest dict (ZIP içindeki manifest.json)
     """
-    zip_bytes, manifest = export_evidence_pack(project_id=int(project_id), snapshot_id=int(snapshot_id))
+    zip_bytes = build_evidence_pack(int(snapshot_id))
+
+    # manifest dict'i ZIP içinden oku
+    import zipfile, io, json
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+        manifest = json.loads(z.read("manifest.json").decode("utf-8"))
     return zip_bytes, manifest
 
 
 def audit_replay_check(snapshot_id: int) -> Dict[str, Any]:
-    """
-    Denetçi için “replay sonucu”: input_hash/result_hash match.
-    """
     snap = snapshot_payload(int(snapshot_id))
     rep = replay(int(snapshot_id))
     return {
