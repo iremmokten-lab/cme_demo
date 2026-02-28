@@ -13,7 +13,6 @@ from pathlib import Path
 import pandas as pd
 from sqlalchemy import select
 
-from src.db.session import db
 from src.db.models import (
     CalculationSnapshot,
     DatasetUpload,
@@ -25,19 +24,21 @@ from src.db.models import (
     VerificationCase,
     VerificationFinding,
 )
+from src.db.session import db
 from src.mrv.lineage import sha256_bytes
-from src.services.cbam_xml import cbam_reporting_to_xml
 from src.services.reporting import build_pdf
 from src.services.storage import EVIDENCE_DOCS_CATEGORIES
 
 
 def build_xlsx_from_results(results_json: str) -> bytes:
-    """XLSX export (mevcut davranış korunur).
+    """Paket D4: XLSX export.
 
     - KPIs
     - CBAM_Table
     - CBAM_Goods_Summary (varsa)
     - ETS_Activity (varsa)
+    - AI_Benchmark (varsa)
+    - AI_AbatementCurve (varsa)
     """
     results = json.loads(results_json) if results_json else {}
     kpis = results.get("kpis", {}) or {}
@@ -45,7 +46,7 @@ def build_xlsx_from_results(results_json: str) -> bytes:
 
     cbam_goods = []
     try:
-        cbam_goods = (results.get("cbam") or {}).get("goods_summary", []) or []
+        cbam_goods = (results.get("cbam") or {}).get("totals", {}).get("goods_summary", []) or []
     except Exception:
         cbam_goods = []
 
@@ -54,6 +55,16 @@ def build_xlsx_from_results(results_json: str) -> bytes:
         ets_activity = ((results.get("ets") or {}).get("verification") or {}).get("activity_data", []) or []
     except Exception:
         ets_activity = []
+
+    ai_bench_products = []
+    ai_curve = []
+    try:
+        ai = (results.get("ai") or {})
+        ai_bench_products = (ai.get("benchmark") or {}).get("products", []) or []
+        ai_curve = (ai.get("optimizer") or {}).get("abatement_curve", []) or []
+    except Exception:
+        ai_bench_products = []
+        ai_curve = []
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -65,6 +76,12 @@ def build_xlsx_from_results(results_json: str) -> bytes:
 
         if ets_activity:
             pd.DataFrame(ets_activity).to_excel(writer, sheet_name="ETS_Activity", index=False)
+
+        if ai_bench_products:
+            pd.DataFrame(ai_bench_products).to_excel(writer, sheet_name="AI_Benchmark", index=False)
+
+        if ai_curve:
+            pd.DataFrame(ai_curve).to_excel(writer, sheet_name="AI_AbatementCurve", index=False)
 
     return out.getvalue()
 
@@ -79,7 +96,7 @@ def build_zip(files: dict[str, bytes]) -> bytes:
 
 
 def _safe_read_bytes(uri: str) -> bytes:
-    """Streamlit Cloud uyumlu: storage_uri genelde yerel path olur (./data/.. veya /tmp/..)."""
+    """Streamlit Cloud uyumlu: storage_uri genelde yerel path olur."""
     if not uri:
         return b""
     try:
@@ -107,6 +124,7 @@ def _snapshot_input_uris(snapshot: CalculationSnapshot) -> dict:
     except Exception:
         ih = {}
 
+    # Paket D2: project upload kaydı yoksa ih boş olabilir.
     if not ih:
         with db() as s:
             ups = (
@@ -155,24 +173,30 @@ def _ensure_pdf_for_snapshot(snapshot: CalculationSnapshot) -> tuple[bytes, str]
     except Exception:
         results = {}
 
-    # reporting.build_pdf signature: (snapshot_id, report_title, report_data) -> (storage_uri, sha256)
+    pdf = build_pdf(snapshot_id=snapshot.id, results=results)
+    if not pdf:
+        return b"", ""
+
+    h = sha256(pdf).hexdigest()
+
     try:
-        storage_uri, rep_sha = build_pdf(int(snapshot.id), "Carbon MRV Snapshot Raporu", results)
+        reports_dir = Path("exports")
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        out_path = reports_dir / f"report_snapshot_{snapshot.id}.pdf"
+        out_path.write_bytes(pdf)
+
+        with db() as s:
+            rep2 = Report(snapshot_id=snapshot.id, report_type="pdf", storage_uri=str(out_path), sha256=h)
+            s.add(rep2)
+            s.commit()
     except Exception:
-        storage_uri, rep_sha = "", ""
+        pass
 
-    pdf_bytes = _safe_read_bytes(str(storage_uri)) if storage_uri else b""
-    if pdf_bytes and rep_sha:
-        return pdf_bytes, rep_sha
-
-    if pdf_bytes:
-        return pdf_bytes, sha256(pdf_bytes).hexdigest()
-
-    return b"", ""
+    return pdf, h
 
 
 def _hmac_signature(payload_bytes: bytes) -> str | None:
-    """Manifest imzası: HMAC-SHA256(base64). Anahtar env: EVIDENCE_PACK_HMAC_KEY."""
+    """Manifest imzası: HMAC-SHA256(base64)."""
     key = os.getenv("EVIDENCE_PACK_HMAC_KEY", "").strip()
     if not key:
         return None
@@ -195,14 +219,23 @@ def _json_bytes(obj: dict) -> bytes:
 
 
 def build_evidence_pack(snapshot_id: int) -> bytes:
-    """Evidence pack export (ZIP).
+    """Evidence pack export (ZIP) — Paket B + Faz 3 AI artefact'ları.
 
-    FAZ 1.1:
-      - report/cbam_report.json
-      - report/cbam_report.xml
-
-    NOT:
-      - 1.2 ETS reporting çıktısı eklenmedi.
+    İçerik (özet):
+      - input csv: energy/production/materials
+      - factor library
+      - methodology
+      - snapshot json
+      - report pdf
+      - evidence documents
+      - data_quality.json
+      - compliance_checks.json
+      - verification_case.json
+      - ai/benchmark.json
+      - ai/advisor.json
+      - ai/optimizer.json
+      - ai/abatement_curve.csv
+      - manifest.json (signature dahil)
     """
     with db() as s:
         snapshot = s.get(CalculationSnapshot, int(snapshot_id))
@@ -216,11 +249,7 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
 
     # Factor library
     with db() as s:
-        factors = (
-            s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.year.desc()))
-            .scalars()
-            .all()
-        )
+        factors = s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.year.desc())).scalars().all()
 
     factor_rows = []
     factor_versions = {}
@@ -285,7 +314,7 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "results": res,
     }
 
-    # Compliance checks (snapshot sonuçlarından)
+    # Compliance checks
     compliance_checks = []
     try:
         compliance_checks = (res or {}).get("compliance_checks", []) or []
@@ -302,7 +331,7 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "compliance_checks": compliance_checks,
     }
 
-    # Verification case: project + period_year bazlı dahil et (varsa)
+    # Verification case
     period_year = None
     try:
         period_year = ((res or {}).get("input_bundle") or {}).get("period", {}).get("year", None)
@@ -389,11 +418,7 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     # Evidence docs
     evidence_manifest = []
     with db() as s:
-        docs = (
-            s.execute(select(EvidenceDocument).where(EvidenceDocument.project_id == snapshot.project_id))
-            .scalars()
-            .all()
-        )
+        docs = s.execute(select(EvidenceDocument).where(EvidenceDocument.project_id == snapshot.project_id)).scalars().all()
 
     evidence_files_to_zip: list[tuple[str, bytes]] = []
     for d in docs:
@@ -412,7 +437,7 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         )
         evidence_files_to_zip.append((f"evidence/{cat}/{d.original_filename}", b))
 
-    # Data quality (upload kayıtlarından)
+    # Data quality
     dq = {}
     try:
         with db() as s:
@@ -443,23 +468,26 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     except Exception:
         dq = {}
 
-    # CBAM report artifacts (FAZ 1.1)
-    cbam_reporting_obj = {}
-    try:
-        cbam_reporting_obj = (res or {}).get("cbam_reporting", {}) or {}
-    except Exception:
-        cbam_reporting_obj = {}
-    if not isinstance(cbam_reporting_obj, dict):
-        cbam_reporting_obj = {}
+    # AI artefacts
+    ai = (res or {}).get("ai") if isinstance(res, dict) else {}
+    if not isinstance(ai, dict):
+        ai = {}
 
-    cbam_report_json_bytes = _json_bytes(cbam_reporting_obj)
-    try:
-        cbam_xml_text = cbam_reporting_to_xml(cbam_reporting_obj)
-    except Exception:
-        cbam_xml_text = ""
-    cbam_report_xml_bytes = (cbam_xml_text or "").encode("utf-8")
+    bench_bytes = _json_bytes(ai.get("benchmark") or {})
+    advisor_bytes = _json_bytes(ai.get("advisor") or {})
+    optimizer_bytes = _json_bytes(ai.get("optimizer") or {})
 
-    # Byte payloads
+    # CSV: abatement curve
+    abatement_csv = b""
+    try:
+        curve = (ai.get("optimizer") or {}).get("abatement_curve") or []
+        if isinstance(curve, list) and curve:
+            df = pd.DataFrame(curve)
+            abatement_csv = df.to_csv(index=False).encode("utf-8")
+    except Exception:
+        abatement_csv = b""
+
+    # Hashes
     snapshot_json_bytes = _json_bytes(snapshot_payload)
     factors_json_bytes = _json_bytes(factors_json)
     meth_json_bytes = _json_bytes(meth_obj)
@@ -484,8 +512,10 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "evidence_index_hash": sha256_bytes(evidence_index_bytes),
         "compliance_checks_hash": sha256_bytes(compliance_json_bytes),
         "verification_case_hash": sha256_bytes(verification_json_bytes),
-        "cbam_report_json_hash": sha256_bytes(cbam_report_json_bytes),
-        "cbam_report_xml_hash": sha256_bytes(cbam_report_xml_bytes),
+        "ai_benchmark_hash": sha256_bytes(bench_bytes),
+        "ai_advisor_hash": sha256_bytes(advisor_bytes),
+        "ai_optimizer_hash": sha256_bytes(optimizer_bytes),
+        "ai_abatement_curve_hash": sha256_bytes(abatement_csv) if abatement_csv else None,
     }
 
     sig = _hmac_signature(_json_bytes(manifest_base))
@@ -496,24 +526,35 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json", _json_bytes(manifest))
 
+        # inputs
         z.writestr("input/energy.csv", energy_bytes or b"")
         z.writestr("input/production.csv", prod_bytes or b"")
         z.writestr("input/materials.csv", mat_bytes or b"")
 
+        # reference data
         z.writestr("factor_library/emission_factors.json", factors_json_bytes)
         z.writestr("methodology/methodology.json", meth_json_bytes)
 
+        # snapshot + report
         z.writestr("snapshot/snapshot.json", snapshot_json_bytes)
         z.writestr("report/report.pdf", pdf_bytes or b"")
 
-        z.writestr("report/cbam_report.json", cbam_report_json_bytes)
-        z.writestr("report/cbam_report.xml", cbam_report_xml_bytes)
-
+        # data quality
         z.writestr("data_quality/data_quality.json", dq_json_bytes)
 
+        # evidence index + files
         z.writestr("evidence/evidence_index.json", evidence_index_bytes)
+
+        # compliance + verification
         z.writestr("compliance/compliance_checks.json", compliance_json_bytes)
         z.writestr("verification/verification_case.json", verification_json_bytes)
+
+        # AI
+        z.writestr("ai/benchmark.json", bench_bytes)
+        z.writestr("ai/advisor.json", advisor_bytes)
+        z.writestr("ai/optimizer.json", optimizer_bytes)
+        if abatement_csv:
+            z.writestr("ai/abatement_curve.csv", abatement_csv)
 
         for path_in_zip, bts in evidence_files_to_zip:
             z.writestr(path_in_zip, bts or b"")
