@@ -17,6 +17,11 @@ if not user:
     login_view()
     st.stop()
 
+role = str(getattr(user, "role", "") or "").lower()
+if not role.startswith("verifier"):
+    st.error("Bu sayfa sadece verifier rolü içindir.")
+    st.stop()
+
 append_audit(
     "page_viewed",
     {"page": "verifier_portal"},
