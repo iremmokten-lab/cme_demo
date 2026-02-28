@@ -1,230 +1,146 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import hashlib
+import os
+from dataclasses import dataclass
+from typing import Optional
 
-import bcrypt
 import streamlit as st
 from sqlalchemy import select
 
 from src.db.models import Company, User
 from src.db.session import db
-from src.mrv.audit import append_audit, infer_company_id_for_user
-
-SESSION_KEY = "user_id"
-
-# Paket C: login güvenliği
-MAX_ATTEMPTS = 5
-LOCK_MINUTES = 15
 
 
-def _hash_pw(pw: str) -> str:
-    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+@dataclass
+class SessionUser:
+    id: int
+    email: str
+    role: str
+    company_id: int | None
 
 
-def _check_pw(pw: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(pw.encode("utf-8"), hashed.encode("utf-8"))
-    except Exception:
-        return False
+def _hash_password(pw: str) -> str:
+    salt = os.getenv("AUTH_SALT", "demo_salt")
+    raw = (salt + "::" + (pw or "")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
-def _get_secret(key: str, default=None):
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
+def _ensure_company() -> Company:
+    with db() as s:
+        c = s.execute(select(Company).order_by(Company.id).limit(1)).scalars().first()
+        if c:
+            return c
+        c = Company(name="Demo Company")
+        s.add(c)
+        s.commit()
+        s.refresh(c)
+        return c
 
 
 def ensure_bootstrap_admin():
-    """- Eğer hiç user yoksa: demo company + consultantadmin yaratır.
-    - Eğer admin email zaten varsa: isteğe bağlı olarak şifreyi resetleyebilir.
-      Bunun için Streamlit Secrets'a:
-        BOOTSTRAP_ADMIN_FORCE_RESET="1"
-      ekleyin.
-    """
-    admin_email = _get_secret("BOOTSTRAP_ADMIN_EMAIL", "admin@demo.com")
-    admin_pw = _get_secret("BOOTSTRAP_ADMIN_PASSWORD", "ChangeMe123!")
-    force_reset = str(_get_secret("BOOTSTRAP_ADMIN_FORCE_RESET", "0")).strip() == "1"
+    """Bootstrap users: consultant + verifier + client."""
+    admin_email = os.getenv("DEMO_ADMIN_EMAIL", "admin@demo.com")
+    admin_pw = os.getenv("DEMO_ADMIN_PASSWORD", "ChangeMe123!")
+    verifier_email = os.getenv("DEMO_VERIFIER_EMAIL", "verifier@demo.com")
+    verifier_pw = os.getenv("DEMO_VERIFIER_PASSWORD", admin_pw)
+
+    company = _ensure_company()
 
     with db() as s:
-        any_user = s.execute(select(User).limit(1)).scalars().first()
-        admin_user = s.execute(select(User).where(User.email == admin_email).limit(1)).scalars().first()
-
-        if not any_user:
-            c = Company(name="Demo Company")
-            s.add(c)
-            s.flush()
+        u = s.execute(select(User).where(User.email == admin_email)).scalars().first()
+        if not u:
             u = User(
                 email=admin_email,
-                password_hash=_hash_pw(admin_pw),
-                role="consultantadmin",
-                company_id=c.id,
+                password_hash=_hash_password(admin_pw),
+                role="consultant_admin",
+                company_id=company.id,
+                is_active=True,
             )
             s.add(u)
-            s.commit()
-            return
 
-        if not admin_user:
-            c = s.execute(select(Company).order_by(Company.id).limit(1)).scalars().first()
-            if not c:
-                c = Company(name="Demo Company")
-                s.add(c)
-                s.flush()
-            u = User(
-                email=admin_email,
-                password_hash=_hash_pw(admin_pw),
-                role="consultantadmin",
-                company_id=c.id,
+        v = s.execute(select(User).where(User.email == verifier_email)).scalars().first()
+        if not v:
+            v = User(
+                email=verifier_email,
+                password_hash=_hash_password(verifier_pw),
+                role="verifier",
+                company_id=company.id,
+                is_active=True,
             )
-            s.add(u)
-            s.commit()
-            return
+            s.add(v)
 
-        if force_reset:
-            admin_user.password_hash = _hash_pw(admin_pw)
-            admin_user.failed_login_attempts = 0
-            admin_user.locked_until = None
-            s.add(admin_user)
-            s.commit()
+        # default client (opsiyonel)
+        client_email = os.getenv("DEMO_CLIENT_EMAIL", "client@demo.com")
+        client_pw = os.getenv("DEMO_CLIENT_PASSWORD", admin_pw)
+        cusr = s.execute(select(User).where(User.email == client_email)).scalars().first()
+        if not cusr:
+            cusr = User(
+                email=client_email,
+                password_hash=_hash_password(client_pw),
+                role="client",
+                company_id=company.id,
+                is_active=True,
+            )
+            s.add(cusr)
+
+        s.commit()
 
 
-def get_or_create_demo_user():
-    """Geriye dönük uyumluluk (pages/1_Consultant_Panel.py).
-
-    Danışman panelini demo amaçlı hızlı açmak için:
-    - ensure_bootstrap_admin() ile demo consultantadmin hesabını garanti eder
-    - admin kullanıcıyı session'a yazar ve döndürür
-
-    Not: Bu fonksiyon, ana login/role routing akışını bozmaz; sadece bu sayfa tarafından kullanılır.
-    """
-    ensure_bootstrap_admin()
-
-    admin_email = _get_secret("BOOTSTRAP_ADMIN_EMAIL", "admin@demo.com")
-
-    with db() as s:
-        u = s.execute(select(User).where(User.email == admin_email).limit(1)).scalars().first()
-        if not u:
-            u = s.execute(select(User).order_by(User.id).limit(1)).scalars().first()
-        if not u:
-            raise RuntimeError("Demo kullanıcı oluşturulamadı (User tablosu boş).")
-
-        st.session_state[SESSION_KEY] = int(u.id)
-
+def current_user() -> Optional[SessionUser]:
+    u = st.session_state.get("user")
+    if not u:
+        return None
+    if isinstance(u, SessionUser):
+        return u
+    # backward compat dict
     try:
-        append_audit(
-            "demo_user_auto_login",
-            {"email": str(getattr(u, "email", "") or ""), "role": str(getattr(u, "role", "") or "")},
-            user_id=getattr(u, "id", None),
-            company_id=infer_company_id_for_user(u),
-            entity_type="user",
-            entity_id=getattr(u, "id", None),
+        return SessionUser(
+            id=int(u.get("id")),
+            email=str(u.get("email")),
+            role=str(u.get("role")),
+            company_id=(int(u.get("company_id")) if u.get("company_id") is not None else None),
         )
     except Exception:
-        pass
-
-    return u
-
-
-def current_user():
-    uid = st.session_state.get(SESSION_KEY)
-    if not uid:
         return None
+
+
+def authenticate(email: str, password: str) -> Optional[SessionUser]:
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+
     with db() as s:
-        return s.get(User, uid)
+        u = s.execute(select(User).where(User.email == email)).scalars().first()
+        if not u or not u.is_active:
+            return None
 
+        if u.password_hash != _hash_password(password or ""):
+            return None
 
-def _is_locked(user: User) -> tuple[bool, str]:
-    now = datetime.now(timezone.utc)
-    try:
-        locked_until = getattr(user, "locked_until", None)
-        if locked_until and locked_until > now:
-            remaining = locked_until - now
-            mins = max(1, int(remaining.total_seconds() // 60))
-            return True, f"Hesap geçici olarak kilitli. Lütfen {mins} dakika sonra tekrar deneyin."
-    except Exception:
-        pass
-    return False, ""
+        return SessionUser(id=int(u.id), email=u.email, role=u.role, company_id=u.company_id)
 
 
 def login_view():
-    st.title("Giriş")
+    st.title("🔐 Giriş")
+    st.caption("Demo kullanıcılar: admin@demo.com / verifier@demo.com / client@demo.com (şifre: ChangeMe123!)")
 
-    email = st.text_input("E-posta")
-    pw = st.text_input("Şifre", type="password")
+    with st.form("login_form"):
+        email = st.text_input("E-posta", value="")
+        password = st.text_input("Şifre", value="", type="password")
+        ok = st.form_submit_button("Giriş yap", type="primary")
 
-    if st.button("Giriş yap", type="primary"):
-        with db() as s:
-            user = s.execute(select(User).where(User.email == email).limit(1)).scalars().first()
-
-            if not user:
-                st.error("Geçersiz e-posta veya şifre.")
-                return
-
-            locked, msg = _is_locked(user)
-            if locked:
-                st.error(msg)
-                return
-
-            ok = _check_pw(pw, user.password_hash)
-            if not ok:
-                # attempt tracking
-                try:
-                    user.failed_login_attempts = int(getattr(user, "failed_login_attempts", 0) or 0) + 1
-                    if user.failed_login_attempts >= MAX_ATTEMPTS:
-                        user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=LOCK_MINUTES)
-                        s.add(user)
-                        s.commit()
-                        st.error(f"Çok fazla hatalı deneme. Hesap {LOCK_MINUTES} dakika kilitlendi.")
-                        return
-                    s.add(user)
-                    s.commit()
-                except Exception:
-                    pass
-
-                st.error("Geçersiz e-posta veya şifre.")
-                return
-
-            # successful login
-            try:
-                user.failed_login_attempts = 0
-                user.locked_until = None
-                user.last_login_at = datetime.now(timezone.utc)
-                s.add(user)
-                s.commit()
-            except Exception:
-                pass
-
-            st.session_state[SESSION_KEY] = user.id
-
-        try:
-            append_audit(
-                "user_login",
-                {"email": email},
-                user_id=getattr(user, "id", None),
-                company_id=infer_company_id_for_user(user),
-                entity_type="user",
-                entity_id=getattr(user, "id", None),
-            )
-        except Exception:
-            pass
-
-        st.success("Giriş başarılı.")
-        st.rerun()
+    if ok:
+        u = authenticate(email, password)
+        if not u:
+            st.error("Giriş başarısız. E-posta/şifre hatalı.")
+        else:
+            st.session_state["user"] = u
+            st.success("Giriş başarılı.")
+            st.rerun()
 
 
 def logout_button():
-    if st.button("Çıkış"):
-        uid = st.session_state.get(SESSION_KEY)
-        st.session_state.pop(SESSION_KEY, None)
-        try:
-            append_audit(
-                "user_logout",
-                {},
-                user_id=uid,
-                company_id=None,
-                entity_type="user",
-                entity_id=uid,
-            )
-        except Exception:
-            pass
+    if st.button("Çıkış", use_container_width=True):
+        st.session_state.pop("user", None)
         st.rerun()
