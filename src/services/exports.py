@@ -510,31 +510,41 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
 
 
     # Regülasyon datasetleri (CBAM / ETS)
-    cbam_xml_str = ""
-    cbam_json_obj = {}
+    # --- CBAM: cbam_report.json + cbam_report.xml
+    cbam_xml_bytes = b""
+    cbam_json_bytes = b"{}"
     try:
-        cbam = (res or {}).get("cbam", {}) or {}
-        # orchestrator: cbam.cbam_reporting XML string
-        cbam_xml_str = str(cbam.get("cbam_reporting") or "")
+        from src.services.cbam_reporting import cbam_reporting_to_xml
+
+        cbam_reporting = (res or {}).get("cbam_reporting") or {}
+        cbam_table = (res or {}).get("cbam_table") or (res or {}).get("cbam_table_rows") or []
+        if not isinstance(cbam_table, list):
+            cbam_table = []
+
+        cbam_xml_str = cbam_reporting_to_xml(cbam_reporting) if cbam_reporting else ""
+        cbam_xml_bytes = cbam_xml_str.encode("utf-8") if cbam_xml_str else b""
+
         cbam_json_obj = {
-        "schema": "cbam_report.v1",
-        "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
-        "products": cbam.get("table") or [],
-        "meta": cbam.get("meta") or {},
-        "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
-        "validation_status": {
-            "used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors")),
-            "notes": "Default factor kullanımı varsa actual/default flag ile raporlanır.",
-        },
+            "schema": "cbam_report.v1",
+            "regulation": {"primary": "2023/956", "transitional_reporting_ir": "2023/1773"},
+            "facility": ((res or {}).get("input_bundle", {}) or {}).get("facility", {}) or {},
+            "period": ((res or {}).get("input_bundle", {}) or {}).get("period", {}) or {},
+            "products": cbam_table,
+            "totals": (cbam_reporting or {}).get("totals") or {},
+            "methodology": ((res or {}).get("input_bundle", {}) or {}).get("methodology_ref", {}) or {},
+            "validation_status": {
+                "used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors")),
+                "notes": "data_type_flag alanı satır bazında actual/default ayrımını taşır.",
+            },
+            "carbon_price_paid": (cbam_reporting or {}).get("carbon_price_paid") or {},
         }
+        cbam_json_bytes = _json_bytes(cbam_json_obj)
     except Exception:
-        cbam_xml_str = ""
-        cbam_json_obj = {}
+        cbam_xml_bytes = b""
+        cbam_json_bytes = _json_bytes({})
 
-    cbam_xml_bytes = (cbam_xml_str.encode("utf-8") if cbam_xml_str else b"")
-    cbam_json_bytes = _json_bytes(cbam_json_obj)
-
-    # ETS reporting JSON (MRR 2018/2066 / TR ETS modu)
+    # --- ETS: ets_reporting.json (MRR 2018/2066 + TR ETS modu alanları)
+    ets_json_bytes = _json_bytes({})
     ets_json_obj = {}
     try:
         period = ((res or {}).get("input_bundle", {}) or {}).get("period", {}) or {}
@@ -542,27 +552,23 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         methodology_ref = ((res or {}).get("input_bundle", {}) or {}).get("methodology_ref", {}) or {}
         energy_breakdown = (res or {}).get("energy", {}) or {}
         allocation_obj = (res or {}).get("allocation", {}) or {}
-        qa = {"controls": [], "passed": [], "failed": []}
+        qa = (res or {}).get("qa_qc") or {"controls": [], "passed": [], "failed": []}
+
         ets_json_obj = build_ets_reporting_dataset(
-        installation=installation,
-        period=period,
-        energy_breakdown=energy_breakdown,
-        methodology={
-            "id": methodology_ref.get("id"),
-            "name": methodology_ref.get("name"),
-            "regime": methodology_ref.get("regime"),
-            "config": {},
-        },
-        config=(cfg or {}),
-        allocation=allocation_obj,
-        qa_qc=qa,
-        tr_ets_mode=bool(TR_ETS_MODE),
+            installation=installation,
+            period=period,
+            energy_breakdown=energy_breakdown,
+            methodology=methodology_ref if isinstance(methodology_ref, dict) else {},
+            config=(cfg or {}),
+            allocation=allocation_obj if isinstance(allocation_obj, dict) else {},
+            qa_qc=qa if isinstance(qa, dict) else {},
+            tr_ets_mode=bool(TR_ETS_MODE),
         )
+        ets_json_bytes = _json_bytes(ets_json_obj)
     except Exception:
         ets_json_obj = {}
-        ets_json_bytes = _json_bytes(ets_json_obj)
-
-    # Compliance dataset zaten compliance_json_bytes olarak yazılıyor; ayrıca gereksinim için kopya path'ler eklenecek.
+        ets_json_bytes = _json_bytes({})
+# Compliance dataset zaten compliance_json_bytes olarak yazılıyor; ayrıca gereksinim için kopya path'ler eklenecek.
     # Compliance checks (Paket B3): snapshot sonuçlarından çıkar
     compliance_checks = []
     try:
