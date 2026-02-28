@@ -15,6 +15,7 @@ def build_mrv_template_xlsx() -> bytes:
     ws.append(["Bu dosya Streamlit demo ingestion için hazırlanmıştır."])
     ws.append(["Sheet isimleri: energy, production, materials"])
     ws.append(["Kolon adlarını mümkünse değiştirmeyin. Tarih formatı: YYYY-MM"])
+    ws.append(["Not: Bu template, demo ingestion şeması ile uyumludur."])
 
     ws_e = wb.create_sheet("energy")
     ws_e.append(["month", "facility_id", "fuel_type", "fuel_quantity", "fuel_unit"])
