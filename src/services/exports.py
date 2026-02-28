@@ -28,8 +28,10 @@ from src.db.models import (
 from src.mrv.lineage import sha256_bytes
 from src.services.reporting import build_pdf
 from src.services.ets_reporting import build_ets_reporting_dataset
-from src.config import TR_ETS_MODE
+from src.config import get_tr_ets_mode
 from src.services.storage import EVIDENCE_DOCS_CATEGORIES
+from src.services.signing import build_signature_block
+from src.services.validators import validate_cbam_report, validate_ets_reporting
 
 
 def build_xlsx_from_results(results_json: str) -> bytes:
@@ -510,41 +512,31 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
 
 
     # Regülasyon datasetleri (CBAM / ETS)
-    # --- CBAM: cbam_report.json + cbam_report.xml
-    cbam_xml_bytes = b""
-    cbam_json_bytes = b"{}"
+    cbam_xml_str = ""
+    cbam_json_obj = {}
     try:
-        from src.services.cbam_reporting import cbam_reporting_to_xml
-
-        cbam_reporting = (res or {}).get("cbam_reporting") or {}
-        cbam_table = (res or {}).get("cbam_table") or (res or {}).get("cbam_table_rows") or []
-        if not isinstance(cbam_table, list):
-            cbam_table = []
-
-        cbam_xml_str = cbam_reporting_to_xml(cbam_reporting) if cbam_reporting else ""
-        cbam_xml_bytes = cbam_xml_str.encode("utf-8") if cbam_xml_str else b""
-
+        cbam = (res or {}).get("cbam", {}) or {}
+        # orchestrator: cbam.cbam_reporting XML string
+        cbam_xml_str = str(cbam.get("cbam_reporting") or "")
         cbam_json_obj = {
-            "schema": "cbam_report.v1",
-            "regulation": {"primary": "2023/956", "transitional_reporting_ir": "2023/1773"},
-            "facility": ((res or {}).get("input_bundle", {}) or {}).get("facility", {}) or {},
-            "period": ((res or {}).get("input_bundle", {}) or {}).get("period", {}) or {},
-            "products": cbam_table,
-            "totals": (cbam_reporting or {}).get("totals") or {},
-            "methodology": ((res or {}).get("input_bundle", {}) or {}).get("methodology_ref", {}) or {},
-            "validation_status": {
-                "used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors")),
-                "notes": "data_type_flag alanı satır bazında actual/default ayrımını taşır.",
-            },
-            "carbon_price_paid": (cbam_reporting or {}).get("carbon_price_paid") or {},
+        "schema": "cbam_report.v1",
+        "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
+        "products": cbam.get("table") or [],
+        "meta": cbam.get("meta") or {},
+        "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
+        "validation_status": {
+            "used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors")),
+            "notes": "Default factor kullanımı varsa actual/default flag ile raporlanır.",
+        },
         }
-        cbam_json_bytes = _json_bytes(cbam_json_obj)
     except Exception:
-        cbam_xml_bytes = b""
-        cbam_json_bytes = _json_bytes({})
+        cbam_xml_str = ""
+        cbam_json_obj = {}
 
-    # --- ETS: ets_reporting.json (MRR 2018/2066 + TR ETS modu alanları)
-    ets_json_bytes = _json_bytes({})
+    cbam_xml_bytes = (cbam_xml_str.encode("utf-8") if cbam_xml_str else b"")
+    cbam_json_bytes = _json_bytes(cbam_json_obj)
+
+    # ETS reporting JSON (MRR 2018/2066 / TR ETS modu)
     ets_json_obj = {}
     try:
         period = ((res or {}).get("input_bundle", {}) or {}).get("period", {}) or {}
@@ -552,23 +544,27 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         methodology_ref = ((res or {}).get("input_bundle", {}) or {}).get("methodology_ref", {}) or {}
         energy_breakdown = (res or {}).get("energy", {}) or {}
         allocation_obj = (res or {}).get("allocation", {}) or {}
-        qa = (res or {}).get("qa_qc") or {"controls": [], "passed": [], "failed": []}
-
+        qa = {"controls": [], "passed": [], "failed": []}
         ets_json_obj = build_ets_reporting_dataset(
-            installation=installation,
-            period=period,
-            energy_breakdown=energy_breakdown,
-            methodology=methodology_ref if isinstance(methodology_ref, dict) else {},
-            config=(cfg or {}),
-            allocation=allocation_obj if isinstance(allocation_obj, dict) else {},
-            qa_qc=qa if isinstance(qa, dict) else {},
-            tr_ets_mode=bool(TR_ETS_MODE),
+        installation=installation,
+        period=period,
+        energy_breakdown=energy_breakdown,
+        methodology={
+            "id": methodology_ref.get("id"),
+            "name": methodology_ref.get("name"),
+            "regime": methodology_ref.get("regime"),
+            "config": {},
+        },
+        config=(cfg or {}),
+        allocation=allocation_obj,
+        qa_qc=qa,
+        tr_ets_mode=bool(get_tr_ets_mode()),
         )
-        ets_json_bytes = _json_bytes(ets_json_obj)
     except Exception:
         ets_json_obj = {}
-        ets_json_bytes = _json_bytes({})
-# Compliance dataset zaten compliance_json_bytes olarak yazılıyor; ayrıca gereksinim için kopya path'ler eklenecek.
+        ets_json_bytes = _json_bytes(ets_json_obj)
+
+    # Compliance dataset zaten compliance_json_bytes olarak yazılıyor; ayrıca gereksinim için kopya path'ler eklenecek.
     # Compliance checks (Paket B3): snapshot sonuçlarından çıkar
     compliance_checks = []
     try:
@@ -585,6 +581,37 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "engine_version": snapshot.engine_version,
         "compliance_checks": compliance_checks,
     }
+
+    # Ek doğrulamalar (regulation-grade checklist)
+    validation_issues = []
+    try:
+        cbam_issues = validate_cbam_report(cbam_json_obj if isinstance(cbam_json_obj, dict) else {})
+        validation_issues.extend([x.to_dict() for x in (cbam_issues or [])])
+    except Exception as _e:
+        validation_issues.append({
+            "rule_id": "CBAM.VAL.ERR",
+            "reg_reference": "internal",
+            "severity": "warn",
+            "message_tr": "CBAM validator çalıştırılamadı.",
+            "remediation_tr": "CBAM rapor datasını ve şemasını kontrol edin.",
+            "details": {"error": str(_e)},
+        })
+
+    try:
+        ets_issues = validate_ets_reporting(ets_json_obj if isinstance(ets_json_obj, dict) else {})
+        validation_issues.extend([x.to_dict() for x in (ets_issues or [])])
+    except Exception as _e:
+        validation_issues.append({
+            "rule_id": "ETS.VAL.ERR",
+            "reg_reference": "internal",
+            "severity": "warn",
+            "message_tr": "ETS validator çalıştırılamadı.",
+            "remediation_tr": "ETS rapor datasını ve şemasını kontrol edin.",
+            "details": {"error": str(_e)},
+        })
+
+    compliance_payload["validation_issues"] = validation_issues
+
 
     # Verification case (Paket B3): project + period_year bazlı dahil et (varsa)
     period_year = None
@@ -647,16 +674,16 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "ets_reporting_json_hash": sha256_bytes(ets_json_bytes),
     }
 
-    sig = _hmac_signature(_json_bytes(manifest_base))
+    signature_block = build_signature_block(manifest_base)
     manifest = dict(manifest_base)
-    manifest["signature"] = sig  # None olabilir (anahtar yoksa)
+    manifest["signature"] = signature_block  # {'signatures': [...], 'signed_payload_hash_sha256': ...}
 
     # ZIP build
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json", _json_bytes(manifest))
         # signature.json (ayrı dosya)
-        signature_obj = {"algorithm": "HMAC-SHA256", "key_id": "EVIDENCE_PACK_HMAC_KEY", "signature": manifest.get("signature")}
+        signature_obj = manifest.get("signature") or {}
         z.writestr("signature.json", _json_bytes(signature_obj))
 
         # inputs
