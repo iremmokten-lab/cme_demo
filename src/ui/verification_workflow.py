@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
-
 import streamlit as st
 
 from src.services.projects import list_company_projects_for_user
@@ -11,145 +9,164 @@ from src.services.verification import (
     create_case,
     list_cases_for_user,
     read_case_for_user,
-    update_case_status,
     update_case_sampling,
+    update_case_status,
+    case_to_json,
 )
 
 
-def _is_consultant(user) -> bool:
-    return str(getattr(user, "role", "") or "").lower().startswith("consult")
+def _role(user) -> str:
+    return str(getattr(user, "role", "") or "").lower()
 
 
-def _safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
+def _can_write(user) -> bool:
+    r = _role(user)
+    return r.startswith("consult") or r.startswith("verifier")
 
 
 def verification_workflow_page(user) -> None:
-    st.header("Verification Workflow")
+    st.title("🧾 Verification Workflow")
+    st.caption("Case + findings + sampling notları. Danışman/verifier yönetir; müşteri read-only.")
+
+    can_write = _can_write(user)
 
     projects = list_company_projects_for_user(user)
     if not projects:
-        st.info("Önce en az bir proje oluşturmalısınız.")
+        st.warning("Bu şirkete bağlı proje bulunamadı.")
         return
 
-    p_map = {f"{p.id} • {p.name}": int(p.id) for p in projects}
-    p_label = st.selectbox("Proje", list(p_map.keys()))
-    project_id = p_map[p_label]
+    proj_label_to_id = {f"{p.name} (#{p.id})": int(p.id) for p in projects}
+    proj_label = st.selectbox("Proje seç", options=list(proj_label_to_id.keys()))
+    project_id = proj_label_to_id[proj_label]
 
-    st.subheader("Cases")
-    cases = list_cases_for_user(user, project_id=project_id, limit=200)
+    cases = list_cases_for_user(user, project_id=project_id)
 
-    if cases:
-        case_labels = [f"#{c.id} • {c.status} • {c.period_year} • {c.verifier_org or ''}" for c in cases]
-        idx = st.selectbox("Case seç", list(range(len(case_labels))), format_func=lambda i: case_labels[i])
-        case_id = int(cases[idx].id)
-        case_payload = read_case_for_user(user, case_id=case_id)
-        case = case_payload["case"]
-        findings = case_payload["findings"]
+    st.divider()
 
-        cols = st.columns(4)
-        cols[0].metric("Case ID", str(case.get("id")))
-        cols[1].metric("Durum", str(case.get("status")))
-        cols[2].metric("Yıl", str(case.get("period_year")))
-        cols[3].metric("Verifier Org", str(case.get("verifier_org") or "-"))
+    if can_write:
+        with st.expander("➕ Yeni Verification Case Oluştur", expanded=False):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                period_year = st.number_input("Dönem (Yıl)", min_value=2000, max_value=2100, value=2025, step=1)
+            with c2:
+                facility_id = st.number_input("Facility ID (opsiyonel)", min_value=0, value=0, step=1)
+            with c3:
+                verifier_org = st.text_input("Verifier Organizasyon", value="")
 
-        if _is_consultant(user) or str(getattr(user, "role", "") or "").lower().startswith("verifier"):
-            with st.form("case_status"):
-                new_status = st.selectbox("Case durumu", ["open", "in_review", "closed"], index=["open", "in_review", "closed"].index(case.get("status") or "open"))
-                save = st.form_submit_button("Durumu Güncelle", type="primary")
-            if save:
+            if st.button("Case oluştur", type="primary"):
                 try:
-                    update_case_status(user, case_id=int(case_id), status=new_status)
-                    st.success("Case durumu güncellendi.")
+                    created = create_case(
+                        user,
+                        project_id=project_id,
+                        facility_id=(int(facility_id) if int(facility_id) > 0 else None),
+                        period_year=int(period_year),
+                        verifier_org=str(verifier_org),
+                    )
+                    st.success(f"Case oluşturuldu. (#{created.id})")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Case durumu güncellenemedi: {e}")
+                    st.error(f"Case oluşturulamadı: {e}")
+    else:
+        st.info("Read-only mod: müşteri rolü (case oluşturma/düzenleme kapalı).")
 
-        st.divider()
+    if not cases:
+        st.warning("Bu proje için verification case yok.")
+        return
 
-        st.subheader("Sampling / Örnekleme Notları")
-        with st.form(f"sampling_{case_id}"):
-            sampling_notes = st.text_area("Sampling Notları", value=str(case.get("sampling_notes", "") or ""), height=120)
-            sampling_size = st.number_input("Örneklem Büyüklüğü (opsiyonel)", min_value=0, step=1, value=int(case.get("sampling_size") or 0))
-            save_sampling = st.form_submit_button("Sampling'i Kaydet", type="primary")
-        if save_sampling:
+    case_labels = [f"#{c.id} • {c.status} • {c.period_year} • {c.verifier_org or ''}" for c in cases]
+    sel = st.selectbox("Case seç", list(range(len(case_labels))), format_func=lambda i: case_labels[i])
+    case_id = int(cases[sel].id)
+
+    c_obj = read_case_for_user(user, case_id)
+    if not c_obj:
+        st.error("Case okunamadı.")
+        return
+
+    c = case_to_json(c_obj)
+
+    cols = st.columns(4)
+    cols[0].metric("Case", f"#{c['id']}")
+    cols[1].metric("Durum", c.get("status", ""))
+    cols[2].metric("Yıl", str(c.get("period_year", "")))
+    cols[3].metric("Verifier Org", c.get("verifier_org", "") or "-")
+
+    st.subheader("Sampling / Örnekleme")
+    if can_write:
+        with st.form("sampling_form"):
+            notes = st.text_area("Sampling notları", value=str(c.get("sampling_notes", "") or ""), height=120)
+            size = st.number_input("Örneklem büyüklüğü (opsiyonel)", min_value=0, step=1, value=int(c.get("sampling_size") or 0))
+            ok = st.form_submit_button("Kaydet", type="primary")
+        if ok:
             try:
-                update_case_sampling(user, int(case_id), sampling_notes=sampling_notes, sampling_size=int(sampling_size) if sampling_size else None)
+                update_case_sampling(user, case_id=case_id, sampling_notes=notes, sampling_size=(int(size) if int(size) > 0 else None))
                 st.success("Sampling güncellendi.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Sampling güncellenemedi: {e}")
+    else:
+        st.write(c.get("sampling_notes") or "—")
+        st.caption(f"Örneklem büyüklüğü: {c.get('sampling_size') or '—'}")
 
-        st.subheader("Bulgular")
+    st.subheader("Case Durumu")
+    if can_write:
+        with st.form("status_form"):
+            stt = st.selectbox("Durum", ["planning", "fieldwork", "findings", "closed"], index=["planning", "fieldwork", "findings", "closed"].index(c.get("status") or "planning"))
+            ok = st.form_submit_button("Durumu Güncelle", type="primary")
+        if ok:
+            try:
+                update_case_status(user, case_id=case_id, status=stt)
+                st.success("Durum güncellendi.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Durum güncellenemedi: {e}")
 
-        if findings:
-            for f in findings:
-                with st.expander(f"#{f['id']} • {f['severity']} • {f['status']}", expanded=False):
-                    st.write("**Açıklama**")
-                    st.write(f.get("description") or "-")
-                    st.write("**Düzeltici Aksiyon**")
-                    st.write(f.get("corrective_action") or "-")
-                    st.write("**Due date**")
-                    st.write(f.get("due_date") or "-")
+    st.divider()
+    st.subheader("Findings (Bulgular)")
 
-                    if f.get("status") != "closed":
-                        if st.button("Finding kapat", key=f"close_{f['id']}"):
-                            try:
-                                close_finding(user, finding_id=int(f["id"]))
-                                st.success("Finding kapatıldı.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Finding kapatılamadı: {e}")
-        else:
-            st.caption("Henüz finding yok.")
+    findings = c.get("findings", []) or []
+    if not findings:
+        st.caption("Henüz finding yok.")
+    else:
+        for f in findings:
+            with st.expander(f"#{f['id']} • {f['severity']} • {f['status']}", expanded=False):
+                st.write("**Açıklama**")
+                st.write(f.get("description") or "—")
+                st.write("**Düzeltici Aksiyon**")
+                st.write(f.get("corrective_action") or "—")
+                st.write("**Due date**")
+                st.write(f.get("due_date") or "—")
 
-        st.divider()
-        st.subheader("Yeni Finding Ekle")
-        with st.form("add_finding"):
-            severity = st.selectbox("Severity", ["minor", "major", "critical"], index=0)
-            description = st.text_area("Açıklama", height=120)
-            corrective_action = st.text_area("Düzeltici aksiyon", height=100)
-            due_date = st.text_input("Due date (opsiyonel)")
+                if can_write and f.get("status") != "closed":
+                    if st.button("Finding kapat", key=f"close_{f['id']}"):
+                        try:
+                            close_finding(user, finding_id=int(f["id"]))
+                            st.success("Finding kapatıldı.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Finding kapatılamadı: {e}")
+
+    st.divider()
+    st.subheader("Yeni Finding Ekle")
+    if can_write:
+        with st.form("add_finding_form"):
+            sev = st.selectbox("Severity", ["minor", "major", "critical"], index=0)
+            desc = st.text_area("Açıklama", height=120)
+            ca = st.text_area("Düzeltici aksiyon", height=100)
+            due = st.text_input("Due date (opsiyonel, YYYY-MM-DD)")
             ok = st.form_submit_button("Finding ekle", type="primary")
         if ok:
             try:
                 add_finding(
                     user,
-                    case_id=int(case_id),
-                    severity=severity,
-                    description=description,
-                    corrective_action=corrective_action,
-                    due_date=due_date,
+                    case_id=case_id,
+                    severity=sev,
+                    description=desc,
+                    corrective_action=ca,
+                    due_date=due,
                 )
                 st.success("Finding eklendi.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Finding eklenemedi: {e}")
-
     else:
-        st.info("Bu proje için case yok.")
-
-    st.divider()
-    st.subheader("Yeni Verification Case Oluştur")
-    with st.form("create_case"):
-        period_year = st.number_input("Period year", min_value=2020, max_value=2100, value=2025, step=1)
-        facility_id = st.number_input("Facility ID (opsiyonel)", min_value=0, value=0, step=1)
-        verifier_org = st.text_input("Verifier org (opsiyonel)", value="")
-        create = st.form_submit_button("Case oluştur", type="primary")
-
-    if create:
-        try:
-            create_case(
-                user,
-                project_id=int(project_id),
-                facility_id=(int(facility_id) if int(facility_id) != 0 else None),
-                period_year=int(period_year),
-                verifier_org=verifier_org,
-            )
-            st.success("Verification case oluşturuldu.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Case oluşturulamadı: {e}")
+        st.info("Read-only mod: finding ekleme kapalı.")
