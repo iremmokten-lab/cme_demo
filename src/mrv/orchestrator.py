@@ -282,6 +282,9 @@ def run_orchestrator(
         allocation_basis=str(cbam_cfg.get("allocation_basis", "quantity") or "quantity"),
         allocation_by_sku=allocation_by_sku,
         allocation_meta=allocation_meta,
+        carbon_price_paid_eur_per_t=float(cbam_cfg.get("carbon_price_paid_eur_per_t") or 0.0),
+        carbon_price_paid_amount_eur=(float(cbam_cfg.get("carbon_price_paid_amount_eur")) if cbam_cfg.get("carbon_price_paid_amount_eur") not in (None, "") else None),
+        carbon_price_paid_currency=str(cbam_cfg.get("carbon_price_paid_currency") or "EUR"),
     )
     cbam_table = cbam_df.to_dict(orient="records") if cbam_df is not None and len(cbam_df) > 0 else []
 
