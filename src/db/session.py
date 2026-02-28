@@ -1,48 +1,42 @@
-from __future__ import annotations
-
 import os
-from contextlib import contextmanager
+from pathlib import Path
 
 from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import sessionmaker
 
-DB_URL = os.getenv("DB_URL", "sqlite:///./data/app.db")
+DB_PATH = os.getenv("CME_DB_PATH", "/tmp/cme_demo.db")
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-# SQLite için check_same_thread=False gerekli olabilir (Streamlit multipage)
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
 engine = create_engine(
-    DB_URL,
-    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {},
-    echo=False,
-    future=True,
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
 )
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-Base = declarative_base()
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
-@contextmanager
 def db():
-    s = SessionLocal()
-    try:
-        yield s
-        s.commit()
-    except Exception:
-        s.rollback()
-        raise
-    finally:
-        s.close()
+    return SessionLocal()
 
 
 def init_db():
-    # Base import side-effects: models must be imported
-    from src.db import models  # noqa: F401
+    # Base tablolar
+    from src.db.models import Base
+
+    # CN Registry tabloları (metadata içine dahil olsun diye import)
+    try:
+        import src.db.cbam_registry  # noqa: F401
+    except Exception:
+        pass
 
     Base.metadata.create_all(bind=engine)
 
-    # migration-like stabilization
+    # Faz 2: migration-like stabilization (SQLite)
     try:
         from src.db.migrations import run_migrations
 
-        run_migrations()
+        run_migrations(engine)
     except Exception:
         pass
