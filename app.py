@@ -5,12 +5,17 @@ import streamlit as st
 from src.db.session import init_db
 from src.mrv.audit import append_audit, infer_company_id_for_user
 from src.services.authz import current_user, ensure_bootstrap_admin, login_view, logout_button
+from src.config import TR_ETS_MODE
 
 st.set_page_config(page_title="CME Demo", layout="wide")
 
 # DB init + bootstrap
 init_db()
 ensure_bootstrap_admin()
+
+# Mod
+st.sidebar.markdown('### Mod')
+st.sidebar.write('TR ETS Modu: ' + ('✅ Açık' if TR_ETS_MODE else '❌ Kapalı'))
 
 user = current_user()
 if not user:
