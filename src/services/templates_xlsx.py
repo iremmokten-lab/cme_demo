@@ -10,12 +10,14 @@ def build_mrv_template_xlsx() -> bytes:
 
     ws = wb.active
     ws.title = "README"
-    ws.append(["CME Demo — MRV Excel Template"])
+    ws.append(["CME Demo — MRV Excel Template (Faz 2)"])
     ws.append([""])
-    ws.append(["Bu dosya Streamlit demo ingestion için hazırlanmıştır."])
     ws.append(["Sheet isimleri: energy, production, materials"])
     ws.append(["Kolon adlarını mümkünse değiştirmeyin. Tarih formatı: YYYY-MM"])
-    ws.append(["Not: Bu template, demo ingestion şeması ile uyumludur."])
+    ws.append([""])
+    ws.append(["energy kolonları: month, facility_id, fuel_type, fuel_quantity, fuel_unit"])
+    ws.append(["production kolonları: month, facility_id, sku, cn_code, quantity, unit, export_to_eu_quantity"])
+    ws.append(["materials kolonları: sku, material_name, material_quantity, material_unit, emission_factor"])
 
     ws_e = wb.create_sheet("energy")
     ws_e.append(["month", "facility_id", "fuel_type", "fuel_quantity", "fuel_unit"])
