@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-"""Phase 3 — Benchmark & Outlier Detection
+"""Faz 3 — Benchmark & Outlier Detection
 
-Amaç:
-- Facility / product intensity benchmark (tCO2 / output)
+Kapsam:
+- Facility / ürün yoğunluğu benchmark (tCO2 / ton)
 - Basit outlier tespiti (z-score + IQR)
 
 Notlar:
-- Harici veri kaynağı yok (demo). Benchmarks deterministik fallback tablolar.
-- Sonuçlar snapshot.results_json["ai"]["benchmark"] altında saklanır.
+- Harici veri kaynağı yok (demo). Benchmarks deterministik fallback tablodur.
+- Çıktılar snapshot.results_json["ai"]["benchmark"] altında saklanır.
+- Motor çıktısı farklı anahtarlar kullanabilir; cbam_table / cbam.product_lines her ikisini de tolere eder.
 """
 
 import math
@@ -30,32 +31,14 @@ def _norm(s: Any) -> str:
 
 
 # Demo benchmark catalog (tCO2 per ton product)
-# Değerler: tamamen DEMO / placeholder. Faz 3'te dış veri ile güncellenecek.
+# Değerler: demo / placeholder.
 _BENCHMARK_TCO2_PER_TON: Dict[str, Dict[str, float]] = {
-    # sector -> cbam_good_key -> intensity
-    "iron_steel": {
-        "iron_steel": 1.9,
-        "other": 2.1,
-    },
-    "aluminium": {
-        "aluminium": 8.0,
-        "other": 7.5,
-    },
-    "cement": {
-        "cement": 0.75,
-        "other": 0.8,
-    },
-    "fertilizers": {
-        "fertilizers": 2.6,
-        "other": 2.2,
-    },
-    "chemicals": {
-        "chemicals": 1.2,
-        "other": 1.0,
-    },
-    "default": {
-        "other": 1.5,
-    },
+    "iron_steel": {"iron_steel": 1.9, "other": 2.1},
+    "aluminium": {"aluminium": 8.0, "other": 7.5},
+    "cement": {"cement": 0.75, "other": 0.8},
+    "fertilizers": {"fertilizers": 2.6, "other": 2.2},
+    "chemicals": {"chemicals": 1.2, "other": 1.0},
+    "default": {"other": 1.5},
 }
 
 
@@ -126,81 +109,94 @@ class OutlierFlag:
         }
 
 
+def _iter_product_rows(cbam: Dict[str, Any], cbam_table: Any) -> List[Dict[str, Any]]:
+    """Motorun iki olası formatını normalize eder."""
+    rows: List[Dict[str, Any]] = []
+
+    if isinstance(cbam_table, list):
+        for r in cbam_table:
+            if isinstance(r, dict):
+                rows.append(r)
+
+    pl = None
+    if isinstance(cbam, dict):
+        pl = cbam.get("product_lines")
+        if pl is None:
+            pl = cbam.get("products")
+    if isinstance(pl, list):
+        for r in pl:
+            if isinstance(r, dict):
+                rows.append(r)
+
+    return rows
+
+
 def build_benchmark_report(
     *,
-    facility: Dict[str, Any],
-    kpis: Dict[str, Any],
-    cbam: Dict[str, Any],
+    facility: Dict[str, Any] | None,
+    kpis: Dict[str, Any] | None,
+    cbam: Dict[str, Any] | None,
+    cbam_table: Any = None,
 ) -> Dict[str, Any]:
     """Snapshot sonuçlarından benchmark raporu üretir."""
 
-    sector = str((facility or {}).get("sector", "") or "")
-    total_tco2 = _to_float((kpis or {}).get("total_tco2", 0.0), 0.0)
+    facility = facility or {}
+    kpis = kpis or {}
+    cbam = cbam or {}
 
-    # Facility intensity: total_tco2 / total production (ton)
+    sector = str(facility.get("sector", "") or "")
+    total_tco2 = _to_float(kpis.get("total_tco2", 0.0), 0.0)
+
     prod_total_ton = 0.0
-    try:
-        # cbam.product_lines: list of sku lines with quantity_kg or quantity_unit
-        lines = (cbam or {}).get("product_lines") or []
-        if isinstance(lines, list):
-            for ln in lines:
-                if not isinstance(ln, dict):
-                    continue
-                q_ton = _to_float(ln.get("quantity_ton"), 0.0)
-                if q_ton > 0:
-                    prod_total_ton += q_ton
-                else:
-                    # fallback: kg
-                    q_kg = _to_float(ln.get("quantity_kg"), 0.0)
-                    if q_kg > 0:
-                        prod_total_ton += q_kg / 1000.0
-    except Exception:
-        prod_total_ton = 0.0
-
-    facility_intensity = (total_tco2 / prod_total_ton) if prod_total_ton > 0 else None
-
-    # Product intensity benchmark
     product_rows: List[Dict[str, Any]] = []
-    outliers: List[OutlierFlag] = []
 
-    lines = (cbam or {}).get("product_lines") or []
     intensities: List[float] = []
     keys: List[str] = []
 
-    if isinstance(lines, list):
-        for ln in lines:
-            if not isinstance(ln, dict):
-                continue
-            sku = str(ln.get("sku", "") or "")
-            good_key = str(ln.get("cbam_good_key", ln.get("cbam_good", "other")) or "other")
-            embedded_tco2 = _to_float(ln.get("embedded_tco2", 0.0), 0.0)
-            q_ton = _to_float(ln.get("quantity_ton"), 0.0)
-            if q_ton <= 0:
-                q_kg = _to_float(ln.get("quantity_kg", 0.0), 0.0)
-                q_ton = q_kg / 1000.0 if q_kg > 0 else 0.0
-            intensity = (embedded_tco2 / q_ton) if q_ton > 0 else None
+    rows = _iter_product_rows(cbam, cbam_table)
+    for idx, r in enumerate(rows):
+        sku = str(r.get("sku") or r.get("product_code") or r.get("product") or "")
+        good_key = str(r.get("cbam_good_key") or r.get("cbam_good") or "other")
 
-            bench, bench_meta = _pick_benchmark(sector, good_key)
-            ratio = (float(intensity) / bench) if (intensity is not None and bench > 0) else None
+        q_ton = _to_float(r.get("quantity_ton"), 0.0)
+        if q_ton <= 0:
+            q_ton = _to_float(r.get("quantity"), 0.0)
+        if q_ton <= 0:
+            q_kg = _to_float(r.get("quantity_kg"), 0.0)
+            if q_kg > 0:
+                q_ton = q_kg / 1000.0
 
-            product_rows.append(
-                {
-                    "sku": sku,
-                    "cbam_good_key": _norm(good_key) or "other",
-                    "quantity_ton": q_ton,
-                    "embedded_tco2": embedded_tco2,
-                    "intensity_tco2_per_ton": intensity,
-                    "benchmark_tco2_per_ton": bench,
-                    "benchmark_meta": bench_meta,
-                    "ratio_to_benchmark": ratio,
-                }
-            )
+        prod_total_ton += max(0.0, q_ton)
 
-            if intensity is not None and q_ton > 0:
-                intensities.append(float(intensity))
-                keys.append(sku or f"line_{len(keys)+1}")
+        embedded_tco2 = _to_float(r.get("embedded_tco2"), 0.0)
+        if embedded_tco2 <= 0:
+            embedded_tco2 = _to_float(r.get("embedded_emissions_tco2"), 0.0)
 
-    # Outlier detection across product intensities
+        intensity = (embedded_tco2 / q_ton) if q_ton > 0 else None
+
+        bench, bench_meta = _pick_benchmark(sector, good_key)
+        ratio = (float(intensity) / bench) if (intensity is not None and bench > 0) else None
+
+        product_rows.append(
+            {
+                "sku": sku,
+                "cbam_good_key": _norm(good_key) or "other",
+                "quantity_ton": q_ton,
+                "embedded_tco2": embedded_tco2,
+                "intensity_tco2_per_ton": intensity,
+                "benchmark_tco2_per_ton": bench,
+                "benchmark_meta": bench_meta,
+                "ratio_to_benchmark": ratio,
+            }
+        )
+
+        if intensity is not None and q_ton > 0:
+            intensities.append(float(intensity))
+            keys.append(sku or f"line_{idx+1}")
+
+    facility_intensity = (total_tco2 / prod_total_ton) if prod_total_ton > 0 else None
+
+    outliers: List[OutlierFlag] = []
     if intensities:
         z = _zscore(intensities)
         lo, hi = _iqr_bounds(intensities)
@@ -227,7 +223,6 @@ def build_benchmark_report(
                     )
                 )
 
-    # Facility benchmark compare (aggregate)
     facility_bench, facility_bench_meta = _pick_benchmark(sector, "other")
     facility_ratio = (float(facility_intensity) / facility_bench) if (facility_intensity is not None and facility_bench > 0) else None
 
@@ -237,11 +232,16 @@ def build_benchmark_report(
                 id="facility_intensity_high",
                 severity="warn" if facility_ratio < 2.5 else "critical",
                 message="Tesis yoğunluğu benchmark'a göre yüksek.",
-                meta={"facility_intensity": facility_intensity, "benchmark": facility_bench, "ratio": facility_ratio, "meta": facility_bench_meta},
+                meta={
+                    "facility_intensity": facility_intensity,
+                    "benchmark": facility_bench,
+                    "ratio": facility_ratio,
+                    "meta": facility_bench_meta,
+                },
             )
         )
 
-    out = {
+    return {
         "facility": {
             "sector": sector,
             "total_tco2": total_tco2,
@@ -254,4 +254,3 @@ def build_benchmark_report(
         "products": product_rows,
         "outliers": [o.to_dict() for o in outliers],
     }
-    return out
