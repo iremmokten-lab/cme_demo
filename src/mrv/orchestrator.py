@@ -10,7 +10,8 @@ from src.db.models import Methodology, MonitoringPlan, Project
 from src.db.session import db
 from src.engine.allocation import allocate_product_emissions, allocation_map_from_df
 from src.engine.cbam import cbam_compute
-from src.engine.emissions import energy_emissions, resolve_factor_set_for_energy_df
+from src.engine.emissions import energy
+from src import config as app_config_emissions, resolve_factor_set_for_energy_df
 from src.engine.ets import ets_net_and_cost, ets_verification_payload
 from src.mrv.bundles import FactorRef, InputBundle, MonitoringPlanRef, PriceRef, QAFlag, ResultBundle
 from src.mrv.lineage import sha256_json
@@ -278,13 +279,12 @@ def run_orchestrator(
         production_df=production_df,
         energy_breakdown=energy_out,
         materials_df=materials_df,
-        eua_price_eur_per_t=price.eua_price_eur_per_t,
+        eua_price_eur_per_t=price.eua_price_eur_per_t or app_config.get_eu_ets_reference_price_eur_per_t(),
+        reporting_year=int(cbam_cfg.get('reporting_year') or app_config.get_cbam_reporting_year()),
+        carbon_price_paid_eur_per_t=float(cbam_cfg.get('carbon_price_paid_eur_per_t') or (config or {}).get('carbon_price_paid_eur_per_t') or 0.0),
         allocation_basis=str(cbam_cfg.get("allocation_basis", "quantity") or "quantity"),
         allocation_by_sku=allocation_by_sku,
         allocation_meta=allocation_meta,
-        carbon_price_paid_eur_per_t=float(cbam_cfg.get("carbon_price_paid_eur_per_t") or 0.0),
-        carbon_price_paid_amount_eur=(float(cbam_cfg.get("carbon_price_paid_amount_eur")) if cbam_cfg.get("carbon_price_paid_amount_eur") not in (None, "") else None),
-        carbon_price_paid_currency=str(cbam_cfg.get("carbon_price_paid_currency") or "EUR"),
     )
     cbam_table = cbam_df.to_dict(orient="records") if cbam_df is not None and len(cbam_df) > 0 else []
 
