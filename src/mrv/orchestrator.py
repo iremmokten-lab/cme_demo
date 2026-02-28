@@ -234,6 +234,7 @@ def run_orchestrator(
     # Core compute
     energy_out = energy_emissions(
         energy_df,
+        project_id=int(project_id),
         region=region or "TR",
         electricity_method=electricity_method,
         market_grid_factor_override=market_override_f,
@@ -412,3 +413,4 @@ def run_orchestrator(
     legacy_results["results_json"] = dict(legacy_results)
 
     return input_bundle, result_bundle, legacy_results
+
