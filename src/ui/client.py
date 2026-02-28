@@ -14,6 +14,7 @@ from src.mrv.audit import append_audit, infer_company_id_for_user, infer_company
 from src.services import projects as prj
 from src.services.exports import build_evidence_pack, build_xlsx_from_results
 from src.services.reporting import build_pdf
+from src.services.alerts import list_open_alerts_for_user
 
 
 def _read_results(snapshot: CalculationSnapshot) -> dict:
@@ -58,39 +59,31 @@ def _facility_name_for_snapshot(snapshot: CalculationSnapshot) -> str:
             return "-"
         if not getattr(p, "facility_id", None):
             return "(tesis yok)"
-        # facility adı projects service üzerinden daha iyi; burada basit fetch
-        from src.db.models import Facility
-
         with db() as s:
-            f = s.get(Facility, int(p.facility_id))
-        if not f:
-            return "-"
-        return f.name
+            from src.db.models import Facility
+
+            fac = s.get(Facility, int(p.facility_id))
+            return fac.name if fac else "(tesis yok)"
     except Exception:
         return "-"
 
 
-def _trend_dataframe(shared_snaps: list[CalculationSnapshot]) -> pd.DataFrame:
+def _trend_dataframe(snaps: list[CalculationSnapshot]) -> pd.DataFrame:
     rows = []
-    for sn in shared_snaps:
+    for sn in snaps:
         k = _snapshot_kpis(sn)
+        ts = getattr(sn, "created_at", None)
+        if not ts:
+            ts = datetime.utcnow()
         rows.append(
             {
-                "tarih": sn.created_at,
                 "snapshot_id": sn.id,
-                "direct_tco2": k["direct_tco2"],
-                "indirect_tco2": k["indirect_tco2"],
-                "total_tco2": k["total_tco2"],
-                "cbam_cost_eur": k["cbam_cost_eur"],
-                "ets_cost_tl": k["ets_cost_tl"],
+                "tarih": ts,
+                "tarih_str": str(ts)[:19],
+                **k,
             }
         )
-    df = pd.DataFrame(rows)
-    if len(df) == 0:
-        return df
-    df = df.sort_values("tarih")
-    # tarih stringleştirme (grafikler için)
-    df["tarih_str"] = df["tarih"].apply(lambda x: x.strftime("%Y-%m-%d") if hasattr(x, "strftime") else str(x))
+    df = pd.DataFrame(rows).sort_values("tarih")
     return df
 
 
@@ -114,6 +107,24 @@ def client_app(user):
     if not snaps:
         st.info("Henüz paylaşılmış (👁️) snapshot yok. Danışmanınız paylaştığında burada görünecek.")
         return
+
+    # Alerts (Faz 2)
+    alerts = list_open_alerts_for_user(user, limit=50)
+    if alerts:
+        with st.expander(f"🚨 Açık Uyarılar ({len(alerts)})", expanded=False):
+            rows = []
+            for a in alerts:
+                rows.append(
+                    {
+                        "severity": getattr(a, "severity", ""),
+                        "başlık": getattr(a, "title", ""),
+                        "mesaj": getattr(a, "message", ""),
+                        "snapshot_id": getattr(a, "snapshot_id", None),
+                        "durum": getattr(a, "status", ""),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.divider()
 
     # Company KPIs (latest snapshot totals)
     latest = snaps[0]
@@ -149,7 +160,6 @@ def client_app(user):
 
     fac_rows = []
     for fac, items in by_fac.items():
-        # latest per facility
         items_sorted = sorted(items, key=lambda x: x.created_at, reverse=True)
         k = _snapshot_kpis(items_sorted[0])
         fac_rows.append(
@@ -166,175 +176,112 @@ def client_app(user):
 
     st.divider()
 
+    # Ürün Yoğunluğu / CBAM (Faz 2)
+    st.subheader("Ürün Yoğunluğu (İntensity) ve CBAM Özeti")
+    prod_rows = []
+    for sn in snaps[:200]:
+        r = _read_results(sn)
+        cbam = (r.get("cbam") or {}) if isinstance(r, dict) else {}
+        products = (cbam.get("products") or []) if isinstance(cbam, dict) else []
+        if not isinstance(products, list):
+            continue
+        for p in products:
+            try:
+                prod_rows.append(
+                    {
+                        "snapshot_id": sn.id,
+                        "tarih": str(getattr(sn, "created_at", "") or ""),
+                        "sku": p.get("sku") or p.get("product") or "",
+                        "cn_code": p.get("cn_code") or "",
+                        "quantity": float(p.get("quantity") or 0.0),
+                        "unit": p.get("unit") or "",
+                        "direct_tco2": float(p.get("direct_tco2") or 0.0),
+                        "indirect_tco2": float(p.get("indirect_tco2") or 0.0),
+                        "total_tco2": float(p.get("total_tco2") or 0.0),
+                        "intensity_tco2_per_unit": float(p.get("intensity_tco2_per_unit") or 0.0),
+                        "cbam_cost_eur": float(p.get("cbam_cost_eur") or 0.0),
+                    }
+                )
+            except Exception:
+                continue
+
+    if prod_rows:
+        prdf = pd.DataFrame(prod_rows)
+        latest_id = int(snaps[0].id)
+        ldf = prdf[prdf["snapshot_id"] == latest_id].copy()
+        ldf = ldf.sort_values(["cbam_cost_eur", "intensity_tco2_per_unit"], ascending=False)
+        st.dataframe(ldf, use_container_width=True)
+    else:
+        st.caption("Engine sonuçlarında CBAM ürün satırları yoksa bu tablo boş görünebilir.")
+    st.divider()
+
     # Snapshot list & compare
     st.subheader("Snapshot Karşılaştırma (Baseline vs Senaryo)")
     labels = []
     id_map = []
     for sn in snaps[:200]:
         r = _read_results(sn)
-        scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
-        kind = "Senaryo" if scen else "Baseline"
-        name = scen.get("name") if scen else ""
-        lock_tag = "🔒" if getattr(sn, "locked", False) else ""
-        chain_tag = "⛓️" if getattr(sn, "previous_snapshot_hash", None) else ""
-        fac = _facility_name_for_snapshot(sn)
-        labels.append(f"{lock_tag}{chain_tag} ID:{sn.id} • {fac} • {kind}{(' — ' + name) if name else ''} • {sn.created_at}")
-        id_map.append(sn.id)
+        tag = (r.get("scenario") or {}).get("name") if isinstance(r, dict) else ""
+        tag = f" • {tag}" if tag else ""
+        labels.append(f"#{sn.id}{tag} • {str(sn.created_at)[:19]}")
+        id_map.append(int(sn.id))
 
-    a, b = st.columns(2)
-    with a:
-        left_sel = st.selectbox("1. Snapshot", labels, index=0, key="cmp_left")
-    with b:
-        right_sel = st.selectbox("2. Snapshot", labels, index=min(1, len(labels) - 1), key="cmp_right")
+    colA, colB = st.columns(2)
+    with colA:
+        left = st.selectbox("Baseline", options=labels, index=min(0, len(labels) - 1))
+    with colB:
+        right = st.selectbox("Scenario", options=labels, index=min(1, len(labels) - 1) if len(labels) > 1 else 0)
 
-    left_id = id_map[labels.index(left_sel)]
-    right_id = id_map[labels.index(right_sel)]
+    sid_left = id_map[labels.index(left)]
+    sid_right = id_map[labels.index(right)]
 
     with db() as s:
-        left_snap = s.get(CalculationSnapshot, int(left_id))
-        right_snap = s.get(CalculationSnapshot, int(right_id))
+        s_left = s.get(CalculationSnapshot, int(sid_left))
+        s_right = s.get(CalculationSnapshot, int(sid_right))
 
-    if left_snap and right_snap:
-        append_audit(
-            "snapshot_compare_viewed",
-            {"left": left_snap.id, "right": right_snap.id},
-            user_id=getattr(user, "id", None),
-            company_id=company_id,
-            entity_type="snapshot_compare",
-            entity_id=None,
+    if s_left and s_right:
+        kL = _snapshot_kpis(s_left)
+        kR = _snapshot_kpis(s_right)
+
+        comp = pd.DataFrame(
+            [
+                {"metrik": "total_tco2", "baseline": kL["total_tco2"], "scenario": kR["total_tco2"], "delta": kR["total_tco2"] - kL["total_tco2"]},
+                {"metrik": "cbam_cost_eur", "baseline": kL["cbam_cost_eur"], "scenario": kR["cbam_cost_eur"], "delta": kR["cbam_cost_eur"] - kL["cbam_cost_eur"]},
+                {"metrik": "ets_cost_tl", "baseline": kL["ets_cost_tl"], "scenario": kR["ets_cost_tl"], "delta": kR["ets_cost_tl"] - kL["ets_cost_tl"]},
+            ]
         )
-
-        lk = _snapshot_kpis(left_snap)
-        rk = _snapshot_kpis(right_snap)
-
-        comp_rows = []
-        for key, label in [
-            ("total_tco2", "Toplam Emisyon (tCO2)"),
-            ("direct_tco2", "Direct (tCO2)"),
-            ("indirect_tco2", "Indirect (tCO2)"),
-            ("precursor_tco2", "Precursor (tCO2)"),
-            ("cbam_cost_eur", "CBAM (€)"),
-            ("ets_cost_tl", "ETS (TL)"),
-        ]:
-            comp_rows.append(
-                {
-                    "metrik": label,
-                    "A": lk[key],
-                    "B": rk[key],
-                    "fark (B-A)": rk[key] - lk[key],
-                }
-            )
-        st.dataframe(pd.DataFrame(comp_rows), use_container_width=True)
+        st.dataframe(comp, use_container_width=True)
 
         st.divider()
-
-        st.subheader("Raporlar")
-        rcol1, rcol2, rcol3 = st.columns(3)
-
-        def _download_pdf_for_snapshot(sn: CalculationSnapshot, title_suffix: str):
-            results = _read_results(sn)
-            try:
-                cfg = json.loads(sn.config_json or "{}")
-            except Exception:
-                cfg = {}
-            payload = {
-                "kpis": (results.get("kpis") or {}) if isinstance(results, dict) else {},
-                "config": cfg,
-                "cbam_table": results.get("cbam_table", []),
-                "scenario": results.get("scenario", {}),
-                "methodology": results.get("methodology", None),
-                "data_sources": [
-                    "energy.csv (yüklenen dosya)",
-                    "production.csv (yüklenen dosya)",
-                    "materials.csv (opsiyonel, precursor)",
-                    "EmissionFactor Library (DB)",
-                    "Monitoring Plan (DB, facility bazlı)",
-                ],
-                "formulas": [
-                    "Direct: fuel_quantity × NCV × EF × OF",
-                    "Indirect: electricity_kwh × grid_factor (location/market)",
-                    "Precursor: materials.material_quantity × materials.emission_factor",
-                ],
-            }
-            title = f"Rapor — {title_suffix}"
-            uri, sha = build_pdf(sn.id, title, payload)
-            # build_pdf returns uri; read from disk
-            from pathlib import Path
-
-            p = Path(str(uri))
-            data = p.read_bytes() if p.exists() else b""
-            return data, sha
-
-        with rcol1:
-            if st.button("A için PDF indir", type="primary", key="dl_pdf_a"):
-                data, sha = _download_pdf_for_snapshot(left_snap, f"Snapshot {left_snap.id}")
-                append_audit(
-                    "report_exported",
-                    {"snapshot_id": left_snap.id, "sha256": sha},
-                    user_id=getattr(user, "id", None),
-                    company_id=infer_company_id_for_snapshot(left_snap.id) or company_id,
-                    entity_type="report",
-                    entity_id=left_snap.id,
-                )
-                st.download_button("PDF indir (A)", data=data, file_name=f"snapshot_{left_snap.id}.pdf", mime="application/pdf", use_container_width=True)
-
-        with rcol2:
-            if st.button("B için PDF indir", type="primary", key="dl_pdf_b"):
-                data, sha = _download_pdf_for_snapshot(right_snap, f"Snapshot {right_snap.id}")
-                append_audit(
-                    "report_exported",
-                    {"snapshot_id": right_snap.id, "sha256": sha},
-                    user_id=getattr(user, "id", None),
-                    company_id=infer_company_id_for_snapshot(right_snap.id) or company_id,
-                    entity_type="report",
-                    entity_id=right_snap.id,
-                )
-                st.download_button("PDF indir (B)", data=data, file_name=f"snapshot_{right_snap.id}.pdf", mime="application/pdf", use_container_width=True)
-
-        with rcol3:
-            st.caption("Evidence Pack yalnızca kilitli (🔒) snapshot’lar için önerilir.")
-            target = left_snap if getattr(left_snap, "locked", False) else right_snap
-            if st.button(f"Evidence Pack indir (ID:{target.id})", type="primary" if getattr(target, "locked", False) else "secondary", key="dl_ep"):
-                ep = build_evidence_pack(target.id)
-                append_audit(
-                    "evidence_exported",
-                    {"snapshot_id": target.id},
-                    user_id=getattr(user, "id", None),
-                    company_id=infer_company_id_for_snapshot(target.id) or company_id,
-                    entity_type="evidence_pack",
-                    entity_id=target.id,
-                )
+        st.subheader("Raporlama / Export")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("Evidence Pack indir", type="primary"):
+                data = build_evidence_pack(int(s_left.id))
                 st.download_button(
                     "Evidence Pack ZIP indir",
-                    data=ep,
-                    file_name=f"evidence_pack_snapshot_{target.id}.zip",
+                    data=data,
+                    file_name=f"evidence_pack_snapshot_{s_left.id}.zip",
                     mime="application/zip",
                     use_container_width=True,
-                    type="primary" if getattr(target, "locked", False) else "secondary",
                 )
-
-        st.divider()
-        st.subheader("Excel")
-        x1, x2 = st.columns(2)
-        with x1:
-            xlsx_a = build_xlsx_from_results(left_snap.results_json or "{}")
-            if st.download_button("XLSX indir (A)", data=xlsx_a, file_name=f"snapshot_{left_snap.id}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True):
-                append_audit(
-                    "xlsx_exported",
-                    {"snapshot_id": left_snap.id},
-                    user_id=getattr(user, "id", None),
-                    company_id=infer_company_id_for_snapshot(left_snap.id) or company_id,
-                    entity_type="xlsx",
-                    entity_id=left_snap.id,
+        with c2:
+            if st.button("XLSX indir"):
+                x = build_xlsx_from_results(int(s_left.id))
+                st.download_button(
+                    "XLSX indir",
+                    data=x,
+                    file_name=f"results_snapshot_{s_left.id}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
                 )
-        with x2:
-            xlsx_b = build_xlsx_from_results(right_snap.results_json or "{}")
-            if st.download_button("XLSX indir (B)", data=xlsx_b, file_name=f"snapshot_{right_snap.id}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True):
-                append_audit(
-                    "xlsx_exported",
-                    {"snapshot_id": right_snap.id},
-                    user_id=getattr(user, "id", None),
-                    company_id=infer_company_id_for_snapshot(right_snap.id) or company_id,
-                    entity_type="xlsx",
-                    entity_id=right_snap.id,
+        with c3:
+            if st.button("PDF indir"):
+                pdf = build_pdf(int(s_left.id))
+                st.download_button(
+                    "PDF indir",
+                    data=pdf,
+                    file_name=f"report_snapshot_{s_left.id}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
                 )
