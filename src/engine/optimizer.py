@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-"""Phase 3 — Optimizer (deterministic, constraint-based-lite)
+"""Faz 3 — Optimizer (deterministic)
 
 Kapsam:
 - Abatement cost curve (MACC) üretimi
-- Basit constraint-based seçim (greedy):
-  - hedef azaltım (tCO2)
+- Basit portföy seçimi (greedy):
+  - hedef azaltım (% veya tCO2)
   - max CAPEX
 
 Not:
-- Harici solver bağımlılığı yok (Streamlit Cloud için).
+- Harici solver yok (Streamlit Cloud uyumlu).
 - Deterministik: stable sort + id tie-break.
 """
 
@@ -37,7 +37,6 @@ class Option:
     notes: str = ""
 
     def annualized_cost_eur(self, discount_rate: float = 0.08) -> float:
-        """CAPEX'i yıllık eşdeğer maliyete çevir."""
         r = float(discount_rate)
         n = max(1, int(self.lifetime_years))
         if self.capex_eur <= 0:
@@ -105,8 +104,6 @@ def optimize_portfolio(
     max_capex_eur: float | None,
     discount_rate: float = 0.08,
 ) -> Dict[str, Any]:
-    """Greedy optimization."""
-
     opts = list(options or [])
 
     for o in opts:
@@ -169,10 +166,15 @@ def build_optimizer_payload(
 
     options = build_options_from_measures(measures, total_tco2)
     curve = compute_abatement_curve(options, discount_rate=disc)
+
+    capex_val = None
+    if capex_max is not None and str(capex_max).strip() != "":
+        capex_val = _to_float(capex_max, 0.0)
+
     portfolio = optimize_portfolio(
         options,
         target_reduction_tco2=target_t,
-        max_capex_eur=(_to_float(capex_max, 0.0) if capex_max is not None and str(capex_max).strip() != "" else None),
+        max_capex_eur=capex_val,
         discount_rate=disc,
     )
 
