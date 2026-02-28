@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+from src.mrv.data_quality_engine import anomaly_checks, completeness_checks
+
 
 def _norm(s: Any) -> str:
     return str(s or "").strip().lower().replace(" ", "_")
@@ -34,65 +36,38 @@ def validate_csv(dataset_type: str, df: pd.DataFrame) -> list[str]:
 
     if dtype == "energy":
         required_row = {"month", "facility_id", "fuel_type", "fuel_quantity", "fuel_unit"}
-        legacy_min = {"month", "facility_id"}
-        legacy_any = {"natural_gas_m3", "electricity_kwh", "diesel_l", "coal_kg"}
+        legacy_min = {"month", "facility_id", "fuel", "quantity"}
+        if not (required_row.issubset(cols) or legacy_min.issubset(cols)):
+            errors.append("Energy şeması bekleniyor: month, facility_id, fuel_type/fuel, fuel_quantity/quantity, fuel_unit.")
+    elif dtype == "production":
+        required_row = {"month", "facility_id", "product_code", "quantity", "unit"}
+        legacy_min = {"month", "facility_id", "product", "quantity"}
+        if not (required_row.issubset(cols) or legacy_min.issubset(cols)):
+            errors.append("Production şeması bekleniyor: month, facility_id, product_code/product, quantity, unit.")
+    elif dtype == "materials":
+        required_row = {"month", "facility_id", "material", "quantity", "unit"}
+        if not required_row.issubset(cols):
+            errors.append("Materials şeması bekleniyor: month, facility_id, material, quantity, unit.")
+    else:
+        # esnek
+        if "month" not in cols:
+            errors.append("Şema kontrolü: 'month' kolonu bulunamadı.")
 
-        if _has_cols(df, required_row):
-            col = [c for c in df.columns if _norm(c) == "fuel_quantity"][0]
-            if not _is_numeric_series(df[col]):
-                errors.append("energy.csv: fuel_quantity sayısal olmalı.")
-            return errors
-
-        if _has_cols(df, legacy_min) and any(c in cols for c in legacy_any):
-            return errors
-
-        errors.append(
-            "energy.csv şeması tanınmadı. Beklenen kolonlar:\n"
-            "- Yeni şema: month, facility_id, fuel_type, fuel_quantity, fuel_unit\n"
-            "- Legacy: month, facility_id ve (natural_gas_m3 veya electricity_kwh vb.)"
-        )
-        return errors
-
-    if dtype == "production":
-        required = {"month", "facility_id", "sku", "cn_code", "quantity", "unit", "export_to_eu_quantity"}
-        missing = sorted(list(required - cols))
-        if missing:
-            errors.append(f"production.csv eksik kolon(lar): {', '.join(missing)}")
-
-        if "quantity" in cols:
-            col = [c for c in df.columns if _norm(c) == "quantity"][0]
-            if not _is_numeric_series(df[col]):
-                errors.append("production.csv: quantity sayısal olmalı.")
-        if "export_to_eu_quantity" in cols:
-            col = [c for c in df.columns if _norm(c) == "export_to_eu_quantity"][0]
-            if not _is_numeric_series(df[col]):
-                errors.append("production.csv: export_to_eu_quantity sayısal olmalı.")
-        return errors
-
-    if dtype == "materials":
-        required = {"sku", "material_name", "material_quantity", "material_unit", "emission_factor"}
-        missing = sorted(list(required - cols))
-        if missing:
-            errors.append(f"materials.csv eksik kolon(lar): {', '.join(missing)}")
-
-        if "material_quantity" in cols:
-            col = [c for c in df.columns if _norm(c) == "material_quantity"][0]
-            if not _is_numeric_series(df[col]):
-                errors.append("materials.csv: material_quantity sayısal olmalı.")
-        if "emission_factor" in cols:
-            col = [c for c in df.columns if _norm(c) == "emission_factor"][0]
-            if not _is_numeric_series(df[col]):
-                errors.append("materials.csv: emission_factor sayısal olmalı.")
-        return errors
-
-    return [f"Dataset tipi tanınmadı: {dataset_type}"]
+    return errors
 
 
 def data_quality_assess(dataset_type: str, df: pd.DataFrame) -> tuple[int, dict]:
-    """Basit data quality skoru:
-    - Eksik değer oranı
-    - Tip uygunluğu
-    - Basit outlier IQR
+    """Regülasyon-grade Data Quality skorlaması (baseline).
+
+    Kapsam:
+      - missingness
+      - schema
+      - outliers (IQR)
+      - completeness checks (missing months/products/fuels)
+      - anomaly checks (numeric spikes/outliers)
+
+    Not: Cross-check (production vs energy) hesaplaması upload bazında tek dataset ile sınırlı,
+    tam cross-check orchestrator/compliance safhasında yapılır.
     """
     dtype = _norm(dataset_type)
     report: dict = {"dataset_type": dtype, "checks": []}
@@ -118,20 +93,19 @@ def data_quality_assess(dataset_type: str, df: pd.DataFrame) -> tuple[int, dict]
     else:
         add_check("missingness", "pass", {"missing_ratio": miss_ratio}, penalty=0)
 
-    # Schema validation
+    # Schema
     errs = validate_csv(dtype, df)
     if errs:
         add_check("schema", "fail", {"errors": errs[:10]}, penalty=35)
     else:
         add_check("schema", "pass", {"errors": []}, penalty=0)
 
-    # Simple outlier check for numeric columns
+    # Numeric outliers (IQR)
     df2 = df.copy()
     numeric_cols = []
     for c in df2.columns:
         try:
-            s = df2[c]
-            if _is_numeric_series(s):
+            if _is_numeric_series(df2[c]):
                 numeric_cols.append(c)
         except Exception:
             continue
@@ -149,10 +123,22 @@ def data_quality_assess(dataset_type: str, df: pd.DataFrame) -> tuple[int, dict]
         lower = q1 - 3.0 * iqr
         upper = q3 + 3.0 * iqr
         outlier_count += int(((vals < lower) | (vals > upper)).sum())
+
     if outlier_count > 0:
         add_check("outliers_iqr", "warn", {"outlier_count": outlier_count}, penalty=min(10, 3 + outlier_count // 10))
     else:
         add_check("outliers_iqr", "pass", {"outlier_count": 0}, penalty=0)
+
+    # Completeness + anomalies
+    for chk in completeness_checks(dtype, df):
+        stt = str(chk.get("status") or "pass")
+        pen = 25 if stt == "fail" else (10 if stt == "warn" else 0)
+        add_check(str(chk.get("id") or "completeness"), stt, chk.get("details") or {}, penalty=pen)
+
+    for chk in anomaly_checks(dtype, df):
+        stt = str(chk.get("status") or "pass")
+        pen = 15 if stt == "fail" else (5 if stt == "warn" else 0)
+        add_check(str(chk.get("id") or "anomaly"), stt, chk.get("details") or {}, penalty=pen)
 
     score = max(0, min(100, 100 - penalties))
     report["score"] = int(score)
