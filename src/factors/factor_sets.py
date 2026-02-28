@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from src.db.models import FactorSet
 from src.db.session import db
+from src.db.models import FactorSet
 
 
 def lock_factor_set(factor_set_id: int, user_id: int | None = None) -> FactorSet:
@@ -19,8 +19,3 @@ def lock_factor_set(factor_set_id: int, user_id: int | None = None) -> FactorSet
         s.commit()
         s.refresh(fs)
         return fs
-
-
-def ensure_factor_set_not_locked(fs: FactorSet):
-    if fs.locked:
-        raise ValueError("Bu factor set kilitli. Değiştirilemez.")
