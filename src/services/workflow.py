@@ -182,6 +182,20 @@ def run_full(
     if materials_u and str(getattr(materials_u, "storage_uri", "") or ""):
         materials_df = load_csv_from_uri(str(getattr(materials_u, "storage_uri", "") or ""))
 
+    # Sampling universe / reg-grade audit readiness: satır sayıları (deterministik snapshot ref içine eklenir)
+    try:
+        input_hashes["energy_rows"] = int(len(energy_df))
+    except Exception:
+        input_hashes["energy_rows"] = 0
+    try:
+        input_hashes["production_rows"] = int(len(prod_df))
+    except Exception:
+        input_hashes["production_rows"] = 0
+    try:
+        input_hashes["materials_rows"] = int(len(materials_df)) if materials_df is not None else 0
+    except Exception:
+        input_hashes["materials_rows"] = 0
+
     input_bundle, result_bundle, legacy_results = run_orchestrator(
         project_id=int(project_id),
         config=(config or {}),
