@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple, Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -62,10 +63,7 @@ _REGISTRY_CACHE: dict = {
 
 
 def _load_registry_rows() -> List[dict]:
-    """DB’den aktif mappingleri çeker.
-
-    Import başarısızsa sessizce fallback’e döner.
-    """
+    """DB’den aktif mappingleri çeker. Import başarısızsa sessizce fallback’e döner."""
     global _REGISTRY_CACHE
 
     if _REGISTRY_CACHE.get("loaded"):
@@ -130,8 +128,9 @@ def _registry_match(cn: str) -> Optional[dict]:
         elif mt == "prefix" and cn.startswith(pat):
             prefix_hits.append(r)
 
-    def _rank_key(r: dict):
-        return (int(r.get("priority", 100) or 100), len(r.get("cn_pattern", "") or ""))
+    def _rank_key(rr: dict):
+        # priority büyük olan öncelikli; pattern uzunluğu da tie-breaker
+        return (int(rr.get("priority", 100) or 100), len(rr.get("cn_pattern", "") or ""))
 
     if exact_hits:
         exact_hits.sort(key=_rank_key, reverse=True)
@@ -245,17 +244,19 @@ def cbam_compute(
     allocation_by_sku: dict | None = None,
     allocation_meta: dict | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    """CBAM hesap (FAZ 1 genişletilmiş).
+    """CBAM hesap (FAZ 1.1 + 1.3 uyumlu).
 
-    - Direct emissions: enerji_breakdown.direct_tco2
-    - Indirect emissions: enerji_breakdown.indirect_tco2
-    - Precursor: materials.csv’den sku bazlı
-    - SKU → CN → Goods mapping (DB registry öncelikli)
-    - Ürün bazlı embedded emissions + export allocation
+    Direct/Indirect:
+      - energy_breakdown.direct_tco2 / indirect_tco2
+      - allocation_by_sku verilmişse (allocation engine) satırların direct/indirect payı buradan gelir.
+      - verilmemişse legacy allocation_basis: quantity veya export
 
-    Allocation:
-      - allocation_by_sku verilirse direct/indirect dağılımı oradan alınır (allocation engine).
-      - verilmezse legacy allocation_basis ile quantity/export share üzerinden dağıtılır.
+    Precursor:
+      - materials.csv üzerinden sku bazlı precursor_tco2
+
+    Çıktı:
+      - cbam_table (satır bazında)
+      - totals (goods_summary dahil)
     """
     if production_df is None or len(production_df) == 0:
         empty = pd.DataFrame(
@@ -332,7 +333,6 @@ def cbam_compute(
 
     # Allocation
     if allocation_by_sku and isinstance(allocation_by_sku, dict):
-        # SKU bazında map: {sku:{direct_alloc_tco2, indirect_alloc_tco2}}
         df["direct_alloc_tco2"] = 0.0
         df["indirect_alloc_tco2"] = 0.0
         for i, r in df.iterrows():
@@ -341,23 +341,17 @@ def cbam_compute(
             df.at[i, "direct_alloc_tco2"] = float((m or {}).get("direct_alloc_tco2", 0.0) or 0.0)
             df.at[i, "indirect_alloc_tco2"] = float((m or {}).get("indirect_alloc_tco2", 0.0) or 0.0)
 
-        # Eğer aynı sku birden fazla satırsa, aynı allocation tekrar yazılmış olur.
-        # Bu durumda embedded satır bazında şişebilir. Çözüm: sku bazında aggregate edip tekrar dağıt.
-        # Basit deterministik yaklaşım: sku bazında allocation'ı satır içindeki quantity payına göre böl.
+        # Aynı sku birden fazla satırsa allocation tekrar yazılır; satır bazında quantity payı ile böl.
         sku_counts = df.groupby("sku")["sku"].transform("count")
         if (sku_counts > 1).any():
-            # sku bazında quantity payı ile dağıt
             q = df["quantity"].clip(lower=0.0)
             qsum = df.groupby("sku")["quantity"].transform("sum").replace(0.0, np.nan)
             share = (q / qsum).fillna(0.0)
-
-            # önce sku bazında unique allocation değerini al
             uniq_direct = df.groupby("sku")["direct_alloc_tco2"].transform("max")
             uniq_indirect = df.groupby("sku")["indirect_alloc_tco2"].transform("max")
             df["direct_alloc_tco2"] = uniq_direct * share
             df["indirect_alloc_tco2"] = uniq_indirect * share
     else:
-        # Legacy allocation weights
         basis = _norm(allocation_basis)
         if basis == "export":
             alloc_base = df["export_to_eu_quantity"].clip(lower=0.0)
@@ -389,7 +383,7 @@ def cbam_compute(
     # Embedded
     df["embedded_tco2"] = df["direct_alloc_tco2"] + df["indirect_alloc_tco2"] + df["precursor_tco2"]
 
-    # Export share
+    # Export share: EU export / produced
     df["eu_export_qty"] = df["export_to_eu_quantity"].clip(lower=0.0)
     qty_pos = df["quantity"].clip(lower=0.0)
 
@@ -398,7 +392,7 @@ def cbam_compute(
         df.loc[qty_pos > 0.0, "eu_export_qty"] / df.loc[qty_pos > 0.0, "quantity"]
     ).clip(0.0, 1.0)
 
-    # CBAM cost signal
+    # CBAM cost signal (MVP)
     df["covered_and_export"] = (df["cbam_covered_calc"] == True) & (df["eu_export_qty"] > 0.0)
     df["cbam_cost_eur"] = 0.0
     df.loc[df["covered_and_export"], "cbam_cost_eur"] = (
@@ -432,16 +426,15 @@ def cbam_compute(
 
     table = table.rename(columns={"cbam_covered_calc": "cbam_covered"})
 
-    gs = (
+    goods_summary = (
         table.groupby(["cbam_good"], dropna=False)[
             ["embedded_tco2", "cbam_cost_eur", "direct_alloc_tco2", "indirect_alloc_tco2", "precursor_tco2"]
         ]
         .sum()
         .reset_index()
         .sort_values("embedded_tco2", ascending=False)
+        .to_dict(orient="records")
     )
-
-    goods_summary = gs.to_dict(orient="records")
 
     totals = {
         "embedded_tco2": float(table["embedded_tco2"].sum()),
@@ -456,7 +449,6 @@ def cbam_compute(
         "notes": [
             "CN→CBAM goods eşlemesi: Önce DB registry, yoksa fallback prefix kuralları kullanılır.",
             "CBAM maliyet sinyali (MVP): embedded_tCO2 × EUA(€/t) × export_share (EU export / total production).",
-            "FAZ 1: allocation engine aktifse direct/indirect dağılımı sku bazında kilitlenmiş allocation_hash ile takip edilir.",
         ],
     }
 
