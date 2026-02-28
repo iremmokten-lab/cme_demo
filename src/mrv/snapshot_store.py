@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from sqlalchemy import select
 
@@ -28,10 +28,6 @@ def compute_input_hash(
     factor_set_ref: list[dict] | None,
     monitoring_plan_ref: dict | None,
 ) -> str:
-    """
-    Deterministic input-hash:
-    Aynı config + input dataset hashleri + senaryo + metodoloji + factor lock => aynı input_hash.
-    """
     payload = {
         "engine_version": str(engine_version or ""),
         "config": config or {},
@@ -77,9 +73,6 @@ def save_snapshot(
     shared_with_client: bool = False,
     lock_after_create: bool = False,
 ) -> CalculationSnapshot:
-    """
-    DB'ye snapshot kaydeder. lock_after_create=True ise immutable kilitler.
-    """
     prev_hash = _previous_snapshot_hash(project_id)
 
     with db() as s:
@@ -119,7 +112,7 @@ def get_snapshot(snapshot_id: int) -> CalculationSnapshot | None:
 
 
 def snapshot_payload(snapshot_id: int) -> Dict[str, Any]:
-    snap = get_snapshot(snapshot_id)
+    snap = get_snapshot(int(snapshot_id))
     if not snap:
         raise ValueError("Snapshot bulunamadı.")
     return {
