@@ -2,33 +2,16 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List
 
 from sqlalchemy import select
 
-from src.db.models import VerificationCase, VerificationFinding, CalculationSnapshot, Project
 from src.db.session import db
+from src.db.models import VerificationCase, VerificationFinding
 
 
-def _safe_json_loads(s: str, default):
-    try:
-        return json.loads(s or "")
-    except Exception:
-        return default
-
-
-def create_case(
-    *,
-    project_id: int,
-    facility_id: int | None,
-    period_year: int,
-    snapshot_id: int | None,
-    title: str,
-    description: str,
-    created_by_user_id: int | None = None,
-) -> VerificationCase:
+def create_case(*, project_id: int, facility_id: int | None, period_year: int, snapshot_id: int | None, title: str, description: str, verifier_org: str = "", created_by_user_id: int | None = None) -> VerificationCase:
     with db() as s:
-        case = VerificationCase(
+        c = VerificationCase(
             project_id=int(project_id),
             facility_id=int(facility_id) if facility_id is not None else None,
             period_year=int(period_year),
@@ -36,25 +19,17 @@ def create_case(
             status="open",
             title=str(title or "Verification Case"),
             description=str(description or ""),
+            verifier_org=str(verifier_org or ""),
             sampling_json=json.dumps({}, ensure_ascii=False),
             created_by_user_id=int(created_by_user_id) if created_by_user_id is not None else None,
         )
-        s.add(case)
+        s.add(c)
         s.commit()
-        s.refresh(case)
-        return case
+        s.refresh(c)
+        return c
 
 
-def list_cases(project_id: int) -> list[VerificationCase]:
-    with db() as s:
-        return (
-            s.execute(select(VerificationCase).where(VerificationCase.project_id == int(project_id)).order_by(VerificationCase.created_at.desc()))
-            .scalars()
-            .all()
-        )
-
-
-def add_sampling_plan(case_id: int, sampling_plan: dict, user_id: int | None = None) -> VerificationCase:
+def add_sampling_plan(case_id: int, sampling_plan: dict) -> VerificationCase:
     with db() as s:
         c = s.get(VerificationCase, int(case_id))
         if not c:
@@ -65,17 +40,7 @@ def add_sampling_plan(case_id: int, sampling_plan: dict, user_id: int | None = N
         return c
 
 
-def add_finding(
-    *,
-    case_id: int,
-    severity: str,
-    title: str,
-    description: str,
-    evidence_ref: str = "",
-    corrective_action: str = "",
-    action_due_date: str = "",
-    created_by_user_id: int | None = None,
-) -> VerificationFinding:
+def add_finding(*, case_id: int, severity: str, title: str, description: str, evidence_ref: str = "", corrective_action: str = "", action_due_date: str = "", created_by_user_id: int | None = None) -> VerificationFinding:
     with db() as s:
         f = VerificationFinding(
             case_id=int(case_id),
@@ -118,6 +83,12 @@ def export_case_json(case_id: int) -> dict:
             .all()
         )
 
+    def _safe_load(sv: str | None, default):
+        try:
+            return json.loads(sv or "")
+        except Exception:
+            return default
+
     return {
         "case": {
             "id": int(c.id),
@@ -128,7 +99,8 @@ def export_case_json(case_id: int) -> dict:
             "status": str(c.status or ""),
             "title": str(c.title or ""),
             "description": str(c.description or ""),
-            "sampling_plan": _safe_json_loads(c.sampling_json, {}),
+            "verifier_org": str(c.verifier_org or ""),
+            "sampling_plan": _safe_load(c.sampling_json, {}),
             "created_at": str(c.created_at),
             "closed_at": str(c.closed_at) if c.closed_at else None,
         },
