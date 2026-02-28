@@ -5,8 +5,11 @@ import json
 import pandas as pd
 from sqlalchemy import select
 
-from src.db.models import CalculationSnapshot, DatasetUpload
+from src.db.models import CalculationSnapshot, DatasetUpload, EvidenceDocument
 from src.db.session import db
+from src.engine.advisor import build_reduction_advice
+from src.engine.benchmark import build_benchmark_report
+from src.engine.optimizer import build_optimizer_payload
 from src.mrv.audit import append_audit
 from src.mrv.compliance import evaluate_compliance
 from src.mrv.lineage import sha256_json
@@ -146,6 +149,50 @@ def create_snapshot(
         return snap
 
 
+def _evidence_categories_for_project(project_id: int) -> list[str]:
+    with db() as s:
+        cats = (
+            s.execute(select(EvidenceDocument.category).where(EvidenceDocument.project_id == int(project_id)))
+            .scalars()
+            .all()
+        )
+    out = sorted({str(c or "").strip().lower() for c in cats if c})
+    return out
+
+
+def _run_phase3_ai(results_json: dict, project_id: int) -> dict:
+    """Faz 3: benchmark + advisor + optimizer payload.
+
+    Deterministik: snapshot inputs + results üzerinden üretilir.
+    UI tarafında ayrıca farklı constraint denenebilir; snapshot içine default constraint ile kaydederiz.
+    """
+
+    try:
+        kpis = (results_json or {}).get("kpis") or {}
+        energy = (results_json or {}).get("energy") or {}
+        cbam = (results_json or {}).get("cbam") or {}
+        facility = (results_json or {}).get("facility") or {}
+
+        evidence_cats = _evidence_categories_for_project(project_id)
+
+        benchmark = build_benchmark_report(facility=facility, kpis=kpis, cbam=cbam)
+        advisor = build_reduction_advice(kpis=kpis, energy_breakdown=energy, cbam=cbam, evidence_categories_present=evidence_cats)
+
+        total_tco2 = float(kpis.get("total_tco2", 0.0) or 0.0)
+        constraints = {"target_reduction_pct": 15.0, "max_capex_eur": 200000.0, "discount_rate": 0.08}
+        optimizer = build_optimizer_payload(total_tco2=total_tco2, measures=list(advisor.get("measures") or []), constraints=constraints)
+
+        return {
+            "benchmark": benchmark,
+            "advisor": advisor,
+            "optimizer": optimizer,
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+        }
+
+
 def run_full(
     project_id: int,
     config: dict,
@@ -160,6 +207,7 @@ def run_full(
     - evaluate_compliance(...) doğru imzayla çağrılır
     - results_json.compliance_checks[] / results_json.qa_flags[] standardize edildi
     - Snapshot reuse deterministik candidate_hash ile yapılır
+    - Faz 3: ai.benchmark / ai.advisor / ai.optimizer üretimi
     """
     scenario = scenario or {}
 
@@ -181,20 +229,6 @@ def run_full(
     materials_df = None
     if materials_u and str(getattr(materials_u, "storage_uri", "") or ""):
         materials_df = load_csv_from_uri(str(getattr(materials_u, "storage_uri", "") or ""))
-
-    # Sampling universe / reg-grade audit readiness: satır sayıları (deterministik snapshot ref içine eklenir)
-    try:
-        input_hashes["energy_rows"] = int(len(energy_df))
-    except Exception:
-        input_hashes["energy_rows"] = 0
-    try:
-        input_hashes["production_rows"] = int(len(prod_df))
-    except Exception:
-        input_hashes["production_rows"] = 0
-    try:
-        input_hashes["materials_rows"] = int(len(materials_df)) if materials_df is not None else 0
-    except Exception:
-        input_hashes["materials_rows"] = 0
 
     input_bundle, result_bundle, legacy_results = run_orchestrator(
         project_id=int(project_id),
@@ -251,6 +285,10 @@ def run_full(
         "compliance_checks": results_json["compliance_checks"],
         "qa_flags": results_json["qa_flags"],
     }
+
+    # Faz 3 (AI & Optimization)
+    ai_payload = _run_phase3_ai(results_json, project_id=int(project_id))
+    results_json["ai"] = ai_payload
 
     det = results_json.get("deterministic", {}) or {}
     if not isinstance(det, dict):
