@@ -1,35 +1,9 @@
-# AUDITABILITY (Denetlenebilirlik)
+# AUDITABILITY
 
-Bu proje, aynı input + aynı config + aynı factor set + aynı metodoloji ile aynı sonucu üretmek üzere tasarlanmıştır.
+Bu proje snapshot + replay + evidence pack ile denetlenebilirlik sağlar.
 
-## Hash Mantığı
+- input_hash/result_hash deterministiktir
+- kilitli snapshot değiştirilemez
+- evidence pack manifest.json her dosyanın hash'ini taşır
+- signature.json HMAC-SHA256 içerir (EVIDENCE_PACK_HMAC_KEY)
 
-- input_hash: InputBundle'ın canonical JSON SHA-256 hash'i
-- result_hash: ResultBundle'ın canonical JSON SHA-256 hash'i
-
-Canonical JSON:
-- sort_keys=True
-- separators=(',', ':')
-- ensure_ascii=False
-
-## Snapshot (Immutable)
-
-Kilitlenen snapshot:
-- değiştirilemez
-- silinemez
-
-## Replay
-
-src/mrv/replay.py içindeki replay(snapshot_id):
-- dataset URI'ları ile yeniden hesaplar
-- input_hash_match/result_hash_match üretir
-
-## Evidence Pack
-
-Evidence pack ZIP:
-- manifest.json (tüm dosyaların SHA-256 hash'i)
-- signature.json (HMAC-SHA256, anahtar varsa)
-- CBAM/ETS/TR-ETS JSON + CBAM XML
-- PDF raporlar (ETS/CBAM/Compliance)
-- verification_case.json
-- evidence dosyaları ve index
