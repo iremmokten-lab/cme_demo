@@ -1,15 +1,5 @@
 from __future__ import annotations
 
-"""Projects/Facilities service contract.
-
-Bu modül, UI katmanının çağırdığı fonksiyonların tek kaynağıdır.
-Amaç:
-- Danışman: şirket içindeki tüm veriler (tam erişim)
-- Müşteri / Verifier: sadece kendi company kapsamı + snapshot tarafında RLS (shared_with_client)
-
-Not: Streamlit Cloud + SQLite için yazılmıştır.
-"""
-
 from typing import Any, List
 
 from sqlalchemy import desc, select
@@ -82,7 +72,7 @@ def create_facility(company_id: int, name: str, country_code: str = "TR", sector
     ss = (sector or "").strip()
 
     with db() as s:
-        fac = Facility(company_id=int(company_id), name=nm, country_code=cc, sector=ss)
+        fac = Facility(company_id=int(company_id), name=nm, country_code=cc, sector=ss, country=cc)
         s.add(fac)
         s.commit()
         s.refresh(fac)
@@ -105,6 +95,7 @@ def update_facility(
             fac.name = (name or "").strip() or fac.name
         if country_code is not None:
             fac.country_code = (country_code or fac.country_code or "TR").strip().upper()[:2]
+            fac.country = fac.country_code
         if sector is not None:
             fac.sector = (sector or "").strip()
         s.add(fac)
@@ -211,11 +202,6 @@ def list_company_projects_for_user(user: Any) -> List[Project]:
 
 
 def list_snapshots_for_user(user: Any, *, project_id: int | None = None, limit: int = 200) -> List[CalculationSnapshot]:
-    """RLS:
-    - Consultant: company içindeki tüm snapshot'lar
-    - Client / Verifier: sadece shared_with_client=True snapshot'lar
-    """
-
     cid = require_company_id(user)
     with db() as s:
         proj_ids = s.execute(select(Project.id).where(Project.company_id == int(cid))).scalars().all()
