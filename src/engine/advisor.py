@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Phase 3 — Reduction Advisor (heuristic, evidence-aware)
+"""Faz 3 — Reduction Advisor (heuristic, evidence-aware)
 
 Amaç:
 - Hotspot analizi: emisyonların en büyük kaynakları
@@ -8,7 +8,7 @@ Amaç:
 
 Not:
 - Bu demo sürümünde öneriler deterministik, rule-based.
-- Faz 3.2'de "evidence-backed" yaklaşım için: evidence categories + gaps.
+- Evidence gap yaklaşımı: mevcut evidence kategorileri ile beklenenler arasındaki farkı listeler.
 """
 
 from dataclasses import dataclass
@@ -51,6 +51,8 @@ class Measure:
             "opex_delta_eur_per_year": self.opex_delta_eur_per_year,
             "evidence_needed": self.evidence_needed,
             "assumptions": self.assumptions,
+            # optimizer için default lifetime (deterministik)
+            "lifetime_years": int(self.assumptions.get("lifetime_years", 10) or 10),
         }
 
 
@@ -86,38 +88,41 @@ def _hotspots_from_energy(energy_breakdown: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_reduction_advice(
     *,
-    kpis: Dict[str, Any],
-    energy_breakdown: Dict[str, Any],
-    cbam: Dict[str, Any],
+    kpis: Dict[str, Any] | None,
+    energy_breakdown: Dict[str, Any] | None,
+    cbam: Dict[str, Any] | None,
     evidence_categories_present: List[str] | None = None,
 ) -> Dict[str, Any]:
     """Snapshot results -> advisor payload."""
 
-    total_tco2 = _to_float((kpis or {}).get("total_tco2", 0.0), 0.0)
+    kpis = kpis or {}
+    energy_breakdown = energy_breakdown or {}
+    cbam = cbam or {}
+
+    total_tco2 = _to_float(kpis.get("total_tco2", 0.0), 0.0)
     if total_tco2 <= 0:
         return {
             "hotspots": {},
             "measures": [],
+            "evidence_missing_categories": [],
             "notes": ["Toplam emisyon 0; öneriler üretilemedi."],
         }
 
-    hotspots = _hotspots_from_energy(energy_breakdown or {})
+    hotspots = _hotspots_from_energy(energy_breakdown)
 
-    # evidence gap awareness
     ev = set([_norm(x) for x in (evidence_categories_present or []) if x])
 
     def ev_need(*cats: str) -> List[str]:
-        return [c for c in cats]
+        return [str(c) for c in cats]
 
     measures: List[Measure] = []
 
-    # Determine dominant source
-    direct = hotspots.get("direct_total_tco2", 0.0) or 0.0
-    indirect = hotspots.get("indirect_total_tco2", 0.0) or 0.0
-    direct_share = float(direct) / float(total_tco2) if total_tco2 > 0 else 0.0
-    indirect_share = float(indirect) / float(total_tco2) if total_tco2 > 0 else 0.0
+    direct = float(hotspots.get("direct_total_tco2", 0.0) or 0.0)
+    indirect = float(hotspots.get("indirect_total_tco2", 0.0) or 0.0)
 
-    # Electricity efficiency
+    direct_share = direct / total_tco2 if total_tco2 > 0 else 0.0
+    indirect_share = indirect / total_tco2 if total_tco2 > 0 else 0.0
+
     if indirect_share >= 0.15:
         measures.append(
             Measure(
@@ -129,11 +134,10 @@ def build_reduction_advice(
                 capex_eur=25000.0,
                 opex_delta_eur_per_year=-8000.0,
                 evidence_needed=ev_need("energy_bills", "metering", "equipment_specs"),
-                assumptions={"applies_if_indirect_share_ge": 0.15},
+                assumptions={"applies_if_indirect_share_ge": 0.15, "lifetime_years": 10},
             )
         )
 
-    # Heat recovery / boiler optimization
     if direct_share >= 0.20:
         measures.append(
             Measure(
@@ -145,11 +149,10 @@ def build_reduction_advice(
                 capex_eur=60000.0,
                 opex_delta_eur_per_year=-12000.0,
                 evidence_needed=ev_need("fuel_invoices", "boiler_logs", "maintenance"),
-                assumptions={"applies_if_direct_share_ge": 0.20},
+                assumptions={"applies_if_direct_share_ge": 0.20, "lifetime_years": 12},
             )
         )
 
-    # Fuel switch (demo)
     by_fuel = hotspots.get("by_fuel_tco2") or []
     top_fuels = [r.get("fuel_type") for r in by_fuel[:2] if isinstance(r, dict)]
     if any(_norm(f) in ("coal", "komur", "kömür", "lignite", "linyit") for f in top_fuels):
@@ -163,13 +166,18 @@ def build_reduction_advice(
                 capex_eur=180000.0,
                 opex_delta_eur_per_year=20000.0,
                 evidence_needed=ev_need("fuel_invoices", "process_diagrams", "capex_quotes"),
-                assumptions={"detected_top_fuels": top_fuels},
+                assumptions={"detected_top_fuels": top_fuels, "lifetime_years": 15},
             )
         )
 
-    # CBAM-related: precursor emissions
-    cbam_totals = (cbam or {}).get("totals") or {}
-    precursor = _to_float(cbam_totals.get("precursor_tco2", 0.0), 0.0)
+    precursor = 0.0
+    try:
+        precursor = _to_float((cbam.get("precursor_tco2") if isinstance(cbam, dict) else 0.0), 0.0)
+        if precursor <= 0:
+            precursor = _to_float(((cbam.get("totals") or {}).get("precursor_tco2") if isinstance(cbam, dict) else 0.0), 0.0)
+    except Exception:
+        precursor = 0.0
+
     if precursor > 0 and precursor / total_tco2 >= 0.10:
         measures.append(
             Measure(
@@ -181,11 +189,10 @@ def build_reduction_advice(
                 capex_eur=10000.0,
                 opex_delta_eur_per_year=0.0,
                 evidence_needed=ev_need("supplier_epd", "contracts", "materials"),
-                assumptions={"precursor_share_ge": 0.10},
+                assumptions={"precursor_share_ge": 0.10, "lifetime_years": 3},
             )
         )
 
-    # Generic measure
     measures.append(
         Measure(
             id="m_data_improve",
@@ -196,11 +203,10 @@ def build_reduction_advice(
             capex_eur=15000.0,
             opex_delta_eur_per_year=2000.0,
             evidence_needed=ev_need("metering", "calibration", "procedures"),
-            assumptions={},
+            assumptions={"lifetime_years": 8},
         )
     )
 
-    # Evidence gap hints
     missing = []
     if ev:
         needed = set()
