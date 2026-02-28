@@ -18,7 +18,6 @@ def build_qaqc_checks(*, energy_df=None, production_df=None) -> dict:
         checks.extend(dq.get("checks") or [])
         flags.extend(dq.get("qa_flags") or [])
 
-    # baseline ETS QA/QC kayıtları (audit için)
     checks.append(
         {
             "check_id": "ETS.QAQC.DOCUMENTATION",
