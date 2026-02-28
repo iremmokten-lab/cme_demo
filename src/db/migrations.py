@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import text
-
-from src.db.session import engine
+from sqlalchemy import Engine, text
 
 
 def _try(conn, sql: str):
@@ -12,17 +10,18 @@ def _try(conn, sql: str):
         pass
 
 
-def run_migrations():
-    """SQLite migration-like: eksik kolonları ekle.
+def run_migrations(engine: Engine):
+    """SQLite için migration-like stabilization.
 
-    Not: SQLite ALTER TABLE ADD COLUMN destekler (temel).
+    - Faz 2: verificationcases sampling alanları
+    - Faz 2: alerts tablosu varsa yeni kolonlar (future-proof)
     """
     with engine.connect() as conn:
-        # verification_cases sampling fields
-        _try(conn, "ALTER TABLE verification_cases ADD COLUMN sampling_notes TEXT")
-        _try(conn, "ALTER TABLE verification_cases ADD COLUMN sampling_size INTEGER")
+        # verificationcases: sampling
+        _try(conn, "ALTER TABLE verificationcases ADD COLUMN sampling_notes TEXT")
+        _try(conn, "ALTER TABLE verificationcases ADD COLUMN sampling_size INTEGER")
 
-        # alerts meta json
+        # alerts: geleceğe dönük kolonlar (table yoksa ignore)
         _try(conn, "ALTER TABLE alerts ADD COLUMN meta_json TEXT")
         _try(conn, "ALTER TABLE alerts ADD COLUMN resolved_at DATETIME")
         _try(conn, "ALTER TABLE alerts ADD COLUMN resolved_by_user_id INTEGER")
