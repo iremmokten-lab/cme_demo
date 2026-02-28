@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-"""XLSX ingestion templates (Faz 2).
-
-Amaç:
-- CSV yanında Excel template ile ingestion
-- Tek bir "MRV Template" dosyası: energy / production / materials sheet'leri
-"""
-
 from io import BytesIO
 
 from openpyxl import Workbook
