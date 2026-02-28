@@ -46,9 +46,9 @@ def main():
         sys.exit(2)
 
     snapshot_id = int(sys.argv[1])
-
     rep = replay(snapshot_id)
     ok = rep.get("input_hash_match") and rep.get("result_hash_match")
+
     print("REPLAY:", "PASS" if ok else "FAIL")
     print(json.dumps(rep, ensure_ascii=False, indent=2))
 
