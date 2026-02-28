@@ -30,7 +30,6 @@ def _read_results_json(snapshot: CalculationSnapshot) -> dict:
 
 
 def _extract_compliance_status(results: dict) -> tuple[str, int, int]:
-    """Return (status, fail_count, warn_count)."""
     checks = (results.get("compliance_checks") or []) if isinstance(results, dict) else []
     if not isinstance(checks, list):
         checks = []
@@ -49,11 +48,10 @@ def _extract_compliance_status(results: dict) -> tuple[str, int, int]:
 
 
 def generate_alerts_for_snapshot(company_id: int, snapshot: CalculationSnapshot) -> List[dict]:
-    """Snapshot bazlı alert üretir (persist etmez)."""
     results = _read_results_json(snapshot)
     out: List[dict] = []
 
-    stt, fail, warn = _extract_compliance_status(results)
+    _stt, fail, warn = _extract_compliance_status(results)
     if fail > 0:
         out.append(
             {
@@ -75,37 +73,10 @@ def generate_alerts_for_snapshot(company_id: int, snapshot: CalculationSnapshot)
             }
         )
 
-    ev = (results.get("evidence") or {}) if isinstance(results, dict) else {}
-    missing = (ev.get("missing") or []) if isinstance(ev, dict) else []
-    if missing:
-        out.append(
-            {
-                "alert_type": "missing_evidence",
-                "severity": "warn" if len(missing) < 5 else "critical",
-                "title": "Eksik Evidence",
-                "message": f"Evidence listesinde eksikler var: {len(missing)} adet.",
-                "meta": {"snapshot_id": snapshot.id, "missing": missing[:50]},
-            }
-        )
-
-    alloc = (results.get("allocation") or {}) if isinstance(results, dict) else {}
-    if isinstance(alloc, dict):
-        if alloc.get("deterministic_hash") and not alloc.get("methods"):
-            out.append(
-                {
-                    "alert_type": "allocation_incomplete",
-                    "severity": "warn",
-                    "title": "Allocation eksik",
-                    "message": "Allocation hash var ancak yöntem/dağıtım çıktısı yok.",
-                    "meta": {"snapshot_id": snapshot.id},
-                }
-            )
-
     return out
 
 
 def upsert_alerts(company_id: int, snapshot: CalculationSnapshot) -> int:
-    """Snapshot için alert'leri DB'ye yazar. Mevcut open alert'leri aynı type için günceller."""
     alerts = generate_alerts_for_snapshot(company_id, snapshot)
     if not alerts:
         return 0
