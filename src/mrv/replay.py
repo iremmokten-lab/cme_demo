@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Tuple
-
-from sqlalchemy import select
+from typing import Any, Dict
 
 from src.db.models import CalculationSnapshot
 from src.db.session import db
-from src.mrv.lineage import sha256_json
 from src.mrv.orchestrator import run_orchestrator
+from src.mrv.snapshot_store import compute_input_hash
 
 
 def _safe_json_loads(s: str, default):
@@ -19,12 +17,15 @@ def _safe_json_loads(s: str, default):
 
 
 def replay(snapshot_id: int) -> Dict[str, Any]:
-    """Audit-ready snapshot replay.
-
-    Doğrulamalar:
-      - input_hash match
-      - result_hash match
     """
+    Snapshot Replay (audit-ready):
+
+    - snapshot içinden config + input_hashes + results alınır
+    - dataset uri ile tekrar okunur
+    - orchestrator aynı parametrelerle tekrar çalıştırılır
+    - input_hash/result_hash doğrulanır
+    """
+
     with db() as s:
         snap = s.get(CalculationSnapshot, int(snapshot_id))
         if not snap:
@@ -34,13 +35,10 @@ def replay(snapshot_id: int) -> Dict[str, Any]:
         input_hashes = _safe_json_loads(snap.input_hashes_json, {})
         results = _safe_json_loads(snap.results_json, {})
 
-    # Orijinal sonuçlardan orchestrator girdilerini çıkar
-    # (Bu repo tasarımında input bundle & energy/production dataset referansları results_json içinde bulunuyor.)
     input_bundle = (results or {}).get("input_bundle") or {}
-    activity_snapshot_ref = input_bundle.get("activity_snapshot_ref") or input_hashes
+    activity_snapshot_ref = input_bundle.get("activity_snapshot_ref") or input_hashes or {}
 
-    # Datasetleri storage_uri üzerinden tekrar oku
-    # workflow.load_csv_from_uri zaten backend okuyor, orchestrator'a df gerekiyor
+    # datasetleri uri üzerinden tekrar oku
     from src.services.workflow import load_csv_from_uri
 
     energy_uri = ((activity_snapshot_ref or {}).get("energy") or {}).get("uri") or ""
@@ -55,12 +53,13 @@ def replay(snapshot_id: int) -> Dict[str, Any]:
     materials_df = load_csv_from_uri(str(mat_uri)) if mat_uri else None
 
     methodology_id = int(snap.methodology_id) if snap.methodology_id is not None else None
+    scenario = (input_bundle.get("scenario") or {}) if isinstance(input_bundle, dict) else {}
 
-    # Replay çalıştır
+    # Replay orchestrator
     input_bundle2, result_bundle2, legacy2 = run_orchestrator(
         project_id=int(snap.project_id),
         config=config or {},
-        scenario=(input_bundle.get("scenario") or {}),
+        scenario=scenario or {},
         methodology_id=methodology_id,
         activity_snapshot_ref=activity_snapshot_ref,
         energy_df=energy_df,
@@ -68,36 +67,31 @@ def replay(snapshot_id: int) -> Dict[str, Any]:
         materials_df=materials_df,
     )
 
-    # input_hash doğrula (repo mantığında input_hash = determinism candidate key)
-    # Biz bunu workflow içinde _compute_result_hash ile üretmiştik, burada aynı payloadı kuruyoruz:
     factor_set_ref = (legacy2.get("input_bundle") or {}).get("factor_set_ref") or []
-    monitoring_plan_ref = (legacy2.get("input_bundle") or {}).get("monitoring_plan_ref")
+    monitoring_plan_ref = (legacy2.get("input_bundle") or {}).get("monitoring_plan_ref") or None
 
-    engine_version = str((legacy2.get("engine_version") or ""))
-    candidate_input_hash = sha256_json(
-        {
-            "engine_version": engine_version,
-            "config": config or {},
-            "input_hashes": input_hashes or {},
-            "scenario": (input_bundle.get("scenario") or {}),
-            "methodology_id": methodology_id,
-            "factor_set_ref": factor_set_ref,
-            "monitoring_plan_ref": monitoring_plan_ref,
-        }
+    candidate_input_hash = compute_input_hash(
+        engine_version=str(legacy2.get("engine_version") or ""),
+        config=config or {},
+        input_hashes=activity_snapshot_ref or {},
+        scenario=scenario or {},
+        methodology_id=methodology_id,
+        factor_set_ref=factor_set_ref,
+        monitoring_plan_ref=monitoring_plan_ref,
     )
 
-    input_hash_match = str(candidate_input_hash) == str(snap.input_hash)
-    result_hash_match = str(result_bundle2.result_hash) == str(snap.result_hash)
+    input_hash_match = str(candidate_input_hash) == str(snap.input_hash or "")
+    result_hash_match = str(result_bundle2.result_hash or "") == str(snap.result_hash or "")
 
     return {
         "snapshot_id": int(snapshot_id),
-        "input_hash_expected": str(snap.input_hash),
+        "input_hash_expected": str(snap.input_hash or ""),
         "input_hash_recomputed": str(candidate_input_hash),
         "input_hash_match": bool(input_hash_match),
-        "result_hash_expected": str(snap.result_hash),
-        "result_hash_recomputed": str(result_bundle2.result_hash),
+        "result_hash_expected": str(snap.result_hash or ""),
+        "result_hash_recomputed": str(result_bundle2.result_hash or ""),
         "result_hash_match": bool(result_hash_match),
-        "recomputed_results_preview": {
+        "preview": {
             "total_tco2": ((legacy2.get("energy") or {}).get("total_tco2")),
             "direct_tco2": ((legacy2.get("energy") or {}).get("direct_tco2")),
             "indirect_tco2": ((legacy2.get("energy") or {}).get("indirect_tco2")),
