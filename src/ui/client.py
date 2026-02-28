@@ -59,31 +59,38 @@ def _facility_name_for_snapshot(snapshot: CalculationSnapshot) -> str:
             return "-"
         if not getattr(p, "facility_id", None):
             return "(tesis yok)"
-        with db() as s:
-            from src.db.models import Facility
+        # facility adı projects service üzerinden daha iyi; burada basit fetch
+        from src.db.models import Facility
 
-            fac = s.get(Facility, int(p.facility_id))
-            return fac.name if fac else "(tesis yok)"
+        with db() as s:
+            f = s.get(Facility, int(p.facility_id))
+        if not f:
+            return "-"
+        return f.name
     except Exception:
         return "-"
 
 
-def _trend_dataframe(snaps: list[CalculationSnapshot]) -> pd.DataFrame:
+def _trend_dataframe(shared_snaps: list[CalculationSnapshot]) -> pd.DataFrame:
     rows = []
-    for sn in snaps:
+    for sn in shared_snaps:
         k = _snapshot_kpis(sn)
-        ts = getattr(sn, "created_at", None)
-        if not ts:
-            ts = datetime.utcnow()
         rows.append(
             {
+                "tarih": sn.created_at,
                 "snapshot_id": sn.id,
-                "tarih": ts,
-                "tarih_str": str(ts)[:19],
-                **k,
+                "direct_tco2": k["direct_tco2"],
+                "indirect_tco2": k["indirect_tco2"],
+                "total_tco2": k["total_tco2"],
+                "cbam_cost_eur": k["cbam_cost_eur"],
+                "ets_cost_tl": k["ets_cost_tl"],
             }
         )
-    df = pd.DataFrame(rows).sort_values("tarih")
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        return df
+    df = df.sort_values("tarih")
+    df["tarih_str"] = df["tarih"].apply(lambda x: x.strftime("%Y-%m-%d") if hasattr(x, "strftime") else str(x))
     return df
 
 
@@ -92,7 +99,6 @@ def client_app(user):
 
     company_id = prj.require_company_id(user)
 
-    # Only shared snapshots
     snaps = prj.list_shared_snapshots_for_user(user, limit=400)
 
     append_audit(
@@ -120,13 +126,11 @@ def client_app(user):
                         "başlık": getattr(a, "title", ""),
                         "mesaj": getattr(a, "message", ""),
                         "snapshot_id": getattr(a, "snapshot_id", None),
-                        "durum": getattr(a, "status", ""),
                     }
                 )
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
         st.divider()
 
-    # Company KPIs (latest snapshot totals)
     latest = snaps[0]
     latest_k = _snapshot_kpis(latest)
 
@@ -140,7 +144,6 @@ def client_app(user):
 
     st.divider()
 
-    # Trend
     st.subheader("Trend")
     df = _trend_dataframe(snaps)
     if len(df) >= 2:
@@ -152,8 +155,7 @@ def client_app(user):
 
     st.divider()
 
-    # Multi-facility view
-    st.subheader("Tesis Bazlı Görünüm ve Risk Sıralaması")
+    st.subheader("Tesis Bazlı Görünüm")
     by_fac = defaultdict(list)
     for sn in snaps:
         by_fac[_facility_name_for_snapshot(sn)].append(sn)
@@ -176,47 +178,7 @@ def client_app(user):
 
     st.divider()
 
-    # Ürün Yoğunluğu / CBAM (Faz 2)
-    st.subheader("Ürün Yoğunluğu (İntensity) ve CBAM Özeti")
-    prod_rows = []
-    for sn in snaps[:200]:
-        r = _read_results(sn)
-        cbam = (r.get("cbam") or {}) if isinstance(r, dict) else {}
-        products = (cbam.get("products") or []) if isinstance(cbam, dict) else []
-        if not isinstance(products, list):
-            continue
-        for p in products:
-            try:
-                prod_rows.append(
-                    {
-                        "snapshot_id": sn.id,
-                        "tarih": str(getattr(sn, "created_at", "") or ""),
-                        "sku": p.get("sku") or p.get("product") or "",
-                        "cn_code": p.get("cn_code") or "",
-                        "quantity": float(p.get("quantity") or 0.0),
-                        "unit": p.get("unit") or "",
-                        "direct_tco2": float(p.get("direct_tco2") or 0.0),
-                        "indirect_tco2": float(p.get("indirect_tco2") or 0.0),
-                        "total_tco2": float(p.get("total_tco2") or 0.0),
-                        "intensity_tco2_per_unit": float(p.get("intensity_tco2_per_unit") or 0.0),
-                        "cbam_cost_eur": float(p.get("cbam_cost_eur") or 0.0),
-                    }
-                )
-            except Exception:
-                continue
-
-    if prod_rows:
-        prdf = pd.DataFrame(prod_rows)
-        latest_id = int(snaps[0].id)
-        ldf = prdf[prdf["snapshot_id"] == latest_id].copy()
-        ldf = ldf.sort_values(["cbam_cost_eur", "intensity_tco2_per_unit"], ascending=False)
-        st.dataframe(ldf, use_container_width=True)
-    else:
-        st.caption("Engine sonuçlarında CBAM ürün satırları yoksa bu tablo boş görünebilir.")
-    st.divider()
-
-    # Snapshot list & compare
-    st.subheader("Snapshot Karşılaştırma (Baseline vs Senaryo)")
+    st.subheader("Snapshot Karşılaştırma")
     labels = []
     id_map = []
     for sn in snaps[:200]:
@@ -228,7 +190,7 @@ def client_app(user):
 
     colA, colB = st.columns(2)
     with colA:
-        left = st.selectbox("Baseline", options=labels, index=min(0, len(labels) - 1))
+        left = st.selectbox("Baseline", options=labels, index=0)
     with colB:
         right = st.selectbox("Scenario", options=labels, index=min(1, len(labels) - 1) if len(labels) > 1 else 0)
 
