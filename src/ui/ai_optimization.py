@@ -1,245 +1,111 @@
-<Bu dosya zaten PARÇA 1’de belirtilmişti; burada TAMAMINI VERİYORUM.>
-
 from __future__ import annotations
 
 import json
+from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import select
 
-from src.db.models import CalculationSnapshot, EvidenceDocument, Project
+from src.db.models import CalculationSnapshot, Project
 from src.db.session import db
-from src.mrv.audit import append_audit
-from src.services import projects as prj
-from src.services.workflow import run_full
+from src.engine.advisor import generate_reduction_recommendations
+from src.mrv.audit import append_audit, infer_company_id_for_user
+from src.services.authz import require_role
 
 
-def _read_results(snapshot: CalculationSnapshot) -> dict:
+def _safe_json_loads(s: str, default):
     try:
-        return json.loads(snapshot.results_json) if snapshot.results_json else {}
+        return json.loads(s or "")
     except Exception:
-        return {}
+        return default
 
 
-def _fmt_tr(x, digits=2) -> str:
-    try:
-        s = f"{float(x):,.{digits}f}"
-        return s.replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return "0"
+def ai_optimization_page(user):
+    require_role(user, allowed={"consultant", "consultant_admin", "client", "verifier", "verifier_admin"})
 
-
-def _list_projects_for_company(company_id: int):
-    with db() as s:
-        return s.query(Project).filter(Project.company_id == int(company_id)).order_by(Project.id.desc()).limit(500).all()
-
-
-def ai_optimization_page(user) -> None:
-    st.title("🤖 AI & Optimization (Faz 3)")
+    st.title("🤖 AI Carbon Reduction Engine")
     st.caption(
-        "Benchmark + hotspot + reduction advisor + abatement cost curve. "
-        "Bu sayfa deterministik heuristic kullanır (demo)."
+        "Bu ekran, en yüksek emisyon ve maliyet sürücülerini tespit eder ve regülasyon-grade kanıt gereksinimleri "
+        "ile birlikte azaltım aksiyon önerileri üretir."
     )
 
-    if not prj.is_consultant(user):
-        st.error("Bu sayfa sadece danışman rolü içindir.")
-        return
-
-    company_id = prj.require_company_id(user)
-
-    st.subheader("Proje seç")
-    projects = _list_projects_for_company(company_id)
-    if not projects:
-        st.info("Önce bir proje oluşturun.")
-        return
-
-    labels = []
-    pmap = {}
-    for p in projects:
-        fname = getattr(getattr(p, "facility", None), "name", "") or "-"
-        labels.append(f"#{p.id} • {p.name} • {fname}")
-        pmap[labels[-1]] = int(p.id)
-
-    sel = st.selectbox("Proje", options=labels, index=0)
-    project_id = pmap[sel]
-
-    snaps = prj.list_snapshots_for_project(user, project_id, include_unshared=True, limit=200)
-    if not snaps:
-        st.info("Bu proje için snapshot yok. Önce veri yükleyip snapshot üretin.")
-        return
-
-    st.divider()
-
-    # Snapshot selection
-    snap_labels = []
-    sids = []
-    for sn in snaps:
-        lock_tag = "🔒" if getattr(sn, "locked", False) else ""
-        share_tag = "👁️" if getattr(sn, "shared_with_client", False) else ""
-        scen_name = ""
-        try:
-            r = _read_results(sn)
-            scen = (r.get("scenario") or {}) if isinstance(r, dict) else {}
-            scen_name = str(scen.get("name") or "")
-        except Exception:
-            scen_name = ""
-        snap_labels.append(f"{lock_tag}{share_tag} ID:{sn.id} • {sn.created_at} {('• ' + scen_name) if scen_name else ''}")
-        sids.append(int(sn.id))
-
-    snap_sel = st.selectbox("Snapshot", options=snap_labels, index=0)
-    snapshot_id = sids[snap_labels.index(snap_sel)]
-
-    with db() as s:
-        snap = s.get(CalculationSnapshot, int(snapshot_id))
-
-    if not snap:
-        st.error("Snapshot bulunamadı.")
-        return
-
-    results = _read_results(snap)
-    ai = (results.get("ai") or {}) if isinstance(results, dict) else {}
-
-    st.subheader("AI çıktıları")
-
-    # Controls
-    with st.expander("Optimizer kısıtları (senaryo)", expanded=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            target_pct = st.number_input("Hedef azaltım (%)", min_value=0.0, max_value=80.0, value=15.0, step=1.0)
-        with c2:
-            max_capex = st.number_input("Maks CAPEX (€)", min_value=0.0, value=250000.0, step=10000.0)
-        with c3:
-            disc = st.number_input("İskonto oranı", min_value=0.0, max_value=0.30, value=0.08, step=0.01, format="%.2f")
-
-        if st.button("AI çıktısını güncelle (yeniden snapshot)", type="primary"):
-            # Deterministik: mevcut config'i al, optimizer_constraints ekle, yeni snapshot üret.
-            try:
-                cfg = json.loads(snap.config_json or "{}")
-            except Exception:
-                cfg = {}
-
-            cfg = dict(cfg or {})
-            cfg.setdefault("ai", {})
-            if not isinstance(cfg["ai"], dict):
-                cfg["ai"] = {}
-            cfg["ai"]["optimizer_constraints"] = {
-                "target_reduction_pct": float(target_pct),
-                "max_capex_eur": float(max_capex),
-                "discount_rate": float(disc),
-            }
-
-            new_snap = run_full(
-                project_id=int(project_id),
-                config=cfg,
-                scenario=(results.get("scenario") or {}),
-                methodology_id=getattr(snap, "methodology_id", None),
-                created_by_user_id=getattr(user, "id", None),
-            )
-            st.success(f"Yeni snapshot üretildi: {new_snap.id}")
-            st.rerun()
-
-    if not ai:
-        st.info("Bu snapshot'ta AI çıktısı yok. Yeni snapshot üreterek AI modülünü çalıştırın.")
-        return
-
-    # Benchmark
-    bench = (ai.get("benchmark") or {}) if isinstance(ai, dict) else {}
-    if bench:
-        with st.expander("📊 Benchmark & Outlier", expanded=True):
-            fac = bench.get("facility") or {}
-            st.write(
-                f"**Tesis yoğunluğu:** {(_fmt_tr(fac.get('intensity_tco2_per_ton', 0.0), 3) if fac.get('intensity_tco2_per_ton') is not None else '-') } tCO2/ton"
-            )
-            st.write(
-                f"**Benchmark:** {_fmt_tr(fac.get('benchmark_tco2_per_ton', 0.0), 3)} tCO2/ton | "
-                f"**Oran:** {(_fmt_tr(fac.get('ratio_to_benchmark', 0.0), 2) if fac.get('ratio_to_benchmark') is not None else '-') }"
-            )
-
-            out = bench.get("outliers") or []
-            if out:
-                st.warning(f"Outlier/Anomali: {len(out)}")
-                st.dataframe(pd.DataFrame(out), use_container_width=True)
-            else:
-                st.success("Outlier bulunamadı ✅")
-
-            prod = bench.get("products") or []
-            if prod:
-                st.dataframe(pd.DataFrame(prod), use_container_width=True)
-
-    # Advisor
-    adv = (ai.get("advisor") or {}) if isinstance(ai, dict) else {}
-    if adv:
-        with st.expander("🔥 Hotspot & Reduction Advisor", expanded=True):
-            hs = adv.get("hotspots") or {}
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Direct (tCO2)", _fmt_tr(hs.get("direct_total_tco2", 0.0), 3))
-            c2.metric("Indirect (tCO2)", _fmt_tr(hs.get("indirect_total_tco2", 0.0), 3))
-            c3.metric("Toplam (tCO2)", _fmt_tr(hs.get("total_tco2", 0.0), 3))
-
-            fuels = hs.get("by_fuel_tco2") or []
-            if fuels:
-                st.write("**Yakıt bazlı (tCO2)**")
-                st.dataframe(pd.DataFrame(fuels), use_container_width=True)
-
-            measures = adv.get("measures") or []
-            if measures:
-                st.write("**Öneriler**")
-                st.dataframe(pd.DataFrame(measures), use_container_width=True)
-
-            miss = adv.get("evidence_missing_categories") or []
-            if miss:
-                st.warning("Eksik evidence kategorileri: " + ", ".join([str(x) for x in miss]))
-
-    # Optimizer
-    opt = (ai.get("optimizer") or {}) if isinstance(ai, dict) else {}
-    if opt:
-        with st.expander("📈 Abatement Cost Curve & Portfolio", expanded=True):
-            curve = opt.get("abatement_curve") or []
-            if curve:
-                dfc = pd.DataFrame(curve)
-                st.dataframe(dfc, use_container_width=True)
-                try:
-                    chart_df = dfc[["cumulative_reduction_tco2", "cost_per_tco2"]].copy()
-                    chart_df = chart_df.set_index("cumulative_reduction_tco2")
-                    st.line_chart(chart_df)
-                except Exception:
-                    pass
-
-            port = opt.get("portfolio") or {}
-            summ = (port.get("summary") or {}) if isinstance(port, dict) else {}
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("Seçili önlem", str(summ.get("selected_count", 0)))
-            sc2.metric("CAPEX (€)", _fmt_tr(summ.get("capex_eur", 0.0), 0))
-            sc3.metric("Azaltım (tCO2)", _fmt_tr(summ.get("reduction_tco2", 0.0), 2))
-            sc4.metric("Ort. €/tCO2", _fmt_tr(summ.get("avg_cost_per_tco2", 0.0), 2) if summ.get("avg_cost_per_tco2") is not None else "-")
-
-            sel = port.get("selected") or []
-            if sel:
-                st.write("**Seçilen portföy**")
-                st.dataframe(pd.DataFrame(sel), use_container_width=True)
-
-    st.divider()
-
-    # Evidence completeness quick look
-    with db() as s:
-        ev_docs = s.query(EvidenceDocument).filter(EvidenceDocument.project_id == int(project_id)).order_by(EvidenceDocument.uploaded_at.desc()).all()
-
-    cats = {}
-    for d in ev_docs:
-        c = str(getattr(d, "category", "documents") or "documents")
-        cats[c] = cats.get(c, 0) + 1
-
-    with st.expander("📎 Evidence özeti", expanded=False):
-        if cats:
-            st.dataframe(pd.DataFrame([{"kategori": k, "adet": v} for k, v in sorted(cats.items())]), use_container_width=True)
-        else:
-            st.info("Bu proje için evidence dokümanı yok.")
-
     append_audit(
-        "ai_optimization_viewed",
-        {"snapshot_id": int(snapshot_id), "project_id": int(project_id)},
+        "page_viewed",
+        {"page": "ai_optimization"},
         user_id=getattr(user, "id", None),
-        company_id=company_id,
-        entity_type="ai",
-        entity_id=int(snapshot_id),
+        company_id=infer_company_id_for_user(user),
+        entity_type="page",
+        entity_id=None,
+    )
+
+    with db() as s:
+        projects = (
+            s.execute(select(Project).where(Project.company_id == infer_company_id_for_user(user)).order_by(Project.created_at.desc()))
+            .scalars()
+            .all()
+        )
+
+    if not projects:
+        st.info("Henüz proje yok. Önce Consultant Panel'den bir proje oluşturun.")
+        return
+
+    p_map = {f"{p.id} — {p.name}": p.id for p in projects}
+    p_key = st.selectbox("Proje", list(p_map.keys()))
+    project_id = int(p_map[p_key])
+
+    with db() as s:
+        snaps = (
+            s.execute(select(CalculationSnapshot).where(CalculationSnapshot.project_id == project_id).order_by(CalculationSnapshot.created_at.desc()))
+            .scalars()
+            .all()
+        )
+
+    if not snaps:
+        st.warning("Bu proje için henüz snapshot yok. Önce hesaplama çalıştırın.")
+        return
+
+    snap_map = {f"{sn.id} — {sn.created_at.strftime('%Y-%m-%d %H:%M')} — {'LOCK' if sn.locked else 'draft'}": sn.id for sn in snaps}
+    snap_key = st.selectbox("Snapshot", list(snap_map.keys()))
+    snapshot_id = int(snap_map[snap_key])
+
+    with db() as s:
+        snap = s.get(CalculationSnapshot, snapshot_id)
+
+    results = _safe_json_loads(snap.results_json, {})
+    cfg = _safe_json_loads(snap.config_json, {})
+
+    recs = generate_reduction_recommendations(results=results, config=cfg)
+
+    st.subheader("🔥 Hotspots")
+    hs = recs.get("hotspots") or []
+    if not hs:
+        st.info("Hotspot bulunamadı (veri yetersiz olabilir).")
+    else:
+        st.dataframe(pd.DataFrame(hs), use_container_width=True)
+
+    st.subheader("🛠️ Önerilen Aksiyonlar")
+    acts = recs.get("actions") or []
+    if not acts:
+        st.info("Öneri üretilemedi (veri yetersiz olabilir).")
+    else:
+        for i, a in enumerate(acts, 1):
+            with st.expander(f"{i}. {a.get('title','Aksiyon')} — Beklenen Azaltım: {a.get('expected_emission_reduction_tco2',0):.2f} tCO₂"):
+                st.write(a.get("description", ""))
+                cols = st.columns(3)
+                cols[0].metric("Beklenen Azaltım (tCO₂)", f"{float(a.get('expected_emission_reduction_tco2',0.0)):.2f}")
+                cols[1].metric("Beklenen Maliyet Değişimi (EUR)", f"{float(a.get('expected_cost_change_eur',0.0)):.2f}")
+                cols[2].metric("CBAM/ETS Etki (EUR)", f"{float(a.get('expected_exposure_change_eur',0.0)):.2f}")
+
+                st.markdown("**Kanıt Gereksinimleri (Evidence Requirements)**")
+                st.write(a.get("evidence_requirements") or [])
+
+                st.markdown("**Hesaplama Referansı (Calculation Reference)**")
+                st.code(json.dumps(a.get("calculation_reference") or {}, ensure_ascii=False, indent=2), language="json")
+
+    st.divider()
+    st.subheader("📦 Evidence Pack'e ekleme notu")
+    st.write(
+        "Bu öneriler, snapshot sonucu üzerinde deterministik olarak üretilir ve evidence pack manifest içine eklenebilir. "
+        "Uygulama, rapor üretimi sırasında öneri özetini Compliance Report içine dahil eder."
     )
