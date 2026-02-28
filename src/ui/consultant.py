@@ -16,6 +16,8 @@ from src.mrv.lineage import sha256_bytes
 from src.services import projects as prj
 from src.services.exports import build_evidence_pack, build_zip, build_xlsx_from_results
 from src.services.ingestion import data_quality_assess, validate_csv
+from src.mrv.replay import replay
+from src.services.snapshots import lock_snapshot, set_snapshot_shared_with_client
 from src.services.reporting import build_pdf
 from src.services.storage import EVIDENCE_DOCS_CATEGORIES, EVIDENCE_DOCS_DIR, UPLOAD_DIR, write_bytes
 from src.services.workflow import run_full
@@ -391,6 +393,44 @@ def consultant_app(user):
                 sn = s.get(CalculationSnapshot, sid)
 
             if sn:
+
+                st.subheader("🧾 Snapshot Kontrolleri (Audit-ready)")
+                colA, colB, colC = st.columns(3)
+                with colA:
+                    if st.button("Replay Doğrula", use_container_width=True):
+                        try:
+                            rep = replay(int(sn.id))
+                            ok_in = rep["checks"]["input_hash_match"]
+                            ok_out = rep["checks"]["result_hash_match"]
+                            if ok_in and ok_out:
+                                st.success("Replay doğrulandı: input_hash ve result_hash eşleşiyor ✅")
+                            else:
+                                st.error("Replay doğrulanamadı ❌")
+                            st.json(rep)
+                        except Exception as e:
+                            st.error(f"Replay hatası: {e}")
+                
+                with colB:
+                    if st.button("Snapshot'ı Kilitle (Immutable)", disabled=bool(sn.locked), use_container_width=True):
+                        try:
+                            sn2 = lock_snapshot(int(sn.id), user=user)
+                            st.success("Snapshot kilitlendi. Artık değiştirilemez ve silinemez ✅")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+                
+                with colC:
+                    shared = st.toggle("Client ile Paylaş", value=bool(sn.shared_with_client))
+                    if shared != bool(sn.shared_with_client):
+                        try:
+                            set_snapshot_shared_with_client(int(sn.id), bool(shared), user=user)
+                            st.success("Paylaşım ayarı güncellendi ✅")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+                
+                st.caption(f"input_hash: {getattr(sn,'input_hash','')}")
+                st.caption(f"result_hash: {getattr(sn,'result_hash','')}")
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     if st.button("Evidence Pack", type="primary", use_container_width=True):
