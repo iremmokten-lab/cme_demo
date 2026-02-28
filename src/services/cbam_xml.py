@@ -54,13 +54,7 @@ def build_cbam_reporting(
                 "direct_emissions_tco2": float(r.get("direct_alloc_tco2") or 0.0),
                 "indirect_emissions_tco2": float(r.get("indirect_alloc_tco2") or 0.0),
                 "precursor_emissions_tco2": float(r.get("precursor_tco2") or 0.0),
-                                "embedded_emissions_tco2": float(r.get("embedded_tco2") or 0.0),
-                "embedded_intensity_tco2_per_unit": float(r.get("embedded_intensity_tco2_per_unit") or 0.0),
-                "direct_intensity_tco2_per_unit": float(r.get("direct_intensity_tco2_per_unit") or 0.0),
-                "indirect_intensity_tco2_per_unit": float(r.get("indirect_intensity_tco2_per_unit") or 0.0),
-                "carbon_price_paid_eur_per_t": float(r.get("carbon_price_paid_eur_per_t") or 0.0),
-                "carbon_price_paid_amount_eur": float(r.get("carbon_price_paid_amount_eur") or 0.0),
-                "carbon_price_paid_currency": _s(r.get("carbon_price_paid_currency") or "EUR"),
+                "embedded_emissions_tco2": float(r.get("embedded_tco2") or 0.0),
                 "data_type_flag": _s(r.get("data_type_flag") or "actual"),  # actual/default
                 "mapping_rule": _s(r.get("mapping_rule") or ""),
                 "allocation_method": _s(r.get("allocation_method") or ""),
@@ -102,11 +96,6 @@ def build_cbam_reporting(
         },
         "methodology_note_tr": methodology_note_tr or "",
         "goods": goods,
-        "carbon_price_paid": {
-            "currency": "EUR",
-            "total_amount_eur": sum(float(g.get("carbon_price_paid_amount_eur") or 0.0) for g in goods),
-            "paid_eur_per_t_reference": (max(float(g.get("carbon_price_paid_eur_per_t") or 0.0) for g in goods) if goods else 0.0),
-        },
         "totals": totals,
         "notes": [
             "Bu çıktı XML-ready bir yapıdır. Resmi CBAM XML formatına mapping yapılabilir.",
