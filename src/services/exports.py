@@ -28,10 +28,9 @@ from src.db.models import (
 from src.mrv.lineage import sha256_bytes
 from src.services.reporting import build_pdf
 from src.services.ets_reporting import build_ets_reporting_dataset
-from src.config import get_tr_ets_mode
+from src.services.tr_ets_reporting import build_tr_ets_reporting
+from src import config as app_config
 from src.services.storage import EVIDENCE_DOCS_CATEGORIES
-from src.services.signing import build_signature_block
-from src.services.validators import validate_cbam_report, validate_ets_reporting
 
 
 def build_xlsx_from_results(results_json: str) -> bytes:
@@ -558,13 +557,42 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         config=(cfg or {}),
         allocation=allocation_obj,
         qa_qc=qa,
-        tr_ets_mode=bool(get_tr_ets_mode()),
+        tr_ets_mode=bool(app_config.get_tr_ets_mode()),
         )
     except Exception:
         ets_json_obj = {}
         ets_json_bytes = _json_bytes(ets_json_obj)
 
-    # Compliance dataset zaten compliance_json_bytes olarak yazılıyor; ayrıca gereksinim için kopya path'ler eklenecek.
+    
+    # TR ETS reporting JSON (İklim Başkanlığı TR-ETS taslak özetine dayalı)
+    tr_ets_json_obj = {}
+    try:
+        if bool(app_config.get_tr_ets_mode()):
+            period = ((res or {}).get("input_bundle", {}) or {}).get("period", {}) or {}
+            year = int(period.get("year") or app_config.get_cbam_reporting_year())
+            installation = ((res or {}).get("input_bundle", {}) or {}).get("facility", {}) or {}
+            energy_rows = (energy_breakdown or {}).get("breakdown_rows", []) or []
+            electricity_rows = (energy_breakdown or {}).get("electricity_rows", []) or []
+            factor_refs = (energy_breakdown or {}).get("factor_refs", []) or []
+            verified_total = float((energy_breakdown or {}).get("total_tco2", 0.0) or 0.0)
+            pilot_s, pilot_e = app_config.get_tr_ets_pilot_years()
+            tr_ets = build_tr_ets_reporting(
+                year=year,
+                facility=installation,
+                energy_breakdown_rows=energy_rows,
+                electricity_rows=electricity_rows,
+                factor_refs=factor_refs,
+                verified_total_tco2=verified_total,
+                in_scope_threshold_tco2=app_config.get_tr_ets_threshold_tco2(),
+                pilot_start_year=pilot_s,
+                pilot_end_year=pilot_e,
+            )
+            tr_ets_json_obj = tr_ets.to_dict()
+    except Exception:
+        tr_ets_json_obj = {}
+
+    tr_ets_json_bytes = _json_bytes(tr_ets_json_obj)
+# Compliance dataset zaten compliance_json_bytes olarak yazılıyor; ayrıca gereksinim için kopya path'ler eklenecek.
     # Compliance checks (Paket B3): snapshot sonuçlarından çıkar
     compliance_checks = []
     try:
@@ -581,37 +609,6 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "engine_version": snapshot.engine_version,
         "compliance_checks": compliance_checks,
     }
-
-    # Ek doğrulamalar (regulation-grade checklist)
-    validation_issues = []
-    try:
-        cbam_issues = validate_cbam_report(cbam_json_obj if isinstance(cbam_json_obj, dict) else {})
-        validation_issues.extend([x.to_dict() for x in (cbam_issues or [])])
-    except Exception as _e:
-        validation_issues.append({
-            "rule_id": "CBAM.VAL.ERR",
-            "reg_reference": "internal",
-            "severity": "warn",
-            "message_tr": "CBAM validator çalıştırılamadı.",
-            "remediation_tr": "CBAM rapor datasını ve şemasını kontrol edin.",
-            "details": {"error": str(_e)},
-        })
-
-    try:
-        ets_issues = validate_ets_reporting(ets_json_obj if isinstance(ets_json_obj, dict) else {})
-        validation_issues.extend([x.to_dict() for x in (ets_issues or [])])
-    except Exception as _e:
-        validation_issues.append({
-            "rule_id": "ETS.VAL.ERR",
-            "reg_reference": "internal",
-            "severity": "warn",
-            "message_tr": "ETS validator çalıştırılamadı.",
-            "remediation_tr": "ETS rapor datasını ve şemasını kontrol edin.",
-            "details": {"error": str(_e)},
-        })
-
-    compliance_payload["validation_issues"] = validation_issues
-
 
     # Verification case (Paket B3): project + period_year bazlı dahil et (varsa)
     period_year = None
@@ -672,18 +669,19 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "cbam_report_xml_hash": sha256_bytes(cbam_xml_bytes),
         "cbam_report_json_hash": sha256_bytes(cbam_json_bytes),
         "ets_reporting_json_hash": sha256_bytes(ets_json_bytes),
+        "tr_ets_reporting_json_hash": sha256_bytes(tr_ets_json_bytes),
     }
 
-    signature_block = build_signature_block(manifest_base)
+    sig = _hmac_signature(_json_bytes(manifest_base))
     manifest = dict(manifest_base)
-    manifest["signature"] = signature_block  # {'signatures': [...], 'signed_payload_hash_sha256': ...}
+    manifest["signature"] = sig  # None olabilir (anahtar yoksa)
 
     # ZIP build
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json", _json_bytes(manifest))
         # signature.json (ayrı dosya)
-        signature_obj = manifest.get("signature") or {}
+        signature_obj = {"algorithm": "HMAC-SHA256", "key_id": "EVIDENCE_PACK_HMAC_KEY", "signature": manifest.get("signature")}
         z.writestr("signature.json", _json_bytes(signature_obj))
 
         # inputs
@@ -702,6 +700,7 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         z.writestr("cbam_report.xml", cbam_xml_bytes or b"")
         z.writestr("cbam_report.json", cbam_json_bytes or b"")
         z.writestr("ets_reporting.json", ets_json_bytes or b"")
+        z.writestr("tr_ets_reporting.json", tr_ets_json_bytes or b"")
         # PDF alias (ETS)
         z.writestr("ets_report.pdf", pdf_bytes or b"")
 
