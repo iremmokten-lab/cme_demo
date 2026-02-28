@@ -18,8 +18,9 @@ if not user:
     st.stop()
 
 # Yetki kontrolü
-if str(user.role).startswith("consultant"):
-    st.error("Bu sayfa müşteri kullanıcıları içindir. (Danışman olarak Danışman Paneli’ni kullanın.)")
+role = str(user.role).lower()
+if role.startswith("consultant") or role.startswith("verifier"):
+    st.error("Bu sayfa müşteri kullanıcıları içindir. (Danışman/verifier olarak kendi sayfanızı kullanın.)")
     st.stop()
 
 append_audit(
