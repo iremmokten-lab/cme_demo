@@ -250,3 +250,31 @@ def logout_button():
     if st.button("Çıkış", use_container_width=True):
         st.session_state.pop(SESSION_KEY, None)
         st.rerun()
+
+
+# ----------------------------
+# Authorization helpers (UI-safe)
+# ----------------------------
+def require_role(user: User, *, allowed: set[str]):
+    """UI-level role guard.
+
+    allowed örnek:
+      {"consultant", "consultant_admin"} veya {"client"} vb.
+    """
+    role = str(getattr(user, "role", "") or "").lower().strip()
+    norm = role
+    if norm.startswith("consultant"):
+        norm = "consultant_admin" if norm == "consultant_admin" else "consultant"
+    elif norm.startswith("verifier"):
+        norm = "verifier_admin" if norm == "verifier_admin" else "verifier"
+    elif norm.startswith("client"):
+        norm = "client"
+
+    if norm not in allowed and role not in allowed:
+        st.error("Bu sayfaya erişim yetkiniz yok.")
+        st.stop()
+
+
+def can_view_client_shared_snapshot(user: User) -> bool:
+    role = str(getattr(user, "role", "") or "").lower().strip()
+    return role.startswith("client") or role.startswith("verifier")
