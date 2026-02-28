@@ -1,21 +1,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
-
-import pandas as pd
 
 from src.mrv.snapshot_store import compute_input_hash, save_snapshot
 from src.mrv.lineage import sha256_json
 from src.mrv.orchestrator import run_orchestrator
 from src.services.workflow import latest_upload, load_csv_from_uri, _input_hashes_payload
-
-
-def _safe_load(s: str | None, default):
-    try:
-        return json.loads(s or "")
-    except Exception:
-        return default
 
 
 def run_calculation_and_snapshot(
@@ -29,11 +19,11 @@ def run_calculation_and_snapshot(
     lock_after_create: bool = False,
 ) -> dict:
     """
-    Tam audit-grade pipeline:
-      - latest uploads (energy/production/materials) okunur
-      - orchestrator çalışır
-      - input_hash ve result_hash deterministik hesaplanır
-      - DB snapshot kaydı oluşturulur
+    End-to-end deterministic snapshot:
+      - latest uploads read
+      - orchestrator run
+      - input_hash / result_hash computed
+      - saved to DB
     """
     scenario = scenario or {}
     config = config or {}
@@ -51,7 +41,7 @@ def run_calculation_and_snapshot(
 
     activity_snapshot_ref = _input_hashes_payload(project_id, energy_u, prod_u, mat_u)
 
-    input_bundle, result_bundle, legacy = run_orchestrator(
+    _input_bundle, _result_bundle, legacy = run_orchestrator(
         project_id=int(project_id),
         config=config,
         scenario=scenario,
@@ -62,7 +52,6 @@ def run_calculation_and_snapshot(
         materials_df=materials_df,
     )
 
-    # legacy payload içerisinden lock referansları
     ib = (legacy or {}).get("input_bundle") or {}
     factor_set_ref = ib.get("factor_set_ref") or []
     monitoring_plan_ref = ib.get("monitoring_plan_ref") or None
@@ -77,17 +66,11 @@ def run_calculation_and_snapshot(
         monitoring_plan_ref=monitoring_plan_ref if isinstance(monitoring_plan_ref, dict) else None,
     )
 
-    # result_hash: result_bundle varsa onu kullan, yoksa legacy üzerinden üret
-    result_hash = ""
-    try:
-        result_hash = str(getattr(result_bundle, "result_hash", "") or "")
-    except Exception:
-        result_hash = ""
-
+    # result_hash computed from legacy (deterministic) if not present
+    result_hash = str((legacy or {}).get("result_hash") or "")
     if not result_hash:
         result_hash = sha256_json(legacy or {})
 
-    # results_json (DB’ye yazılacak) olarak legacy kullan
     snap = save_snapshot(
         project_id=int(project_id),
         engine_version=str((legacy or {}).get("engine_version") or "engine-0.0.0"),
