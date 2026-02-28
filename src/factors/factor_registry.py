@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any
 
 from sqlalchemy import select
 
@@ -10,7 +10,16 @@ from src.db.models import FactorSet, EmissionFactor
 from src.mrv.lineage import sha256_json
 
 
-def create_factor_set(*, project_id: int, name: str, region: str = "TR", year: int | None = None, version: str = "v1", meta: dict | None = None, created_by_user_id: int | None = None) -> FactorSet:
+def create_factor_set(
+    *,
+    project_id: int,
+    name: str,
+    region: str = "TR",
+    year: int | None = None,
+    version: str = "v1",
+    meta: dict | None = None,
+    created_by_user_id: int | None = None,
+) -> FactorSet:
     with db() as s:
         fs = FactorSet(
             project_id=int(project_id),
@@ -28,7 +37,21 @@ def create_factor_set(*, project_id: int, name: str, region: str = "TR", year: i
         return fs
 
 
-def add_factor(*, project_id: int, factor_set_id: int | None, factor_type: str, value: float, unit: str = "", region: str = "TR", year: int | None = None, version: str = "v1", source: str = "", reference: str = "", meta: dict | None = None, created_by_user_id: int | None = None) -> EmissionFactor:
+def add_factor(
+    *,
+    project_id: int,
+    factor_set_id: int | None,
+    factor_type: str,
+    value: float,
+    unit: str = "",
+    region: str = "TR",
+    year: int | None = None,
+    version: str = "v1",
+    source: str = "",
+    reference: str = "",
+    meta: dict | None = None,
+    created_by_user_id: int | None = None,
+) -> EmissionFactor:
     with db() as s:
         ef = EmissionFactor(
             project_id=int(project_id),
