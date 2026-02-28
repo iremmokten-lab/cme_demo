@@ -182,6 +182,16 @@ def cbam_reporting_to_xml(cbam_reporting: Dict[str, Any]) -> str:
         ET.SubElement(em, "IndirectAllocTCO2").text = _f(g.get("indirect_alloc_tco2"))
         ET.SubElement(em, "PrecursorTCO2").text = _f(g.get("precursor_tco2"))
         ET.SubElement(em, "EmbeddedTCO2").text = _f(g.get("embedded_tco2"))
+        # intensity
+        ET.SubElement(em, "DirectIntensityTCO2PerUnit").text = _f(g.get("direct_intensity_tco2_per_unit"), 6)
+        ET.SubElement(em, "IndirectIntensityTCO2PerUnit").text = _f(g.get("indirect_intensity_tco2_per_unit"), 6)
+        ET.SubElement(em, "EmbeddedIntensityTCO2PerUnit").text = _f(g.get("embedded_intensity_tco2_per_unit"), 6)
+
+        # carbon price paid (country of origin)
+        cp = ET.SubElement(ge, "CarbonPricePaid")
+        ET.SubElement(cp, "PaidEURPerT").text = _f(g.get("carbon_price_paid_eur_per_t"), 6)
+        ET.SubElement(cp, "PaidAmountEUR").text = _f(g.get("carbon_price_paid_amount_eur"), 2)
+        ET.SubElement(cp, "Currency").text = _s(g.get("carbon_price_paid_currency") or "EUR")
 
         ET.SubElement(ge, "DataTypeFlag").text = _s(g.get("data_type_flag"))
         ET.SubElement(ge, "MappingRule").text = _s(g.get("mapping_rule"))
