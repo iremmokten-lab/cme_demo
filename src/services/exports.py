@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import base64
 import hmac
 import io
 import json
-import os
 import zipfile
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
+from typing import Tuple, Dict, Any
 
 import pandas as pd
 from sqlalchemy import select
 
-from src.db.session import db
+from src import config as app_config
 from src.db.models import (
     CalculationSnapshot,
     DatasetUpload,
@@ -25,323 +24,78 @@ from src.db.models import (
     VerificationCase,
     VerificationFinding,
 )
+from src.db.session import db
 from src.mrv.lineage import sha256_bytes
 from src.services.reporting import build_pdf
 from src.services.ets_reporting import build_ets_reporting_dataset
 from src.services.tr_ets_reporting import build_tr_ets_reporting
-from src import config as app_config
 from src.services.storage import EVIDENCE_DOCS_CATEGORIES
 
 
 def build_xlsx_from_results(results_json: str) -> bytes:
-    """
-    Paket D4: XLSX export geliştirme
-      - KPIs
-      - CBAM_Table
-      - CBAM_Goods_Summary (varsa)
-      - ETS_Activity (varsa)
-      - AI_Benchmark / AI_Advisor / AI_Optimizer (varsa)
-    """
     results = json.loads(results_json) if results_json else {}
     kpis = results.get("kpis", {}) or {}
     table = results.get("cbam_table", []) or []
-
-    cbam_goods = []
-    try:
-        cbam_goods = (results.get("cbam") or {}).get("totals", {}).get("goods_summary", []) or []
-    except Exception:
-        cbam_goods = []
-
-    ets_activity = []
-    try:
-        ets_activity = ((results.get("ets") or {}).get("verification") or {}).get("activity_data", []) or []
-    except Exception:
-        ets_activity = []
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         pd.DataFrame([kpis]).to_excel(writer, sheet_name="KPIs", index=False)
         pd.DataFrame(table).to_excel(writer, sheet_name="CBAM_Table", index=False)
-
-        if cbam_goods:
-            pd.DataFrame(cbam_goods).to_excel(writer, sheet_name="CBAM_Goods_Summary", index=False)
-
-        if ets_activity:
-            pd.DataFrame(ets_activity).to_excel(writer, sheet_name="ETS_Activity", index=False)
-
-        # Faz 3 AI sheets
-        try:
-            ai = (results.get("ai") or {}) if isinstance(results, dict) else {}
-        except Exception:
-            ai = {}
-
-        if isinstance(ai, dict) and ai:
-            try:
-                bench = ai.get("benchmark") or {}
-                if isinstance(bench, dict) and (bench.get("products") or bench.get("outliers") or bench.get("facility")):
-                    pd.DataFrame([bench.get("facility") or {}]).to_excel(writer, sheet_name="AI_Benchmark_Facility", index=False)
-                    prows = bench.get("products") or []
-                    if isinstance(prows, list) and prows:
-                        pd.DataFrame(prows).to_excel(writer, sheet_name="AI_Benchmark_Products", index=False)
-                    orows = bench.get("outliers") or []
-                    if isinstance(orows, list) and orows:
-                        pd.DataFrame(orows).to_excel(writer, sheet_name="AI_Outliers", index=False)
-            except Exception:
-                pass
-
-            try:
-                adv = ai.get("advisor") or {}
-                if isinstance(adv, dict) and (adv.get("measures") or adv.get("hotspots")):
-                    pd.DataFrame([adv.get("hotspots") or {}]).to_excel(writer, sheet_name="AI_Hotspots", index=False)
-                    mrows = adv.get("measures") or []
-                    if isinstance(mrows, list) and mrows:
-                        pd.DataFrame(mrows).to_excel(writer, sheet_name="AI_Measures", index=False)
-                    miss = adv.get("evidence_missing_categories") or []
-                    if isinstance(miss, list) and miss:
-                        pd.DataFrame([{"missing_category": x} for x in miss]).to_excel(writer, sheet_name="AI_Evidence_Gaps", index=False)
-            except Exception:
-                pass
-
-            try:
-                opt = ai.get("optimizer") or {}
-                if isinstance(opt, dict) and (opt.get("abatement_curve") or opt.get("portfolio")):
-                    curve = opt.get("abatement_curve") or []
-                    if isinstance(curve, list) and curve:
-                        pd.DataFrame(curve).to_excel(writer, sheet_name="AI_MACC", index=False)
-                    port = opt.get("portfolio") or {}
-                    if isinstance(port, dict):
-                        pd.DataFrame([port.get("summary") or {}]).to_excel(writer, sheet_name="AI_Portfolio_Summary", index=False)
-                        sel = port.get("selected") or []
-                        if isinstance(sel, list) and sel:
-                            pd.DataFrame(sel).to_excel(writer, sheet_name="AI_Portfolio_Selected", index=False)
-            except Exception:
-                pass
-
-    return out.getvalue()
-
-
-def build_zip(files: dict[str, bytes]) -> bytes:
-    """
-    Basit ZIP builder. files: path->bytes
-    """
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for path_in_zip, bts in files.items():
-            z.writestr(path_in_zip, bts or b"")
     return out.getvalue()
 
 
 def _safe_read_bytes(uri: str) -> bytes:
-    """
-    Streamlit Cloud uyumlu: storage_uri genelde yerel path olur (./data/.. veya /tmp/..).
-    """
     if not uri:
         return b""
     try:
         p = Path(uri)
-        if p.exists() and p.is_file():
+        if p.exists():
             return p.read_bytes()
     except Exception:
         pass
-
-    # bazı ortamlarda uri file:// olabilir
-    try:
-        if uri.startswith("file://"):
-            p = Path(uri.replace("file://", ""))
-            if p.exists() and p.is_file():
-                return p.read_bytes()
-    except Exception:
-        pass
-
-    # son çare: bytes yok
     return b""
 
 
 def _snapshot_input_uris(snapshot: CalculationSnapshot) -> dict:
-    """
-    input_hashes_json -> {energy:{uri,sha256,...}, production:{...}, materials:{...}}
-    """
     try:
         ih = json.loads(snapshot.input_hashes_json or "{}")
     except Exception:
         ih = {}
-
-    # Paket D2: project upload kaydı yoksa ih boş olabilir.
-    # En iyi çaba ile DB'den latest upload çek.
-    if not ih:
-        with db() as s:
-            ups = (
-                s.execute(
-                    select(DatasetUpload)
-                    .where(DatasetUpload.project_id == snapshot.project_id)
-                    .order_by(DatasetUpload.uploaded_at.desc())
-                )
-                .scalars()
-                .all()
-            )
-        ih = {}
-        for u in ups:
-            if u.dataset_type not in ih:
-                ih[u.dataset_type] = {
-                    "upload_id": u.id,
-                    "sha256": u.sha256,
-                    "uri": u.storage_uri,
-                    "original_filename": u.original_filename,
-                    "schema_version": u.schema_version,
-                }
-
-        # normalize keys
-        ih = {
-            "energy": ih.get("energy", {}),
-            "production": ih.get("production", {}),
-            "materials": ih.get("materials", {}),
-        }
-
-    return ih
+    return {
+        "energy": ih.get("energy") or {},
+        "production": ih.get("production") or {},
+        "materials": ih.get("materials") or {},
+    }
 
 
-def _get_secret(key: str, default=None):
-    try:
-        import streamlit as st
-
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
+def _json_bytes(obj: Any) -> bytes:
+    return json.dumps(obj or {}, ensure_ascii=False, sort_keys=True, default=str, indent=2).encode("utf-8")
 
 
-def _hmac_signature(payload_bytes: bytes) -> str | None:
-    """
-    Paketin bütünlüğü için HMAC-SHA256 imza (opsiyonel).
-    Streamlit secrets: EVIDENCE_PACK_HMAC_KEY
-    """
-    key = _get_secret("EVIDENCE_PACK_HMAC_KEY", None)
+def _hmac_signature(manifest_obj: dict) -> str | None:
+    key = app_config.get_evidence_pack_hmac_key()
     if not key:
         return None
+    msg = _json_bytes({k: v for k, v in manifest_obj.items() if k != "signature"})
+    return hmac.new(key.encode("utf-8"), msg, digestmod="sha256").hexdigest()
+
+
+def _build_pdf_bytes(snapshot_id: int, title: str, data: dict) -> bytes:
     try:
-        key_b = str(key).encode("utf-8")
-        sig = hmac.new(key_b, payload_bytes, digestmod=sha256).hexdigest()
-        return sig
+        path, _sha = build_pdf(int(snapshot_id), str(title), data or {})
+        return Path(path).read_bytes()
     except Exception:
-        return None
-
-
-def _json_bytes(obj: dict) -> bytes:
-    try:
-        return json.dumps(obj or {}, ensure_ascii=False, sort_keys=True, default=str, indent=2).encode("utf-8")
-    except Exception:
-        return b"{}"
-
-
-def _report_pdf_for_snapshot(snapshot: CalculationSnapshot, results: dict, cfg: dict) -> bytes:
-    """
-    Paket D3: PDF rapor
-    """
-    payload = {
-        "kpis": (results.get("kpis") or {}) if isinstance(results, dict) else {},
-        "config": cfg,
-        "cbam": (results.get("cbam") or {}) if isinstance(results, dict) else {},
-        "cbam_table": (results.get("cbam_table") or []) if isinstance(results, dict) else [],
-        "ets": (results.get("ets") or {}) if isinstance(results, dict) else {},
-        "qa_flags": (results.get("qa_flags") or []) if isinstance(results, dict) else [],
-        "compliance_checks": (results.get("compliance_checks") or []) if isinstance(results, dict) else [],
-    }
-    try:
-        return build_pdf(payload)
-    except Exception:
-        # PDF builder fail-safe
         return b""
 
 
-def _report_hash_for_report_bytes(pdf_bytes: bytes) -> str:
-    try:
-        return sha256(pdf_bytes or b"").hexdigest()
-    except Exception:
-        return ""
-
-
-def _ensure_categories(cat: str) -> str:
-    cat_n = str(cat or "").strip()
-    if not cat_n:
+def _ensure_category(cat: str) -> str:
+    c = str(cat or "").strip()
+    if not c or c not in EVIDENCE_DOCS_CATEGORIES:
         return "documents"
-    if cat_n not in EVIDENCE_DOCS_CATEGORIES:
-        return "documents"
-    return cat_n
+    return c
 
 
-def _evidence_files_for_project(project_id: int) -> tuple[list[dict], list[tuple[str, bytes]]]:
-    """
-    evidence_manifest, evidence_files_to_zip
-    """
-    evidence_manifest = []
-    evidence_files = []
-    with db() as s:
-        docs = (
-            s.execute(
-                select(EvidenceDocument)
-                .where(EvidenceDocument.project_id == int(project_id))
-                .order_by(EvidenceDocument.uploaded_at.desc())
-            )
-            .scalars()
-            .all()
-        )
-    for d in docs:
-        cat = _ensure_categories(getattr(d, "category", "documents"))
-        fname = str(getattr(d, "original_filename", "") or "evidence.bin")
-        sha = str(getattr(d, "sha256", "") or "")
-        uri = str(getattr(d, "storage_uri", "") or "")
-        rel = f"evidence/files/{cat}/{d.id}_{fname}"
-        evidence_manifest.append(
-            {
-                "id": d.id,
-                "category": cat,
-                "original_filename": fname,
-                "sha256": sha,
-                "storage_uri": uri,
-                "path_in_pack": rel,
-                "uploaded_at": (d.uploaded_at.isoformat() if getattr(d, "uploaded_at", None) else None),
-                "notes": str(getattr(d, "notes", "") or ""),
-            }
-        )
-        evidence_files.append((rel, _safe_read_bytes(uri)))
-    return evidence_manifest, evidence_files
-
-
-def _data_quality_from_uploads(project_id: int) -> dict:
-    with db() as s:
-        ups = (
-            s.execute(
-                select(DatasetUpload)
-                .where(DatasetUpload.project_id == int(project_id))
-                .order_by(DatasetUpload.uploaded_at.desc())
-            )
-            .scalars()
-            .all()
-        )
-
-    rows = []
-    for u in ups:
-        try:
-            rep = json.loads(getattr(u, "data_quality_report_json", "{}") or "{}")
-        except Exception:
-            rep = {}
-        rows.append(
-            {
-                "dataset_type": u.dataset_type,
-                "upload_id": u.id,
-                "original_filename": u.original_filename,
-                "sha256": u.sha256,
-                "schema_version": getattr(u, "schema_version", None),
-                "storage_uri": u.storage_uri,
-                "data_quality_score": getattr(u, "data_quality_score", None),
-                "data_quality_report": rep,
-                "uploaded_at": (u.uploaded_at.isoformat() if getattr(u, "uploaded_at", None) else None),
-            }
-        )
-
-    return {"project_id": int(project_id), "uploads": rows}
-
-
-def _verification_payload(snapshot: CalculationSnapshot, period_year: int | None) -> dict:
+def _verification_payload(project_id: int, period_year: int | None) -> dict:
     if period_year is None:
         return {"case": None, "findings": []}
 
@@ -349,17 +103,13 @@ def _verification_payload(snapshot: CalculationSnapshot, period_year: int | None
         case = (
             s.execute(
                 select(VerificationCase)
-                .where(
-                    VerificationCase.project_id == int(snapshot.project_id),
-                    VerificationCase.period_year == int(period_year),
-                )
+                .where(VerificationCase.project_id == int(project_id))
+                .where(VerificationCase.period_year == int(period_year))
                 .order_by(VerificationCase.created_at.desc())
-                .limit(1)
             )
             .scalars()
             .first()
         )
-
         if not case:
             return {"case": None, "findings": []}
 
@@ -373,103 +123,89 @@ def _verification_payload(snapshot: CalculationSnapshot, period_year: int | None
             .all()
         )
 
-    case_obj = {
-        "id": case.id,
-        "project_id": case.project_id,
-        "period_year": case.period_year,
-        "verifier_org": case.verifier_org,
-        "status": case.status,
-        "created_at": (case.created_at.isoformat() if getattr(case, "created_at", None) else None),
-        "updated_at": (case.updated_at.isoformat() if getattr(case, "updated_at", None) else None),
-        "notes": case.notes,
-    }
+    def _safe_load(sv: str | None, default):
+        try:
+            return json.loads(sv or "")
+        except Exception:
+            return default
 
-    f_objs = []
-    for f in findings:
-        f_objs.append(
+    return {
+        "case": {
+            "id": int(case.id),
+            "project_id": int(case.project_id),
+            "facility_id": int(case.facility_id) if case.facility_id is not None else None,
+            "period_year": int(case.period_year) if case.period_year is not None else None,
+            "snapshot_id": int(case.snapshot_id) if case.snapshot_id is not None else None,
+            "status": str(case.status or ""),
+            "title": str(case.title or ""),
+            "description": str(case.description or ""),
+            "sampling_plan": _safe_load(getattr(case, "sampling_json", None), {}),
+            "created_at": str(case.created_at),
+            "closed_at": str(getattr(case, "closed_at", None)) if getattr(case, "closed_at", None) else None,
+        },
+        "findings": [
             {
-                "id": f.id,
-                "case_id": f.case_id,
-                "severity": f.severity,
-                "title": f.title,
-                "description": f.description,
-                "evidence_ref": f.evidence_ref,
-                "status": f.status,
-                "created_at": (f.created_at.isoformat() if getattr(f, "created_at", None) else None),
-                "resolved_at": (f.resolved_at.isoformat() if getattr(f, "resolved_at", None) else None),
+                "id": int(f.id),
+                "severity": str(f.severity or ""),
+                "title": str(f.title or ""),
+                "description": str(f.description or ""),
+                "evidence_ref": str(f.evidence_ref or ""),
+                "corrective_action": str(f.corrective_action or ""),
+                "action_due_date": str(f.action_due_date or ""),
+                "status": str(f.status or ""),
+                "created_at": str(f.created_at),
+                "resolved_at": str(getattr(f, "resolved_at", None)) if getattr(f, "resolved_at", None) else None,
             }
-        )
-
-    return {"case": case_obj, "findings": f_objs}
+            for f in findings
+        ],
+    }
 
 
 def build_evidence_pack(snapshot_id: int) -> bytes:
-    """
-    Evidence pack export (ZIP) — Paket B + Paket D4 uyumlu.
-    İçerik:
-      - input csv: energy/production/materials
-      - factor library
-      - methodology
-      - snapshot json
-      - report pdf (CBAM/ETS/DQ bölümleri)
-      - evidence documents (categories)
-      - data_quality.json
-      - compliance_checks.json (Paket B3)
-      - verification_case.json (Paket B3, varsa)
-      - manifest.json (signature dahil)
-    """
     with db() as s:
         snapshot = s.get(CalculationSnapshot, int(snapshot_id))
         if not snapshot:
             raise ValueError("Snapshot bulunamadı.")
+        project = s.get(Project, int(snapshot.project_id))
 
     inputs = _snapshot_input_uris(snapshot)
     energy_bytes = _safe_read_bytes(inputs.get("energy", {}).get("uri", ""))
     prod_bytes = _safe_read_bytes(inputs.get("production", {}).get("uri", ""))
     mat_bytes = _safe_read_bytes(inputs.get("materials", {}).get("uri", ""))
 
-    # Factor library
+    # factors
     with db() as s:
         factors = s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.year.desc())).scalars().all()
+    factor_rows = [
+        {
+            "factor_type": f.factor_type,
+            "value": f.value,
+            "unit": f.unit,
+            "source": f.source,
+            "year": f.year,
+            "version": f.version,
+            "region": f.region,
+            "reference": getattr(f, "reference", "") or "",
+        }
+        for f in factors
+    ]
 
-    factor_rows = []
-    factor_versions = {}
-    for f in factors:
-        factor_rows.append(
-            {
-                "factor_type": f.factor_type,
-                "value": f.value,
-                "unit": f.unit,
-                "source": f.source,
-                "year": f.year,
-                "version": f.version,
-                "region": f.region,
-            }
-        )
-        key = f"{f.factor_type}:{f.region}"
-        if key not in factor_versions:
-            factor_versions[key] = {"version": f.version, "year": f.year}
-
-    factors_json = {"emission_factors": factor_rows}
-
-    # Methodology
-    methodology_version = None
-    meth_obj: dict = {}
+    # methodology
+    meth_obj = {}
     if getattr(snapshot, "methodology_id", None):
         with db() as s:
             m = s.get(Methodology, int(snapshot.methodology_id))
-            if m:
-                methodology_version = m.version
-                meth_obj = {
-                    "id": m.id,
-                    "name": m.name,
-                    "description": m.description,
-                    "scope": m.scope,
-                    "version": m.version,
-                    "created_at": (m.created_at.isoformat() if getattr(m, "created_at", None) else None),
-                }
+        if m:
+            meth_obj = {
+                "id": int(m.id),
+                "name": str(m.name or ""),
+                "description": str(m.description or ""),
+                "scope": str(m.scope or ""),
+                "version": str(m.version or ""),
+                "created_at": str(getattr(m, "created_at", None)) if getattr(m, "created_at", None) else None,
+            }
 
-    # Snapshot json
+    # snapshot payload
     try:
         cfg = json.loads(snapshot.config_json or "{}")
     except Exception:
@@ -484,243 +220,145 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         res = {}
 
     snapshot_payload = {
-        "snapshot_id": snapshot.id,
-        "created_at": (snapshot.created_at.isoformat() if getattr(snapshot, "created_at", None) else None),
-        "engine_version": snapshot.engine_version,
-        "methodology_id": getattr(snapshot, "methodology_id", None),
-        "previous_snapshot_hash": getattr(snapshot, "previous_snapshot_hash", None),
-        "result_hash": snapshot.result_hash,
+        "snapshot_id": int(snapshot.id),
+        "project_id": int(snapshot.project_id),
+        "created_at": str(getattr(snapshot, "created_at", None)),
+        "engine_version": str(snapshot.engine_version or ""),
+        "input_hash": str(getattr(snapshot, "input_hash", "") or ""),
+        "result_hash": str(getattr(snapshot, "result_hash", "") or ""),
         "config": cfg,
         "input_hashes": ih,
         "results": res,
     }
 
-    # Faz 3 AI payloads (opsiyonel)
-    ai_obj = {}
-    try:
-        ai_obj = (res or {}).get("ai", {}) or {}
-    except Exception:
-        ai_obj = {}
-    if not isinstance(ai_obj, dict):
-        ai_obj = {}
+    # regulatory datasets
+    ets_json_obj = build_ets_reporting_dataset(project_id=int(snapshot.project_id), snapshot_id=int(snapshot.id), results=res or {}, config=cfg or {})
+    tr_ets_json_obj = {}
+    if app_config.get_tr_ets_mode():
+        tr_ets_json_obj = build_tr_ets_reporting(project_id=int(snapshot.project_id), snapshot_id=int(snapshot.id), results=res or {}, config=cfg or {})
 
-    ai_benchmark_bytes = _json_bytes(ai_obj.get("benchmark") or {}) if ai_obj else _json_bytes({})
-    ai_advisor_bytes = _json_bytes(ai_obj.get("advisor") or {}) if ai_obj else _json_bytes({})
-    ai_optimizer_bytes = _json_bytes(ai_obj.get("optimizer") or {}) if ai_obj else _json_bytes({})
-    ai_full_bytes = _json_bytes(ai_obj) if ai_obj else _json_bytes({})
-
-
-    # Regülasyon datasetleri (CBAM / ETS)
     cbam_xml_str = ""
     cbam_json_obj = {}
     try:
         cbam = (res or {}).get("cbam", {}) or {}
-        # orchestrator: cbam.cbam_reporting XML string
         cbam_xml_str = str(cbam.get("cbam_reporting") or "")
         cbam_json_obj = {
-        "schema": "cbam_report.v1",
-        "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
-        "products": cbam.get("table") or [],
-        "meta": cbam.get("meta") or {},
-        "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
-        "validation_status": {
-            "used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors")),
-            "notes": "Default factor kullanımı varsa actual/default flag ile raporlanır.",
-        },
+            "schema": "cbam_report.v1",
+            "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
+            "products": cbam.get("table") or [],
+            "meta": cbam.get("meta") or {},
+            "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
+            "validation_status": {"used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors"))},
         }
     except Exception:
         cbam_xml_str = ""
         cbam_json_obj = {}
 
-    cbam_xml_bytes = (cbam_xml_str.encode("utf-8") if cbam_xml_str else b"")
-    cbam_json_bytes = _json_bytes(cbam_json_obj)
-
-    # ETS reporting JSON (MRR 2018/2066 / TR ETS modu)
-    ets_json_obj = {}
-    try:
-        period = ((res or {}).get("input_bundle", {}) or {}).get("period", {}) or {}
-        installation = ((res or {}).get("input_bundle", {}) or {}).get("facility", {}) or {}
-        methodology_ref = ((res or {}).get("input_bundle", {}) or {}).get("methodology_ref", {}) or {}
-        energy_breakdown = (res or {}).get("energy", {}) or {}
-        allocation_obj = (res or {}).get("allocation", {}) or {}
-        qa = {"controls": [], "passed": [], "failed": []}
-        ets_json_obj = build_ets_reporting_dataset(
-        installation=installation,
-        period=period,
-        energy_breakdown=energy_breakdown,
-        methodology={
-            "id": methodology_ref.get("id"),
-            "name": methodology_ref.get("name"),
-            "regime": methodology_ref.get("regime"),
-            "config": {},
-        },
-        config=(cfg or {}),
-        allocation=allocation_obj,
-        qa_qc=qa,
-        tr_ets_mode=bool(app_config.get_tr_ets_mode()),
-        )
-    except Exception:
-        ets_json_obj = {}
-        ets_json_bytes = _json_bytes(ets_json_obj)
-
-    
-    # TR ETS reporting JSON (İklim Başkanlığı TR-ETS taslak özetine dayalı)
-    tr_ets_json_obj = {}
-    try:
-        if bool(app_config.get_tr_ets_mode()):
-            period = ((res or {}).get("input_bundle", {}) or {}).get("period", {}) or {}
-            year = int(period.get("year") or app_config.get_cbam_reporting_year())
-            installation = ((res or {}).get("input_bundle", {}) or {}).get("facility", {}) or {}
-            energy_rows = (energy_breakdown or {}).get("breakdown_rows", []) or []
-            electricity_rows = (energy_breakdown or {}).get("electricity_rows", []) or []
-            factor_refs = (energy_breakdown or {}).get("factor_refs", []) or []
-            verified_total = float((energy_breakdown or {}).get("total_tco2", 0.0) or 0.0)
-            pilot_s, pilot_e = app_config.get_tr_ets_pilot_years()
-            tr_ets = build_tr_ets_reporting(
-                year=year,
-                facility=installation,
-                energy_breakdown_rows=energy_rows,
-                electricity_rows=electricity_rows,
-                factor_refs=factor_refs,
-                verified_total_tco2=verified_total,
-                in_scope_threshold_tco2=app_config.get_tr_ets_threshold_tco2(),
-                pilot_start_year=pilot_s,
-                pilot_end_year=pilot_e,
-            )
-            tr_ets_json_obj = tr_ets.to_dict()
-    except Exception:
-        tr_ets_json_obj = {}
-
-    tr_ets_json_bytes = _json_bytes(tr_ets_json_obj)
-# Compliance dataset zaten compliance_json_bytes olarak yazılıyor; ayrıca gereksinim için kopya path'ler eklenecek.
-    # Compliance checks (Paket B3): snapshot sonuçlarından çıkar
-    compliance_checks = []
-    try:
-        compliance_checks = (res or {}).get("compliance_checks", []) or []
-    except Exception:
-        compliance_checks = []
-    if not isinstance(compliance_checks, list):
-        compliance_checks = []
-
+    # compliance
     compliance_payload = {
-        "snapshot_id": snapshot.id,
-        "project_id": snapshot.project_id,
-        "result_hash": snapshot.result_hash,
-        "engine_version": snapshot.engine_version,
-        "compliance_checks": compliance_checks,
+        "snapshot_id": int(snapshot.id),
+        "project_id": int(snapshot.project_id),
+        "engine_version": str(snapshot.engine_version or ""),
+        "compliance_checks": (res or {}).get("compliance_checks", []) if isinstance(res, dict) else [],
     }
 
-    # Verification case (Paket B3): project + period_year bazlı dahil et (varsa)
+    # verification
     period_year = None
     try:
         period_year = ((res or {}).get("input_bundle") or {}).get("period", {}).get("year", None)
     except Exception:
         period_year = None
-    if period_year is None:
+    if period_year is None and project is not None:
         try:
-            with db() as s:
-                p = s.get(Project, int(snapshot.project_id))
-            period_year = int(getattr(p, "period_year", 0) or 0) if p else None
+            period_year = int(getattr(project, "reporting_year", None))
         except Exception:
             period_year = None
+    verification_payload = _verification_payload(int(snapshot.project_id), int(period_year) if period_year else None)
 
-    verification_payload = _verification_payload(snapshot, int(period_year) if period_year else None)
-
-    # PDF report
-    pdf_bytes = _report_pdf_for_snapshot(snapshot, res, cfg)
-    report_hash = _report_hash_for_report_bytes(pdf_bytes)
-
-    # data quality
-    dq = _data_quality_from_uploads(snapshot.project_id)
-
-    # evidence docs
-    evidence_manifest, evidence_files_to_zip = _evidence_files_for_project(snapshot.project_id)
-
-    # bytes
-    snapshot_json_bytes = _json_bytes(snapshot_payload)
-    factors_json_bytes = _json_bytes(factors_json)
-    meth_json_bytes = _json_bytes(meth_obj)
-    dq_json_bytes = _json_bytes(dq)
-    evidence_index_bytes = _json_bytes({"evidence_documents": evidence_manifest})
-    compliance_json_bytes = _json_bytes(compliance_payload)
-    verification_json_bytes = _json_bytes(verification_payload)
-
-    # Manifest (signature payload: signature alanı hariç)
-    manifest_base = {
-        "snapshot_id": snapshot.id,
-        "engine_version": snapshot.engine_version,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "input_hashes": inputs,
-        "factor_versions": factor_versions,
-        "methodology_version": methodology_version,
-        "previous_snapshot_hash": getattr(snapshot, "previous_snapshot_hash", None),
-        "report_hash": report_hash,
-        "snapshot_hash": sha256_bytes(snapshot_json_bytes),
-        "factors_hash": sha256_bytes(factors_json_bytes),
-        "methodology_hash": sha256_bytes(meth_json_bytes),
-        "data_quality_hash": sha256_bytes(dq_json_bytes),
-        "evidence_index_hash": sha256_bytes(evidence_index_bytes),
-        "compliance_checks_hash": sha256_bytes(compliance_json_bytes),
-        "verification_case_hash": sha256_bytes(verification_json_bytes),
-        "ai_benchmark_hash": sha256_bytes(ai_benchmark_bytes),
-        "ai_advisor_hash": sha256_bytes(ai_advisor_bytes),
-        "ai_optimizer_hash": sha256_bytes(ai_optimizer_bytes),
-        "ai_full_hash": sha256_bytes(ai_full_bytes),
-        "cbam_report_xml_hash": sha256_bytes(cbam_xml_bytes),
-        "cbam_report_json_hash": sha256_bytes(cbam_json_bytes),
-        "ets_reporting_json_hash": sha256_bytes(ets_json_bytes),
-        "tr_ets_reporting_json_hash": sha256_bytes(tr_ets_json_bytes),
+    # PDFs
+    base_for_pdf = {
+        "kpis": (res or {}).get("kpis", {}) if isinstance(res, dict) else {},
+        "config": cfg or {},
+        "cbam": (res or {}).get("cbam", {}) if isinstance(res, dict) else {},
+        "cbam_table": (res or {}).get("cbam_table", []) if isinstance(res, dict) else [],
+        "ets": (res or {}).get("ets", {}) if isinstance(res, dict) else {},
+        "qa_flags": (res or {}).get("qa_flags", []) if isinstance(res, dict) else [],
+        "compliance_checks": compliance_payload.get("compliance_checks") or [],
     }
 
-    sig = _hmac_signature(_json_bytes(manifest_base))
-    manifest = dict(manifest_base)
-    manifest["signature"] = sig  # None olabilir (anahtar yoksa)
+    pdf_general = _build_pdf_bytes(snapshot.id, "Genel MRV Raporu", base_for_pdf)
+    pdf_ets = _build_pdf_bytes(snapshot.id, "ETS Raporu (EU ETS / MRR)", {"ets_reporting": ets_json_obj, **base_for_pdf})
+    pdf_cbam = _build_pdf_bytes(snapshot.id, "CBAM Raporu", {"cbam_report": cbam_json_obj, **base_for_pdf})
+    pdf_comp = _build_pdf_bytes(snapshot.id, "Uyum (Compliance) Raporu", {"compliance": compliance_payload, **base_for_pdf})
 
-    # ZIP build
+    # Evidence docs
+    with db() as s:
+        docs = (
+            s.execute(select(EvidenceDocument).where(EvidenceDocument.project_id == int(snapshot.project_id)).order_by(EvidenceDocument.uploaded_at.desc()))
+            .scalars()
+            .all()
+        )
+    evidence_index = []
+    evidence_files = []
+    for d in docs:
+        cat = _ensure_category(getattr(d, "category", "") or "")
+        uri = str(getattr(d, "storage_uri", "") or "")
+        bts = _safe_read_bytes(uri)
+        sha = sha256_bytes(bts) if bts else (str(getattr(d, "sha256", "") or ""))
+        fn = f"evidence/{cat}/{int(d.id)}_{Path(uri).name if uri else 'document.bin'}"
+        evidence_index.append({"id": int(d.id), "category": cat, "title": str(getattr(d, "title", "") or ""), "sha256": sha, "uri": uri, "path_in_pack": fn})
+        if bts:
+            evidence_files.append((fn, bts))
+
+    files: list[tuple[str, bytes]] = []
+    files += [
+        ("input/energy.csv", energy_bytes or b""),
+        ("input/production.csv", prod_bytes or b""),
+        ("input/materials.csv", mat_bytes or b""),
+        ("snapshot/snapshot.json", _json_bytes(snapshot_payload)),
+        ("factor_library/emission_factors.json", _json_bytes({"emission_factors": factor_rows})),
+        ("methodology/methodology.json", _json_bytes(meth_obj)),
+        ("cbam_report.xml", (cbam_xml_str.encode("utf-8") if cbam_xml_str else b"")),
+        ("cbam_report.json", _json_bytes(cbam_json_obj)),
+        ("ets_reporting.json", _json_bytes(ets_json_obj)),
+        ("tr_ets_reporting.json", _json_bytes(tr_ets_json_obj)),
+        ("compliance/compliance_checks.json", _json_bytes(compliance_payload)),
+        ("verification/verification_case.json", _json_bytes(verification_payload)),
+        ("report/report.pdf", pdf_general or b""),
+        ("ets_report.pdf", pdf_ets or b""),
+        ("cbam_report.pdf", pdf_cbam or b""),
+        ("compliance_report.pdf", pdf_comp or b""),
+        ("evidence/evidence_index.json", _json_bytes({"evidence": evidence_index})),
+    ]
+    files += evidence_files
+
+    manifest = {
+        "snapshot_id": int(snapshot.id),
+        "project_id": int(snapshot.project_id),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "engine_version": str(snapshot.engine_version or ""),
+        "input_hash": str(getattr(snapshot, "input_hash", "") or ""),
+        "result_hash": str(getattr(snapshot, "result_hash", "") or ""),
+        "files": [],
+    }
+    for path, bts in sorted(files, key=lambda x: x[0]):
+        manifest["files"].append({"path": path, "sha256": sha256(bts or b"").hexdigest(), "bytes": len(bts or b"")})
+
+    manifest["signature"] = _hmac_signature(manifest)
+
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json", _json_bytes(manifest))
-        # signature.json (ayrı dosya)
-        signature_obj = {"algorithm": "HMAC-SHA256", "key_id": "EVIDENCE_PACK_HMAC_KEY", "signature": manifest.get("signature")}
-        z.writestr("signature.json", _json_bytes(signature_obj))
-
-        # inputs
-        z.writestr("input/energy.csv", energy_bytes or b"")
-        z.writestr("input/production.csv", prod_bytes or b"")
-        z.writestr("input/materials.csv", mat_bytes or b"")
-
-        # reference data
-        z.writestr("factor_library/emission_factors.json", factors_json_bytes)
-        z.writestr("methodology/methodology.json", meth_json_bytes)
-
-        # snapshot + report
-        z.writestr("snapshot/snapshot.json", snapshot_json_bytes)
-        z.writestr("report/report.pdf", pdf_bytes or b"")
-        # Regülasyon çıktıları (zorunlu isimler)
-        z.writestr("cbam_report.xml", cbam_xml_bytes or b"")
-        z.writestr("cbam_report.json", cbam_json_bytes or b"")
-        z.writestr("ets_reporting.json", ets_json_bytes or b"")
-        z.writestr("tr_ets_reporting.json", tr_ets_json_bytes or b"")
-        # PDF alias (ETS)
-        z.writestr("ets_report.pdf", pdf_bytes or b"")
-
-        # data quality
-        z.writestr("data_quality/data_quality.json", dq_json_bytes)
-
-        # evidence index + files
-        z.writestr("evidence/evidence_index.json", evidence_index_bytes)
-
-        # compliance + verification (Paket B3)
-        z.writestr("compliance/compliance_checks.json", compliance_json_bytes)
-        z.writestr("verification/verification_case.json", verification_json_bytes)
-
-        # Faz 3 AI (opsiyonel)
-        z.writestr("ai/benchmark.json", ai_benchmark_bytes)
-        z.writestr("ai/advisor.json", ai_advisor_bytes)
-        z.writestr("ai/optimizer.json", ai_optimizer_bytes)
-        z.writestr("ai/ai_full.json", ai_full_bytes)
-
-        for path_in_zip, bts in evidence_files_to_zip:
-            z.writestr(path_in_zip, bts or b"")
+        z.writestr("signature.json", _json_bytes({"algorithm": "HMAC-SHA256", "key_id": "EVIDENCE_PACK_HMAC_KEY", "signature": manifest.get("signature")}))
+        for path, bts in sorted(files, key=lambda x: x[0]):
+            z.writestr(path, bts or b"")
 
     return out.getvalue()
+
+
+def export_evidence_pack(project_id: int, snapshot_id: int) -> Tuple[bytes, Dict[str, Any]]:
+    """UI/API için uyumlu wrapper: (zip_bytes, manifest_dict)."""
+    zip_bytes = build_evidence_pack(int(snapshot_id))
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+        manifest = json.loads(z.read("manifest.json").decode("utf-8"))
+    return zip_bytes, manifest
