@@ -1,80 +1,21 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import select
 
-from src.db.models import CalculationSnapshot
 from src.db.session import db
+from src.db.models import CalculationSnapshot
 from src.mrv.lineage import sha256_json
 
 
-def _safe_json_loads(s: str, default):
+def _safe_load(s: str | None, default):
     try:
         return json.loads(s or "")
     except Exception:
         return default
-
-
-@dataclass
-class SnapshotRecord:
-    id: int
-    project_id: int
-    created_at: str
-    engine_version: str
-    input_hash: str
-    result_hash: str
-    locked: bool
-    shared_with_client: bool
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "project_id": self.project_id,
-            "created_at": self.created_at,
-            "engine_version": self.engine_version,
-            "input_hash": self.input_hash,
-            "result_hash": self.result_hash,
-            "locked": self.locked,
-            "shared_with_client": self.shared_with_client,
-        }
-
-
-def get_snapshot(snapshot_id: int) -> CalculationSnapshot | None:
-    with db() as s:
-        return s.get(CalculationSnapshot, int(snapshot_id))
-
-
-def list_snapshots(project_id: int) -> list[SnapshotRecord]:
-    with db() as s:
-        rows = (
-            s.execute(
-                select(CalculationSnapshot)
-                .where(CalculationSnapshot.project_id == int(project_id))
-                .order_by(CalculationSnapshot.created_at.desc())
-            )
-            .scalars()
-            .all()
-        )
-
-    out: list[SnapshotRecord] = []
-    for r in rows:
-        out.append(
-            SnapshotRecord(
-                id=int(r.id),
-                project_id=int(r.project_id),
-                created_at=str(r.created_at),
-                engine_version=str(r.engine_version or ""),
-                input_hash=str(r.input_hash or ""),
-                result_hash=str(r.result_hash or ""),
-                locked=bool(r.locked),
-                shared_with_client=bool(r.shared_with_client),
-            )
-        )
-    return out
 
 
 def compute_input_hash(
@@ -87,6 +28,10 @@ def compute_input_hash(
     factor_set_ref: list[dict] | None,
     monitoring_plan_ref: dict | None,
 ) -> str:
+    """
+    Deterministic input-hash:
+    Aynı config + input dataset hashleri + senaryo + metodoloji + factor lock => aynı input_hash.
+    """
     payload = {
         "engine_version": str(engine_version or ""),
         "config": config or {},
@@ -97,6 +42,23 @@ def compute_input_hash(
         "monitoring_plan_ref": monitoring_plan_ref or None,
     }
     return sha256_json(payload)
+
+
+def _previous_snapshot_hash(project_id: int) -> str | None:
+    with db() as s:
+        prev = (
+            s.execute(
+                select(CalculationSnapshot)
+                .where(CalculationSnapshot.project_id == int(project_id))
+                .order_by(CalculationSnapshot.created_at.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        if not prev:
+            return None
+        return (str(prev.result_hash or "") or None)
 
 
 def save_snapshot(
@@ -111,15 +73,19 @@ def save_snapshot(
     methodology_id: int | None = None,
     factor_set_id: int | None = None,
     monitoring_plan_id: int | None = None,
-    previous_snapshot_hash: str | None = None,
     created_by_user_id: int | None = None,
     shared_with_client: bool = False,
     lock_after_create: bool = False,
 ) -> CalculationSnapshot:
+    """
+    DB'ye snapshot kaydeder. lock_after_create=True ise immutable kilitler.
+    """
+    prev_hash = _previous_snapshot_hash(project_id)
+
     with db() as s:
         snap = CalculationSnapshot(
             project_id=int(project_id),
-            engine_version=str(engine_version or ""),
+            engine_version=str(engine_version or "engine-0.0.0"),
             config_json=json.dumps(config or {}, ensure_ascii=False),
             input_hashes_json=json.dumps(input_hashes or {}, ensure_ascii=False),
             results_json=json.dumps(results or {}, ensure_ascii=False),
@@ -128,9 +94,10 @@ def save_snapshot(
             monitoring_plan_id=int(monitoring_plan_id) if monitoring_plan_id is not None else None,
             input_hash=str(input_hash or ""),
             result_hash=str(result_hash or ""),
-            previous_snapshot_hash=str(previous_snapshot_hash) if previous_snapshot_hash else None,
+            previous_snapshot_hash=prev_hash,
             created_by_user_id=int(created_by_user_id) if created_by_user_id is not None else None,
             shared_with_client=bool(shared_with_client),
+            locked=False,
         )
         s.add(snap)
         s.commit()
@@ -146,41 +113,23 @@ def save_snapshot(
         return snap
 
 
-def set_shared_with_client(snapshot_id: int, shared: bool) -> CalculationSnapshot:
+def get_snapshot(snapshot_id: int) -> CalculationSnapshot | None:
     with db() as s:
-        snap = s.get(CalculationSnapshot, int(snapshot_id))
-        if not snap:
-            raise ValueError("Snapshot bulunamadı.")
-        snap.shared_with_client = bool(shared)
-        s.commit()
-        s.refresh(snap)
-        return snap
-
-
-def delete_snapshot(snapshot_id: int):
-    with db() as s:
-        snap = s.get(CalculationSnapshot, int(snapshot_id))
-        if not snap:
-            return
-        if snap.locked:
-            raise ValueError("Kilitli snapshot silinemez.")
-        s.delete(snap)
-        s.commit()
+        return s.get(CalculationSnapshot, int(snapshot_id))
 
 
 def snapshot_payload(snapshot_id: int) -> Dict[str, Any]:
-    """Snapshot içeriğini (config+input_hashes+results) dict olarak verir."""
     snap = get_snapshot(snapshot_id)
     if not snap:
         raise ValueError("Snapshot bulunamadı.")
     return {
         "snapshot_id": int(snap.id),
         "project_id": int(snap.project_id),
-        "engine_version": str(snap.engine_version or ""),
         "created_at": str(snap.created_at),
-        "config": _safe_json_loads(snap.config_json, {}),
-        "input_hashes": _safe_json_loads(snap.input_hashes_json, {}),
-        "results": _safe_json_loads(snap.results_json, {}),
+        "engine_version": str(snap.engine_version or ""),
+        "config": _safe_load(snap.config_json, {}),
+        "input_hashes": _safe_load(snap.input_hashes_json, {}),
+        "results": _safe_load(snap.results_json, {}),
         "input_hash": str(snap.input_hash or ""),
         "result_hash": str(snap.result_hash or ""),
         "locked": bool(snap.locked),
