@@ -9,7 +9,7 @@ from src.db.session import db
 
 
 def lock_snapshot(snapshot_id: int, user_id: int | None = None) -> CalculationSnapshot:
-    """Snapshot'u immutable yapar (kilitler)."""
+    """Snapshot immutable: kilitle."""
     with db() as s:
         snap = s.get(CalculationSnapshot, int(snapshot_id))
         if not snap:
@@ -54,3 +54,14 @@ def list_snapshots(project_id: int):
             .scalars()
             .all()
         )
+
+
+def set_shared_with_client(snapshot_id: int, shared: bool) -> CalculationSnapshot:
+    with db() as s:
+        snap = s.get(CalculationSnapshot, int(snapshot_id))
+        if not snap:
+            raise ValueError("Snapshot bulunamadı.")
+        snap.shared_with_client = bool(shared)
+        s.commit()
+        s.refresh(snap)
+        return snap
