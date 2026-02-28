@@ -27,6 +27,8 @@ from src.db.models import (
 )
 from src.mrv.lineage import sha256_bytes
 from src.services.reporting import build_pdf
+from src.services.ets_reporting import build_ets_reporting_dataset
+from src.config import TR_ETS_MODE
 from src.services.storage import EVIDENCE_DOCS_CATEGORIES
 
 
@@ -506,6 +508,61 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     ai_optimizer_bytes = _json_bytes(ai_obj.get("optimizer") or {}) if ai_obj else _json_bytes({})
     ai_full_bytes = _json_bytes(ai_obj) if ai_obj else _json_bytes({})
 
+
+    # Regülasyon datasetleri (CBAM / ETS)
+    cbam_xml_str = ""
+    cbam_json_obj = {}
+    try:
+        cbam = (res or {}).get("cbam", {}) or {}
+        # orchestrator: cbam.cbam_reporting XML string
+        cbam_xml_str = str(cbam.get("cbam_reporting") or "")
+        cbam_json_obj = {
+        "schema": "cbam_report.v1",
+        "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
+        "products": cbam.get("table") or [],
+        "meta": cbam.get("meta") or {},
+        "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
+        "validation_status": {
+            "used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors")),
+            "notes": "Default factor kullanımı varsa actual/default flag ile raporlanır.",
+        },
+        }
+    except Exception:
+        cbam_xml_str = ""
+        cbam_json_obj = {}
+
+    cbam_xml_bytes = (cbam_xml_str.encode("utf-8") if cbam_xml_str else b"")
+    cbam_json_bytes = _json_bytes(cbam_json_obj)
+
+    # ETS reporting JSON (MRR 2018/2066 / TR ETS modu)
+    ets_json_obj = {}
+    try:
+        period = ((res or {}).get("input_bundle", {}) or {}).get("period", {}) or {}
+        installation = ((res or {}).get("input_bundle", {}) or {}).get("facility", {}) or {}
+        methodology_ref = ((res or {}).get("input_bundle", {}) or {}).get("methodology_ref", {}) or {}
+        energy_breakdown = (res or {}).get("energy", {}) or {}
+        allocation_obj = (res or {}).get("allocation", {}) or {}
+        qa = {"controls": [], "passed": [], "failed": []}
+        ets_json_obj = build_ets_reporting_dataset(
+        installation=installation,
+        period=period,
+        energy_breakdown=energy_breakdown,
+        methodology={
+            "id": methodology_ref.get("id"),
+            "name": methodology_ref.get("name"),
+            "regime": methodology_ref.get("regime"),
+            "config": {},
+        },
+        config=(cfg or {}),
+        allocation=allocation_obj,
+        qa_qc=qa,
+        tr_ets_mode=bool(TR_ETS_MODE),
+        )
+    except Exception:
+        ets_json_obj = {}
+        ets_json_bytes = _json_bytes(ets_json_obj)
+
+    # Compliance dataset zaten compliance_json_bytes olarak yazılıyor; ayrıca gereksinim için kopya path'ler eklenecek.
     # Compliance checks (Paket B3): snapshot sonuçlarından çıkar
     compliance_checks = []
     try:
@@ -579,6 +636,9 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "ai_advisor_hash": sha256_bytes(ai_advisor_bytes),
         "ai_optimizer_hash": sha256_bytes(ai_optimizer_bytes),
         "ai_full_hash": sha256_bytes(ai_full_bytes),
+        "cbam_report_xml_hash": sha256_bytes(cbam_xml_bytes),
+        "cbam_report_json_hash": sha256_bytes(cbam_json_bytes),
+        "ets_reporting_json_hash": sha256_bytes(ets_json_bytes),
     }
 
     sig = _hmac_signature(_json_bytes(manifest_base))
@@ -589,6 +649,9 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json", _json_bytes(manifest))
+        # signature.json (ayrı dosya)
+        signature_obj = {"algorithm": "HMAC-SHA256", "key_id": "EVIDENCE_PACK_HMAC_KEY", "signature": manifest.get("signature")}
+        z.writestr("signature.json", _json_bytes(signature_obj))
 
         # inputs
         z.writestr("input/energy.csv", energy_bytes or b"")
@@ -602,6 +665,12 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         # snapshot + report
         z.writestr("snapshot/snapshot.json", snapshot_json_bytes)
         z.writestr("report/report.pdf", pdf_bytes or b"")
+        # Regülasyon çıktıları (zorunlu isimler)
+        z.writestr("cbam_report.xml", cbam_xml_bytes or b"")
+        z.writestr("cbam_report.json", cbam_json_bytes or b"")
+        z.writestr("ets_reporting.json", ets_json_bytes or b"")
+        # PDF alias (ETS)
+        z.writestr("ets_report.pdf", pdf_bytes or b"")
 
         # data quality
         z.writestr("data_quality/data_quality.json", dq_json_bytes)
