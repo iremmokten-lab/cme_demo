@@ -9,7 +9,17 @@ from src.db.session import db
 from src.db.models import VerificationCase, VerificationFinding
 
 
-def create_case(*, project_id: int, facility_id: int | None, period_year: int, snapshot_id: int | None, title: str, description: str, verifier_org: str = "", created_by_user_id: int | None = None) -> VerificationCase:
+def create_case(
+    *,
+    project_id: int,
+    facility_id: int | None,
+    period_year: int,
+    snapshot_id: int | None,
+    title: str,
+    description: str,
+    verifier_org: str = "",
+    created_by_user_id: int | None = None,
+) -> VerificationCase:
     with db() as s:
         c = VerificationCase(
             project_id=int(project_id),
@@ -40,7 +50,17 @@ def add_sampling_plan(case_id: int, sampling_plan: dict) -> VerificationCase:
         return c
 
 
-def add_finding(*, case_id: int, severity: str, title: str, description: str, evidence_ref: str = "", corrective_action: str = "", action_due_date: str = "", created_by_user_id: int | None = None) -> VerificationFinding:
+def add_finding(
+    *,
+    case_id: int,
+    severity: str,
+    title: str,
+    description: str,
+    evidence_ref: str = "",
+    corrective_action: str = "",
+    action_due_date: str = "",
+    created_by_user_id: int | None = None,
+) -> VerificationFinding:
     with db() as s:
         f = VerificationFinding(
             case_id=int(case_id),
@@ -78,7 +98,11 @@ def export_case_json(case_id: int) -> dict:
         if not c:
             raise ValueError("Case bulunamadı.")
         findings = (
-            s.execute(select(VerificationFinding).where(VerificationFinding.case_id == int(case_id)).order_by(VerificationFinding.created_at.asc()))
+            s.execute(
+                select(VerificationFinding)
+                .where(VerificationFinding.case_id == int(case_id))
+                .order_by(VerificationFinding.created_at.asc())
+            )
             .scalars()
             .all()
         )
@@ -100,9 +124,9 @@ def export_case_json(case_id: int) -> dict:
             "title": str(c.title or ""),
             "description": str(c.description or ""),
             "verifier_org": str(c.verifier_org or ""),
-            "sampling_plan": _safe_load(c.sampling_json, {}),
+            "sampling_plan": _safe_load(getattr(c, "sampling_json", None), {}),
             "created_at": str(c.created_at),
-            "closed_at": str(c.closed_at) if c.closed_at else None,
+            "closed_at": str(c.closed_at) if getattr(c, "closed_at", None) else None,
         },
         "findings": [
             {
@@ -115,7 +139,7 @@ def export_case_json(case_id: int) -> dict:
                 "action_due_date": str(f.action_due_date or ""),
                 "status": str(f.status or ""),
                 "created_at": str(f.created_at),
-                "resolved_at": str(f.resolved_at) if f.resolved_at else None,
+                "resolved_at": str(f.resolved_at) if getattr(f, "resolved_at", None) else None,
             }
             for f in findings
         ],
