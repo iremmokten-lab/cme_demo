@@ -52,27 +52,64 @@ def _list_evidence_docs(project_id: int) -> List[EvidenceDocument]:
 def _evidence_presence_heuristics(docs: List[EvidenceDocument]) -> Dict[str, Any]:
     """Verification Regulation (2018/2067) için MVP “minimum readiness” heuristics."""
     cats = {"documents": 0, "meter_readings": 0, "invoices": 0, "contracts": 0}
-    kw = {"calibration": 0, "lab": 0, "customs": 0, "sampling": 0}
+    kw = {"calibration": 0, "lab": 0, "customs": 0}
 
     for d in docs or []:
         c = _norm(getattr(d, "category", "documents"))
         if c in cats:
             cats[c] += 1
         fn = _norm(getattr(d, "original_filename", ""))
-        if any(k in fn for k in ["kalibr", "calibrat", "calibration", "certificate", "sertifika"]):
+        if any(k in fn for k in ["kalibr", "calibrat", "calibration", "certificate"]):
             kw["calibration"] += 1
         if any(k in fn for k in ["lab", "laboratuvar", "analysis", "analiz", "test_report", "rapor"]):
             kw["lab"] += 1
-        if any(k in fn for k in ["customs", "gümrük", "gumruk", "export", "ithalat", "ihracat", "eori"]):
+        if any(k in fn for k in ["customs", "gümrük", "gumruk", "export", "ithalat", "ihracat", "invoice"]):
             kw["customs"] += 1
-        if any(k in fn for k in ["sampling", "örnek", "ornek", "sample", "universe"]):
-            kw["sampling"] += 1
 
     return {"categories": cats, "keywords": kw, "total": len(docs or [])}
 
 
-def _has_any(row: Dict[str, Any], keys: List[str]) -> bool:
-    return any((k in row) and (row.get(k) is not None) and (str(row.get(k)).strip() != "") for k in keys)
+def _cbam_completeness(cbam_reporting: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(cbam_reporting, dict):
+        return {"ok": False, "errors": ["cbam_reporting_missing_or_invalid"]}
+
+    errs: List[str] = []
+    period = cbam_reporting.get("period") or {}
+    dec = cbam_reporting.get("declarant") or {}
+    inst = cbam_reporting.get("installation") or {}
+    goods = cbam_reporting.get("goods") or []
+
+    if not period.get("year"):
+        errs.append("missing_period_year")
+    if not _norm(dec.get("company_name")):
+        errs.append("missing_declarant_company_name")
+    if not _norm(inst.get("facility_name")):
+        errs.append("missing_installation_facility_name")
+
+    # goods list: en az 1 satır beklenir (export varsa kritik)
+    if not isinstance(goods, list):
+        errs.append("goods_not_list")
+        goods = []
+    if len(goods) == 0:
+        errs.append("goods_empty")
+
+    # satır bazlı min alanlar
+    row_errs = 0
+    for g in goods[:2000]:
+        if not isinstance(g, dict):
+            row_errs += 1
+            continue
+        if not _norm(g.get("cn_code")):
+            row_errs += 1
+        if g.get("eu_import_quantity") is None:
+            row_errs += 1
+        if _norm(g.get("data_type_flag")) not in ("actual", "default"):
+            row_errs += 1
+
+    if row_errs > 0:
+        errs.append(f"goods_row_errors:{row_errs}")
+
+    return {"ok": len(errs) == 0, "errors": errs}
 
 
 def evaluate_compliance(
@@ -81,21 +118,19 @@ def evaluate_compliance(
     result_bundle: ResultBundle,
     legacy_results: Dict[str, Any],
 ) -> Tuple[List[ComplianceCheck], List[QAFlag]]:
-    """A3: Compliance Rule Engine (FAZ 1 genişletilmiş).
+    """A3: Compliance Rule Engine (FAZ 1.4 reg-grade genişletme).
 
     Kapsam:
-      - CBAM IR 2023/1773: XML-ready rapor alan doluluğu + actual/default flag + allocation trace
-      - ETS MRR 2018/2066: activity data + source streams + uncertainty/tier evidence
-      - Verification 2018/2067: evidence completeness + sampling universe readiness
+      - CBAM 2023/1773: actual/default flag + completeness (cbam_reporting)
+      - MRR 2018/2066: monitoring plan tier/method kontrolleri (MVP)
+      - Verification 2018/2067: evidence completeness + sampling universe (MVP)
     """
     checks: List[ComplianceCheck] = []
     qa_flags: List[QAFlag] = []
 
-    project_id = int(input_bundle.project_id)
-
-    # ------------------------------------------------------------
-    # 1) ETS (MRR 2018/2066) — Monitoring plan, tiers, source streams
-    # ------------------------------------------------------------
+    # -------------------------
+    # 1) MRR 2018/2066 - Monitoring plan minimum
+    # -------------------------
     mp = input_bundle.monitoring_plan_ref.to_dict() if input_bundle.monitoring_plan_ref else None
     if not mp:
         checks.append(
@@ -105,328 +140,203 @@ def evaluate_compliance(
                 severity="fail",
                 status="fail",
                 message_tr="ETS Monitoring Plan bulunamadı. Tesis için Monitoring Plan kaydı zorunludur.",
-                remediation_tr="Danışman panelinde ilgili tesis için Monitoring Plan oluşturun/güncelleyin (yöntem + tier + veri kaynağı + QA prosedürü).",
-                evidence_requirements=["monitoring_plan_record", "qa_qc_procedure_document"],
-                details={"facility": input_bundle.facility, "project_id": project_id},
+                remediation_tr="Danışman panelinde tesis için Monitoring Plan oluşturun/güncelleyin (yöntem + tier).",
+                evidence_requirements=["monitoring_plan_document", "method_statement"],
+                details={"facility_id": input_bundle.facility.get("id")},
             )
         )
     else:
-        method = str(mp.get("method") or "").strip()
-        tier = str(mp.get("tier_level") or "").strip()
-        ok = bool(method) and bool(tier)
-        checks.append(
-            _mk(
-                rule_id="MRR_MP_MIN_FIELDS",
-                reg_reference="2018/2066",
-                severity="warn" if not ok else "info",
-                status="warn" if not ok else "pass",
-                message_tr=("Monitoring Plan alanları eksik görünüyor (method/tier)." if not ok else "Monitoring Plan minimum alanları mevcut."),
-                remediation_tr=("Monitoring Plan’da method ve tier alanlarını doldurun. Verification için QA prosedürü ve veri kaynağı da önerilir." if not ok else "Planı period değişikliklerinde güncel tutun."),
-                evidence_requirements=["monitoring_plan_record"],
-                details={"monitoring_plan_ref": mp},
-            )
-        )
-
-    ets_reporting = legacy_results.get("ets_reporting") or {}
-    if isinstance(ets_reporting, dict):
-        act = (ets_reporting.get("activity_data") or {})
-        fuel_rows = act.get("fuel_rows") or []
-        elec_rows = act.get("electricity_rows") or []
-
-        if not fuel_rows and not elec_rows:
+        method = _norm(mp.get("method"))
+        tier = _norm(mp.get("tier_level"))
+        if not method or not tier:
             checks.append(
                 _mk(
-                    rule_id="MRR_ACTIVITY_DATA_REQUIRED",
+                    rule_id="MRR_MP_INCOMPLETE",
                     reg_reference="2018/2066",
-                    severity="fail",
-                    status="fail",
-                    message_tr="ETS activity data boş görünüyor (yakıt/elektrik satırı yok).",
-                    remediation_tr="energy.csv şablonuna uygun veri yükleyin (yakıt miktarları ve/veya elektrik tüketimi).",
-                    evidence_requirements=["energy_activity_data", "meter_readings", "invoices"],
-                    details={"fuel_rows": 0, "electricity_rows": 0},
+                    severity="warn",
+                    status="warn",
+                    message_tr="Monitoring Plan mevcut ancak yöntem/tier bilgisi eksik.",
+                    remediation_tr="Monitoring Plan kaydında yöntem ve tier alanlarını doldurun.",
+                    evidence_requirements=["monitoring_plan_document"],
+                    details={"monitoring_plan": mp},
                 )
             )
         else:
-            # source stream kontrolü: yakıt satırlarında temel alanlar olmalı
-            missing_fields = 0
-            for r in fuel_rows:
-                if not isinstance(r, dict):
-                    continue
-                if not _has_any(r, ["fuel_type", "fuel"]):
-                    missing_fields += 1
-                if not _has_any(r, ["quantity", "amount"]):
-                    missing_fields += 1
-                if not _has_any(r, ["unit", "quantity_unit"]):
-                    missing_fields += 1
-                # deterministik factor lock işareti: factor_meta veya factor_lock
-                if not _has_any(r, ["factor_meta", "factor_lock", "factor_set_lock"]):
-                    missing_fields += 1
-
-            sev = "warn" if missing_fields > 0 else "info"
-            status = "warn" if missing_fields > 0 else "pass"
             checks.append(
                 _mk(
-                    rule_id="MRR_SOURCE_STREAM_CONTROLS",
+                    rule_id="MRR_MP_PRESENT",
                     reg_reference="2018/2066",
-                    severity=sev,
-                    status=status,
-                    message_tr=("ETS source stream alanlarında eksikler var (yakıt türü/miktar/birim/factor lock)." if missing_fields > 0 else "ETS source stream kontrolleri (MVP) geçti."),
-                    remediation_tr=("energy.csv kolonlarını şablona uyumlu hale getirin ve factor_set_ref kilitlenmesini sağlayın." if missing_fields > 0 else "Belirsizlik (uncertainty) ve tier kanıtlarını dokümante edin."),
-                    evidence_requirements=["energy_activity_data", "meter_readings", "calibration_certificates", "factor_library_lock"],
-                    details={"missing_signals": missing_fields, "fuel_rows": len(fuel_rows), "electricity_rows": len(elec_rows)},
+                    severity="info",
+                    status="pass",
+                    message_tr="Monitoring Plan kayıtlı (MVP kontrol).",
+                    remediation_tr="",
+                    details={"monitoring_plan": mp},
                 )
             )
 
-            # uncertainty/tier evidence
-            un = ets_reporting.get("uncertainty_and_tiers") or {}
-            un_note = str(un.get("uncertainty_notes") or "").strip()
-            if not un_note:
-                checks.append(
-                    _mk(
-                        rule_id="MRR_UNCERTAINTY_NOTE",
-                        reg_reference="2018/2066",
-                        severity="warn",
-                        status="warn",
-                        message_tr="ETS belirsizlik/uncertainty notu boş görünüyor.",
-                        remediation_tr="Config alanında uncertainty_notes ekleyin ve ölçüm belirsizliği + hesaplama yaklaşımını açıklayın.",
-                        evidence_requirements=["uncertainty_assessment", "qa_qc_documents"],
-                        details={"tier_level": un.get("tier_level"), "method": un.get("method")},
-                    )
-                )
-            else:
-                checks.append(
-                    _mk(
-                        rule_id="MRR_UNCERTAINTY_NOTE",
-                        reg_reference="2018/2066",
-                        severity="info",
-                        status="pass",
-                        message_tr="ETS belirsizlik/uncertainty notu mevcut.",
-                        remediation_tr="Notu period değişikliklerinde güncel tutun ve referans dokümanlarla destekleyin.",
-                        evidence_requirements=["uncertainty_assessment"],
-                        details={"length": len(un_note)},
-                    )
-                )
-
-    # ------------------------------------------------------------
-    # 2) CBAM (2023/1773) — XML-ready reporting completeness + actual/default + allocation trace
-    # ------------------------------------------------------------
-    cbam_reporting = legacy_results.get("cbam_reporting") or {}
-    cbam_rows = legacy_results.get("cbam_table", []) or []
-
-    if not cbam_rows:
+    # -------------------------
+    # 2) CBAM 2023/1773 - reporting completeness + actual/default
+    # -------------------------
+    cbam_reporting = (legacy_results or {}).get("cbam_reporting", {}) or {}
+    comp = _cbam_completeness(cbam_reporting)
+    if not comp["ok"]:
         checks.append(
             _mk(
-                rule_id="CBAM_ROWS_REQUIRED",
+                rule_id="CBAM_REPORT_INCOMPLETE",
                 reg_reference="2023/1773",
                 severity="fail",
                 status="fail",
-                message_tr="CBAM raporlama tablosu boş görünüyor. production.csv / materials.csv içeriğini kontrol edin.",
-                remediation_tr="production.csv’de sku + CN + quantity alanlarını; varsa materials.csv’de precursor verisini sağlayın.",
-                evidence_requirements=["production_activity_data", "customs_declarations"],
-                details={"cbam_rows": 0},
-            )
-        )
-    else:
-        # alan doluluğu
-        missing_count = 0
-        flag_missing = 0
-        alloc_missing = 0
-
-        for r in cbam_rows:
-            if not isinstance(r, dict):
-                continue
-            if not _has_any(r, ["cn_code", "cn", "cncode"]):
-                missing_count += 1
-            if not _has_any(r, ["embedded_tco2", "embedded_emissions_tco2", "embedded_emissions"]):
-                missing_count += 1
-            if not _has_any(r, ["direct_alloc_tco2", "direct_tco2"]):
-                missing_count += 1
-            if not _has_any(r, ["indirect_alloc_tco2", "indirect_tco2"]):
-                missing_count += 1
-
-            if not _has_any(r, ["data_type_flag", "method_flag", "is_actual", "default_used"]):
-                flag_missing += 1
-            if not _has_any(r, ["allocation_hash", "allocation_method"]):
-                alloc_missing += 1
-
-        checks.append(
-            _mk(
-                rule_id="CBAM_FIELD_COMPLETENESS",
-                reg_reference="2023/1773",
-                severity="warn" if missing_count > 0 else "info",
-                status="warn" if missing_count > 0 else "pass",
-                message_tr=("CBAM satırlarında bazı zorunlu alanlar eksik görünüyor (CN/embedded/direct/indirect)." if missing_count > 0 else "CBAM temel alan doluluğu kontrolü geçti (MVP)."),
-                remediation_tr=("production.csv alan adlarını şablonla uyumlu hale getirin ve CBAM hesap çıktısında CN + emisyon split alanlarını doldurun." if missing_count > 0 else "Ürün bazında actual/default metodolojisini raporda netleştirin."),
-                evidence_requirements=["production_activity_data", "calculation_workings"],
-                details={"rows": len(cbam_rows), "missing_signals": missing_count},
-            )
-        )
-
-        checks.append(
-            _mk(
-                rule_id="CBAM_ACTUAL_DEFAULT_FLAG",
-                reg_reference="2023/1773",
-                severity="warn" if flag_missing > 0 else "info",
-                status="warn" if flag_missing > 0 else "pass",
-                message_tr=("CBAM satırlarında actual/default bayrağı eksik görünüyor." if flag_missing > 0 else "CBAM actual/default bayrak kontrolü geçti (best-effort)."),
-                remediation_tr=("cbam_reporting.goods[].data_type_flag alanını actual/default olacak şekilde set edin veya metodoloji notunda açıklayın." if flag_missing > 0 else "Bayrakların audit trail’de değiştirilemez şekilde saklandığından emin olun."),
-                evidence_requirements=["methodology_statement"],
-                details={"rows_without_flag": flag_missing, "rows_total": len(cbam_rows)},
-            )
-        )
-
-        checks.append(
-            _mk(
-                rule_id="CBAM_ALLOCATION_TRACE",
-                reg_reference="2023/1773",
-                severity="warn" if alloc_missing > 0 else "info",
-                status="warn" if alloc_missing > 0 else "pass",
-                message_tr=("CBAM satırlarında allocation trace (method/hash) eksik görünüyor." if alloc_missing > 0 else "Allocation trace (method/hash) mevcut."),
-                remediation_tr=("Allocation engine çıktısını results_json.allocation altında saklayın ve CBAM table satırlarına allocation_hash yazın." if alloc_missing > 0 else "Allocation hash değişikliklerinde snapshot chain'i koruyun."),
-                evidence_requirements=["allocation_workings", "calculation_workings"],
-                details={"rows_without_alloc_trace": alloc_missing, "rows_total": len(cbam_rows)},
-            )
-        )
-
-    # XML-ready structure kontrolü (cbam_reporting)
-    if not isinstance(cbam_reporting, dict) or not cbam_reporting.get("goods"):
-        checks.append(
-            _mk(
-                rule_id="CBAM_XML_READY_STRUCTURE",
-                reg_reference="2023/1773",
-                severity="warn",
-                status="warn",
-                message_tr="CBAM XML-ready rapor yapısı (cbam_reporting) boş veya bulunamadı.",
-                remediation_tr="Orchestrator cbam_reporting oluşturmalı. Snapshot üretip tekrar deneyin.",
-                evidence_requirements=["cbam_report_mapping"],
-                details={"has_cbam_reporting": isinstance(cbam_reporting, dict)},
+                message_tr="CBAM rapor yapısı eksik veya hatalı (cbam_reporting).",
+                remediation_tr="Production dosyasında CN kodları ve EU import miktarlarını kontrol edin; config içinde CBAM EORI ve iletişim e-postası girin; snapshot'ı tekrar üretin.",
+                evidence_requirements=["production_records", "customs_records", "emissions_calculation_workbook"],
+                details={"errors": comp["errors"]},
             )
         )
     else:
         checks.append(
             _mk(
-                rule_id="CBAM_XML_READY_STRUCTURE",
+                rule_id="CBAM_REPORT_READY",
                 reg_reference="2023/1773",
                 severity="info",
                 status="pass",
-                message_tr="CBAM XML-ready rapor yapısı üretildi.",
-                remediation_tr="Resmi CBAM XML formatına mapping için alan adlarını sabitleyin ve EORI/period bilgilerini tamamlayın.",
-                evidence_requirements=["cbam_report_mapping", "customs_declarations"],
-                details={"goods_count": len(cbam_reporting.get("goods") or [])},
+                message_tr="CBAM rapor yapısı (XML-ready) üretildi.",
+                remediation_tr="Evidence pack export içinde cbam_report.json ve cbam_report.xml dosyalarını doğrulayın.",
+                details={
+                    "generated_at_utc": cbam_reporting.get("generated_at_utc"),
+                    "goods_count": len(cbam_reporting.get("goods") or []),
+                },
             )
         )
 
-    # ------------------------------------------------------------
-    # 3) Verification Regulation (2018/2067) — minimum evidence + sampling universe
-    # ------------------------------------------------------------
-    docs = _list_evidence_docs(project_id)
+    # actual/default flag heuristics
+    goods = cbam_reporting.get("goods") if isinstance(cbam_reporting, dict) else []
+    actual_count = 0
+    default_count = 0
+    if isinstance(goods, list):
+        for g in goods:
+            if not isinstance(g, dict):
+                continue
+            flag = _norm(g.get("data_type_flag"))
+            if flag == "default":
+                default_count += 1
+            elif flag == "actual":
+                actual_count += 1
+
+    if (actual_count + default_count) > 0:
+        if default_count > 0:
+            checks.append(
+                _mk(
+                    rule_id="CBAM_DATA_DEFAULT_USED",
+                    reg_reference="2023/1773",
+                    severity="warn",
+                    status="warn",
+                    message_tr="CBAM raporunda 'default' veri bayrağı kullanılan kalemler var.",
+                    remediation_tr="Mümkünse 'actual' veri ile güncelleyin ve supporting evidence ekleyin (ölçüm/lab raporu, enerji faturaları, sayaç okuma).",
+                    evidence_requirements=["meter_readings", "lab_reports", "invoices"],
+                    details={"actual_count": actual_count, "default_count": default_count},
+                )
+            )
+        else:
+            checks.append(
+                _mk(
+                    rule_id="CBAM_DATA_ACTUAL",
+                    reg_reference="2023/1773",
+                    severity="info",
+                    status="pass",
+                    message_tr="CBAM raporunda tüm kalemler 'actual' olarak işaretli (MVP).",
+                    remediation_tr="",
+                    details={"actual_count": actual_count, "default_count": default_count},
+                )
+            )
+
+    # Allocation determinism check (FAZ 1.3)
+    alloc = (legacy_results or {}).get("allocation", {}) or {}
+    alloc_hash = alloc.get("allocation_hash") if isinstance(alloc, dict) else None
+    if alloc_hash:
+        checks.append(
+            _mk(
+                rule_id="ALLOCATION_DETERMINISTIC_HASH",
+                reg_reference="internal",
+                severity="info",
+                status="pass",
+                message_tr="Ürün bazlı allocation deterministik hash ile kilitlendi.",
+                remediation_tr="",
+                details={"allocation_hash": alloc_hash, "allocation_method": alloc.get("allocation_method")},
+            )
+        )
+    else:
+        checks.append(
+            _mk(
+                rule_id="ALLOCATION_HASH_MISSING",
+                reg_reference="internal",
+                severity="warn",
+                status="warn",
+                message_tr="Allocation hash bulunamadı. (Deterministik allocation beklenir.)",
+                remediation_tr="Production dosyasında sku ve quantity alanlarının dolu olduğundan emin olun; snapshot'ı tekrar üretin.",
+                details={},
+            )
+        )
+
+    # -------------------------
+    # 3) Verification 2018/2067 - evidence completeness + sampling universe
+    # -------------------------
+    docs = _list_evidence_docs(int(input_bundle.project_id))
     ev = _evidence_presence_heuristics(docs)
 
-    cats = ev.get("categories", {})
-    kw = ev.get("keywords", {})
+    # sampling universe (MVP): input satır sayıları + evidence sayısı
+    universe = {
+        "energy_rows": int((input_bundle.activity_snapshot_ref or {}).get("energy_rows", 0) or 0),
+        "production_rows": int((input_bundle.activity_snapshot_ref or {}).get("production_rows", 0) or 0),
+        "materials_rows": int((input_bundle.activity_snapshot_ref or {}).get("materials_rows", 0) or 0),
+        "evidence_total": int(ev.get("total") or 0),
+        "categories": ev.get("categories"),
+        "keywords": ev.get("keywords"),
+    }
 
-    missing = []
-    if int(cats.get("meter_readings", 0)) <= 0:
-        missing.append("meter_readings (sayaç okuması/kalibrasyon)")
-    if int(cats.get("invoices", 0)) <= 0:
-        missing.append("invoices (fatura/mutabakat)")
-    if int(cats.get("documents", 0)) <= 0:
-        missing.append("documents (prosedür/lab/ekler)")
+    # minimum evidence readiness
+    has_meter = (ev.get("categories") or {}).get("meter_readings", 0) > 0
+    has_inv = (ev.get("categories") or {}).get("invoices", 0) > 0
+    has_doc = (ev.get("categories") or {}).get("documents", 0) > 0
 
-    if missing:
+    if not (has_meter and has_inv and has_doc):
         checks.append(
             _mk(
-                rule_id="VR_MIN_EVIDENCE_SET",
-                reg_reference="2018/2067",
-                severity="fail",
-                status="fail",
-                message_tr="Verification için minimum evidence seti eksik görünüyor.",
-                remediation_tr="Evidence sekmesinden sayaç okuması/kalibrasyon, fatura ve ilgili dokümanları yükleyin. (Kategori doğru seçilmeli.)",
-                evidence_requirements=["meter_readings", "invoices", "calibration_certificates", "qa_qc_documents"],
-                details={"missing": missing, "evidence_summary": ev},
-            )
-        )
-    else:
-        checks.append(
-            _mk(
-                rule_id="VR_MIN_EVIDENCE_SET",
-                reg_reference="2018/2067",
-                severity="info",
-                status="pass",
-                message_tr="Minimum evidence seti (kategori bazlı) mevcut görünüyor.",
-                remediation_tr="Verification için sampling plan, belirsizlik hesapları ve değişiklik yönetimi eklerini de hazırlayın.",
-                evidence_requirements=["sampling_plan", "uncertainty_assessment", "change_log"],
-                details={"evidence_summary": ev},
-            )
-        )
-
-    # Sampling universe readiness (FAZ 1)
-    # Universe: fuel_rows + electricity_rows + cbam goods count
-    fu = 0
-    el = 0
-    gd = 0
-    if isinstance(ets_reporting, dict):
-        act = (ets_reporting.get("activity_data") or {})
-        fu = len(act.get("fuel_rows") or []) if isinstance(act.get("fuel_rows"), list) else 0
-        el = len(act.get("electricity_rows") or []) if isinstance(act.get("electricity_rows"), list) else 0
-    if isinstance(cbam_reporting, dict):
-        gd = len(cbam_reporting.get("goods") or []) if isinstance(cbam_reporting.get("goods"), list) else 0
-
-    universe = {"fuel_rows": fu, "electricity_rows": el, "cbam_goods": gd, "total": int(fu + el + gd)}
-
-    if int(kw.get("sampling", 0)) <= 0:
-        checks.append(
-            _mk(
-                rule_id="VR_SAMPLING_UNIVERSE",
+                rule_id="VERIF_EVIDENCE_MINIMUM",
                 reg_reference="2018/2067",
                 severity="warn",
                 status="warn",
-                message_tr="Sampling plan / sampling universe evidencesi bulunamadı (dosya adı heuristics).",
-                remediation_tr="Verifier için sampling plan dokümanı yükleyin (örn: sampling_plan.pdf) ve örnekleme evrenini (universe) tanımlayın.",
-                evidence_requirements=["sampling_plan", "sampling_universe_definition"],
-                details={"sampling_universe": universe, "keyword_hits": kw.get("sampling", 0)},
+                message_tr="Verification için minimum evidence seti eksik görünüyor (MVP).",
+                remediation_tr="Sayaç okuma/kalibrasyon, enerji faturaları ve prosedür/lab raporu gibi belgeleri Evidence bölümüne yükleyin.",
+                evidence_requirements=["meter_readings", "invoices", "documents"],
+                details={"universe": universe},
             )
         )
     else:
         checks.append(
             _mk(
-                rule_id="VR_SAMPLING_UNIVERSE",
+                rule_id="VERIF_EVIDENCE_PRESENT",
                 reg_reference="2018/2067",
                 severity="info",
                 status="pass",
-                message_tr="Sampling plan / sampling universe evidencesi bulundu (heuristics).",
-                remediation_tr="Sampling plan'ın period ve veri setleri ile uyumlu olduğundan emin olun.",
-                evidence_requirements=["sampling_plan"],
-                details={"sampling_universe": universe},
+                message_tr="Verification için minimum evidence seti mevcut (MVP).",
+                remediation_tr="Sampling plan için evidence pack manifestini ve cbam_report dosyalarını kullanın.",
+                details={"universe": universe},
             )
         )
 
-    # Calibration evidence check
-    if int(kw.get("calibration", 0)) <= 0:
-        checks.append(
-            _mk(
-                rule_id="VR_CALIBRATION_EVIDENCE",
-                reg_reference="2018/2067",
-                severity="warn",
-                status="warn",
-                message_tr="Kalibrasyon evidencesi (dosya adı heuristics) bulunamadı.",
-                remediation_tr="Sayaç kalibrasyon sertifikalarını meter_readings kategorisinde yükleyin.",
-                evidence_requirements=["calibration_certificates"],
-                details={"keyword_hits": kw.get("calibration", 0), "evidence_summary": ev},
+    # QA Flags bağlama
+    for q in (result_bundle.qa_flags or []):
+        if _norm(getattr(q, "severity", "")) == "fail":
+            checks.append(
+                _mk(
+                    rule_id=f"QA_{_norm(getattr(q, 'flag_id', ''))}".upper(),
+                    reg_reference="internal",
+                    severity="fail",
+                    status="fail",
+                    message_tr=str(getattr(q, "message_tr", "") or "Kalite kontrol hatası."),
+                    remediation_tr="İlgili dataset'i düzeltin ve tekrar yükleyin.",
+                    details={"context": getattr(q, "context", {})},
+                )
             )
-        )
-    else:
-        checks.append(
-            _mk(
-                rule_id="VR_CALIBRATION_EVIDENCE",
-                reg_reference="2018/2067",
-                severity="info",
-                status="pass",
-                message_tr="Kalibrasyon evidencesi bulundu (heuristics).",
-                remediation_tr="Sertifikaların geçerlilik tarihlerini period ile eşleştirin.",
-                evidence_requirements=["calibration_certificates"],
-                details={"keyword_hits": kw.get("calibration", 0)},
-            )
-        )
 
     return checks, qa_flags
