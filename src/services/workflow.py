@@ -5,11 +5,13 @@ import json
 import pandas as pd
 from sqlalchemy import select
 
-from src.db.models import CalculationSnapshot, DatasetUpload, EmissionFactor, SnapshotDatasetLink, SnapshotFactorLink
+from src.db.models import CalculationSnapshot, DatasetUpload
 from src.db.session import db
 from src.mrv.audit import append_audit
 from src.mrv.compliance import evaluate_compliance
+from src.mrv.strict_validator import build_compliance_checks_json
 from src.mrv.lineage import sha256_json
+from src.services.compliance_reports import save_compliance_checks_report
 
 
 def _run_phase3_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
@@ -120,7 +122,6 @@ def _input_hashes_payload(project_id: int, energy_u: DatasetUpload, prod_u: Data
     """Activity data snapshot ref.
     DatasetUpload modelinde içerik hash alanı `sha256` olarak tutulur.
     """
-
     payload = {
         "project_id": int(project_id),
         "energy": {
@@ -219,56 +220,13 @@ def create_snapshot(
     monitoring_plan_id: int | None = None,
     created_by_user_id: int | None = None,
     previous_snapshot_hash: str | None = None,
-    base_snapshot_id: int | None = None,
 ) -> CalculationSnapshot:
-    """Immutable-by-policy snapshot persist.
+    """Persist immutable-by-policy snapshot.
 
-    Bu fonksiyon *tek doğruluk kaynağı* olan snapshot kaydını oluşturur ve
-    denetim için gerekli hash/governance alanlarını deterministik şekilde doldurur.
-
-    Kilitli hale getirme ayrı bir aksiyondur (lock_snapshot).
+    - locked=False başlangıçta draft; lock edildikten sonra değiştirilemez/silinemez.
+    - input_hash = canonical input bundle hash (config + dataset hashes + factor refs + methodology ref)
+    - result_hash = canonical result bundle hash
     """
-
-    # --- derive audit hashes from deterministic bundle
-    input_bundle = (results_json or {}).get("input_bundle") or {}
-    if not isinstance(input_bundle, dict):
-        input_bundle = {}
-
-    factor_set_ref = input_bundle.get("factor_set_ref") or []
-    if not isinstance(factor_set_ref, list):
-        factor_set_ref = []
-
-    methodology_ref = input_bundle.get("methodology_ref") or None
-    if methodology_ref is not None and not isinstance(methodology_ref, dict):
-        methodology_ref = None
-
-    dataset_hashes = {
-        "energy": ((input_hashes or {}).get("energy") or {}).get("sha256"),
-        "production": ((input_hashes or {}).get("production") or {}).get("sha256"),
-        "materials": (((input_hashes or {}).get("materials") or {}) if (input_hashes or {}).get("materials") else {}).get("sha256"),
-    }
-
-    factor_set_hash = sha256_json(factor_set_ref or [])
-    methodology_hash = sha256_json(methodology_ref or {})
-
-    # price evidence must be frozen for replay; store inside snapshot for evidence pack
-    price_evidence_list = []
-    try:
-        pe = (config or {}).get("_price_evidence")
-        if isinstance(pe, dict) and pe:
-            price_evidence_list.append(pe)
-        pe2 = (config or {}).get("_price_evidence_list")
-        if isinstance(pe2, list):
-            for x in pe2:
-                if isinstance(x, dict) and x:
-                    price_evidence_list.append(x)
-    except Exception:
-        price_evidence_list = []
-
-    scenario_meta = input_bundle.get("scenario") if isinstance(input_bundle.get("scenario"), dict) else {}
-    if not isinstance(scenario_meta, dict):
-        scenario_meta = {}
-
     with db() as s:
         snap = CalculationSnapshot(
             project_id=int(project_id),
@@ -278,75 +236,20 @@ def create_snapshot(
             config_json=json.dumps(config or {}, ensure_ascii=False, sort_keys=True, default=str),
             input_hashes_json=json.dumps(input_hashes or {}, ensure_ascii=False, sort_keys=True, default=str),
             results_json=json.dumps(results_json or {}, ensure_ascii=False, sort_keys=True, default=str),
-            dataset_hashes_json=json.dumps(dataset_hashes or {}, ensure_ascii=False, sort_keys=True, default=str),
-            factor_set_hash=str(factor_set_hash or ""),
-            methodology_hash=str(methodology_hash or ""),
             methodology_id=int(methodology_id) if methodology_id is not None else None,
             factor_set_id=int(factor_set_id) if factor_set_id is not None else None,
             monitoring_plan_id=int(monitoring_plan_id) if monitoring_plan_id is not None else None,
             previous_snapshot_hash=str(previous_snapshot_hash) if previous_snapshot_hash else None,
-            base_snapshot_id=int(base_snapshot_id) if base_snapshot_id is not None else None,
-            scenario_meta_json=json.dumps(scenario_meta or {}, ensure_ascii=False, sort_keys=True, default=str),
-            price_evidence_json=json.dumps(price_evidence_list or [], ensure_ascii=False, sort_keys=True, default=str),
             created_by_user_id=int(created_by_user_id) if created_by_user_id is not None else None,
         )
         s.add(snap)
         s.commit()
         s.refresh(snap)
 
-        # --- Link datasets for DB-level immutability
-        for dkey in ["energy", "production", "materials"]:
-            info = (input_hashes or {}).get(dkey) or None
-            if not isinstance(info, dict):
-                continue
-            du_id = info.get("upload_id")
-            if du_id is None:
-                continue
-            try:
-                link = SnapshotDatasetLink(
-                    snapshot_id=int(snap.id),
-                    datasetupload_id=int(du_id),
-                    dataset_type=str(dkey),
-                    sha256=str(info.get("sha256") or ""),
-                    storage_uri=str(info.get("uri") or ""),
-                )
-                s.add(link)
-            except Exception:
-                continue
-
-        # --- Link factors used in snapshot (used_in_snapshots governance)
-        for fr in factor_set_ref or []:
-            if not isinstance(fr, dict):
-                continue
-            fid = fr.get("id")
-            if fid is None:
-                continue
-            try:
-                link = SnapshotFactorLink(
-                    snapshot_id=int(snap.id),
-                    factor_id=int(fid),
-                    factor_type=str(fr.get("factor_type") or ""),
-                    region=str(fr.get("region") or "TR"),
-                    year=(int(fr.get("year")) if fr.get("year") is not None and str(fr.get("year")).strip() != "" else None),
-                    version=str(fr.get("version") or "v1"),
-                    factor_hash=str(fr.get("factor_hash") or ""),
-                )
-                s.add(link)
-            except Exception:
-                continue
-
-        s.commit()
-
         if append_audit:
             append_audit(
                 "snapshot_created",
-                {
-                    "snapshot_id": snap.id,
-                    "input_hash": input_hash,
-                    "result_hash": result_hash,
-                    "factor_set_hash": factor_set_hash,
-                    "methodology_hash": methodology_hash,
-                },
+                {"snapshot_id": snap.id, "input_hash": input_hash, "result_hash": result_hash},
                 user_id=created_by_user_id,
                 company_id=None,
                 entity_type="snapshot",
@@ -371,29 +274,6 @@ def run_full(
     - Snapshot reuse deterministik candidate_hash ile yapılır
     """
     scenario = scenario or {}
-
-    # --- Carbon price evidence freeze (CBAM / ETS cost)
-    # External feeds MUST NOT be used for locked snapshots. We freeze the values here and store in snapshot config.
-    from datetime import datetime, timezone
-
-    cfg = dict(config or {})
-    try:
-        eua = float(cfg.get("eua_price_eur_per_t") or cfg.get("eua_price") or 0.0)
-    except Exception:
-        eua = 0.0
-    try:
-        fx = float(cfg.get("fx_tl_per_eur") or cfg.get("eur_try") or 0.0)
-    except Exception:
-        fx = 0.0
-    cfg["_price_evidence"] = {
-        "price_type": "EUA_EUR_PER_T",
-        "price_value": eua,
-        "fx_tl_per_eur": fx,
-        "source": "user_config_or_secrets",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "hash": sha256_json({"eua_price_eur_per_t": eua, "fx_tl_per_eur": fx, "source": "user_config_or_secrets"}),
-    }
-    config = cfg
 
     from src.mrv.orchestrator import ENGINE_VERSION_PACKET_A, run_orchestrator  # circular import için local import
 
@@ -458,27 +338,87 @@ def run_full(
     results_json = legacy_results.get("results_json", {}) or {}
 
     # Standard outputs
-    results_json["compliance_checks"] = [c.to_dict() for c in (compliance_checks or [])]
-    results_json["qa_flags"] = [q.to_dict() for q in (qa_flags_extra or [])]
+    results_json["compliance_checks"] = [c.to_dict() for c in compliance_checks]
+    existing_qa = results_json.get("qa_flags", []) or []
+    if not isinstance(existing_qa, list):
+        existing_qa = []
+    results_json["qa_flags"] = existing_qa + [q.to_dict() for q in qa_flags_extra]
 
-    # Faz 3 AI
-    results_json["ai"] = _run_phase3_ai(project_id, legacy_results, config)
+    # Backward compat block
+    results_json["compliance"] = {
+        "compliance_checks": results_json["compliance_checks"],
+        "qa_flags": results_json["qa_flags"],
+    }
 
-    previous_snapshot_hash = _latest_snapshot_hash(project_id)
+    det = results_json.get("deterministic", {}) or {}
+    if not isinstance(det, dict):
+        det = {}
+    det["snapshot_result_hash"] = candidate_hash
+    results_json["deterministic"] = det
+
+    
+    # HARD FAIL strict validator (ETS + CBAM)
+    tr_mode = False
+    try:
+        from src import config as _cfg
+        tr_mode = bool(getattr(_cfg, "TR_ETS_MODE", False)) or bool((_cfg.load_app_config() or {}).get("TR_ETS_MODE", False))
+    except Exception:
+        tr_mode = False
+
+    strict_obj = build_compliance_checks_json(
+        project_id=int(project_id),
+        snapshot_id=None,
+        config=(config or {}),
+        results_json=results_json,
+        tr_ets_mode=bool(tr_mode),
+    )
+    results_json["compliance_strict"] = strict_obj
+    results_json["compliance_status"] = strict_obj.get("overall_status") or "PASS"
+
+# Faz 3 AI outputs
+    try:
+        ai_payload = _run_phase3_ai(int(project_id), legacy_results, (config or {}))
+        if ai_payload:
+            results_json["ai"] = ai_payload
+    except Exception:
+        pass
+
+    prev_hash = _latest_snapshot_hash(project_id)
 
     snap = create_snapshot(
         project_id=int(project_id),
         engine_version=ENGINE_VERSION_PACKET_A,
-        input_hash=str(candidate_hash),
-        result_hash=str(result_bundle.result_hash or ""),
+        input_hash=candidate_hash,
+        result_hash=str(result_bundle.result_hash),
         config=(config or {}),
         input_hashes=input_hashes,
         results_json=results_json,
         methodology_id=methodology_id,
-        factor_set_id=None,
-        monitoring_plan_id=None,
         created_by_user_id=created_by_user_id,
-        previous_snapshot_hash=previous_snapshot_hash,
+        previous_snapshot_hash=prev_hash,
     )
+
+
+    # compliance_checks.json (HARD FAIL) dosyasını oluştur ve rapor kayıtlarına yaz
+    try:
+        # snapshot_id artık kesin
+        strict_now = results_json.get("compliance_strict") or {}
+        if isinstance(strict_now, dict):
+            strict_now["snapshot_id"] = int(snap.id)
+            results_json["compliance_strict"] = strict_now
+        save_compliance_checks_report(
+            project_id=int(project_id),
+            snapshot_id=int(snap.id),
+            compliance_obj=(results_json.get("compliance_strict") or {}),
+            created_by_user_id=created_by_user_id,
+        )
+    except Exception:
+        # Hard fail validator raporu üretilemese bile snapshot üretimi bozulmasın.
+        pass
+
+    try:
+        append_audit("snapshot_created", {"snapshot_id": snap.id, "result_hash": candidate_hash})
+    except Exception:
+        pass
 
     return snap
