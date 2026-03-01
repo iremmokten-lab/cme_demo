@@ -1,0 +1,253 @@
+{
+  "config_keys": [
+    {
+      "desc_tr": "Rapor yılı.",
+      "key": "period.year",
+      "required_for": [
+        "ETS",
+        "CBAM",
+        "TR_ETS"
+      ]
+    },
+    {
+      "desc_tr": "CBAM transitional dönemde çeyrek.",
+      "key": "period.quarter",
+      "required_for": [
+        "CBAM"
+      ]
+    },
+    {
+      "desc_tr": "Declarant/importer kimliği.",
+      "key": "importer.id",
+      "required_for": [
+        "CBAM"
+      ]
+    },
+    {
+      "desc_tr": "İzleme sınırları.",
+      "key": "monitoring_plan.boundaries",
+      "required_for": [
+        "ETS",
+        "TR_ETS"
+      ]
+    }
+  ],
+  "datasets": [
+    {
+      "columns": [
+        {
+          "desc_tr": "Tüketim ayı.",
+          "name": "month",
+          "required": true,
+          "type": "YYYY-MM"
+        },
+        {
+          "desc_tr": "Tesis kimliği.",
+          "name": "facility_id",
+          "required": true,
+          "type": "int"
+        },
+        {
+          "desc_tr": "Yakıt/enerji türü (natural_gas, diesel, electricity vb.).",
+          "name": "fuel_type",
+          "required": true,
+          "type": "str"
+        },
+        {
+          "desc_tr": "1=direct combustion, 2=elektrik (indirect).",
+          "name": "scope",
+          "required": true,
+          "type": "int"
+        },
+        {
+          "desc_tr": "Miktar (birimle birlikte).",
+          "name": "activity_amount",
+          "required": true,
+          "type": "float"
+        },
+        {
+          "desc_tr": "Nm3, t, MWh vb.",
+          "name": "unit",
+          "required": true,
+          "type": "str"
+        },
+        {
+          "desc_tr": "Eğer ölçüm bazlı EF kullanılıyorsa. Aksi halde factor registry ile eşlenir.",
+          "name": "emission_factor_kgco2_per_unit",
+          "required": false,
+          "type": "float"
+        }
+      ],
+      "dataset_type": "energy",
+      "file_name": "energy.csv",
+      "notes_tr": "Mevcut template dosyaları eski olabilir; bu sözlük regülasyon-grade şemadır.",
+      "purpose_tr": "Yakıt ve elektrik tüketimi (ETS activity data + CBAM indirect).",
+      "required_for": [
+        "ETS",
+        "CBAM",
+        "TR_ETS"
+      ]
+    },
+    {
+      "columns": [
+        {
+          "desc_tr": "Aylık raporlama yapılacaksa.",
+          "name": "month",
+          "required": false,
+          "type": "YYYY-MM"
+        },
+        {
+          "desc_tr": "İç ürün kodu.",
+          "name": "sku",
+          "required": true,
+          "type": "str"
+        },
+        {
+          "desc_tr": "Ürün adı.",
+          "name": "product_name",
+          "required": false,
+          "type": "str"
+        },
+        {
+          "desc_tr": "CBAM Annex I CN kodu.",
+          "name": "cn_code",
+          "required": false,
+          "type": "str"
+        },
+        {
+          "desc_tr": "CBAM 6 sektör etiketi.",
+          "name": "sector",
+          "required": false,
+          "type": "str"
+        },
+        {
+          "desc_tr": "Toplam üretim/ithalat miktarı (ton veya MWh).",
+          "name": "quantity",
+          "required": true,
+          "type": "float"
+        },
+        {
+          "desc_tr": "ton/MWh/kg vb.",
+          "name": "quantity_unit",
+          "required": false,
+          "type": "str"
+        },
+        {
+          "desc_tr": "AB'ye giden miktar.",
+          "name": "export_to_eu_quantity",
+          "required": false,
+          "type": "float"
+        },
+        {
+          "desc_tr": "CBAM kapsam işareti.",
+          "name": "cbam_covered",
+          "required": false,
+          "type": "int(0/1)"
+        },
+        {
+          "desc_tr": "CBAM veri türü.",
+          "name": "actual_default_flag",
+          "required": false,
+          "type": "ACTUAL/DEFAULT"
+        }
+      ],
+      "dataset_type": "production",
+      "file_name": "production.csv",
+      "purpose_tr": "Ürün üretimi ve CBAM ürün miktarları.",
+      "required_for": [
+        "CBAM",
+        "TR_ETS"
+      ]
+    },
+    {
+      "columns": [
+        {
+          "desc_tr": "Ürün kimliği.",
+          "name": "product_id",
+          "required": true,
+          "type": "str"
+        },
+        {
+          "desc_tr": "Ürün adı.",
+          "name": "product_name",
+          "required": true,
+          "type": "str"
+        },
+        {
+          "desc_tr": "CN code.",
+          "name": "cn_code",
+          "required": true,
+          "type": "str"
+        },
+        {
+          "desc_tr": "cement/iron_steel/aluminium/fertilisers/electricity/hydrogen.",
+          "name": "sector",
+          "required": true,
+          "type": "str"
+        },
+        {
+          "desc_tr": "Miktar.",
+          "name": "quantity",
+          "required": true,
+          "type": "float"
+        },
+        {
+          "desc_tr": "ton/MWh/kg.",
+          "name": "quantity_unit",
+          "required": true,
+          "type": "str"
+        },
+        {
+          "desc_tr": "Direct emissions.",
+          "name": "direct_emissions_tco2e",
+          "required": true,
+          "type": "float"
+        },
+        {
+          "desc_tr": "Indirect emissions.",
+          "name": "indirect_emissions_tco2e",
+          "required": true,
+          "type": "float"
+        },
+        {
+          "desc_tr": "Direct + Indirect.",
+          "name": "embedded_emissions_tco2e",
+          "required": true,
+          "type": "float"
+        },
+        {
+          "desc_tr": "Yoğunluk.",
+          "name": "intensity_tco2e_per_unit",
+          "required": true,
+          "type": "float"
+        },
+        {
+          "desc_tr": "ACTUAL/DEFAULT.",
+          "name": "actual_default_flag",
+          "required": true,
+          "type": "str"
+        },
+        {
+          "desc_tr": "DEFAULT ise zorunlu.",
+          "name": "default_value_source",
+          "required": false,
+          "type": "str"
+        },
+        {
+          "desc_tr": "DEFAULT ise zorunlu.",
+          "name": "default_value_version",
+          "required": false,
+          "type": "str"
+        }
+      ],
+      "dataset_type": "cbam_products",
+      "file_name": "cbam_products.csv",
+      "notes_tr": "Bu dataset Adım-3'te hesap motoru ile otomatik üretilebilir; şimdilik manuel upload opsiyonu.",
+      "purpose_tr": "CBAM ürün bazında rapor satırları (CN code, direct/indirect/embedded).",
+      "required_for": [
+        "CBAM"
+      ]
+    }
+  ],
+  "version": "2026.03.01"
+}
