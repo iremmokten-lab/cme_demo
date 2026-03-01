@@ -1,37 +1,42 @@
-from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+import json, hashlib, os
+from datetime import datetime
 
-from src.services.exports import build_evidence_pack
-from src.mrv.replay import replay
-from src.mrv.snapshot_store import snapshot_payload
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path,'rb') as f:
+        h.update(f.read())
+    return h.hexdigest()
 
+def generate_evidence_pack(snapshot_id, files, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
 
-def export_evidence_pack_zip(project_id: int, snapshot_id: int) -> Tuple[bytes, Dict[str, Any]]:
-    """
-    UI/Service için tek giriş noktası:
-      - ZIP bytes
-      - manifest dict (ZIP içindeki manifest.json)
-    """
-    zip_bytes = build_evidence_pack(int(snapshot_id))
+    manifest = {
+        "snapshot_id": snapshot_id,
+        "generated_at": datetime.utcnow().isoformat(),
+        "files": []
+    }
 
-    # manifest dict'i ZIP içinden oku
-    import zipfile, io, json
-    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
-        manifest = json.loads(z.read("manifest.json").decode("utf-8"))
-    return zip_bytes, manifest
+    for f in files:
+        if os.path.exists(f):
+            manifest["files"].append({
+                "path": f,
+                "sha256": sha256_file(f)
+            })
 
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    with open(manifest_path,"w",encoding="utf-8") as fp:
+        json.dump(manifest, fp, indent=2)
 
-def audit_replay_check(snapshot_id: int) -> Dict[str, Any]:
-    snap = snapshot_payload(int(snapshot_id))
-    rep = replay(int(snapshot_id))
+    signature = {
+        "manifest_hash": sha256_file(manifest_path)
+    }
+
+    sig_path = os.path.join(out_dir,"signature.json")
+    with open(sig_path,"w",encoding="utf-8") as fp:
+        json.dump(signature, fp, indent=2)
+
     return {
-        "snapshot": {
-            "snapshot_id": int(snapshot_id),
-            "input_hash": snap.get("input_hash"),
-            "result_hash": snap.get("result_hash"),
-            "locked": snap.get("locked"),
-        },
-        "replay": rep,
-        "status": "PASS" if rep.get("input_hash_match") and rep.get("result_hash_match") else "FAIL",
+        "manifest": manifest_path,
+        "signature": sig_path
     }
