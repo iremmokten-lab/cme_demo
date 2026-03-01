@@ -402,6 +402,76 @@ def build_pdf(snapshot_id: int, report_title: str, report_data: dict) -> tuple[s
         y = _draw_bullets(c, [str(x) for x in formulas], margin_x, y, max_width=500, body_font=body_font, font_size=10)
         y -= 6
 
+    # ----------------------------
+    # Faz 4: AI & Optimizasyon (opsiyonel)
+    # ----------------------------
+    ai = (report_data or {}).get("ai") or {}
+    if isinstance(ai, dict) and ai:
+        if y < 160:
+            c.showPage()
+            y = height - margin_y
+            c.setFont(body_font, 10)
+
+        y = _draw_heading(c, margin_x, y, "AI & Optimizasyon Özeti", bold_font)
+
+        # Advisor measures summary
+        try:
+            adv = ai.get("advisor") or {}
+            measures = (adv.get("measures") or []) if isinstance(adv, dict) else []
+        except Exception:
+            measures = []
+
+        if measures:
+            y = _wrap_text(c, "Önerilen aksiyonlar, snapshot çıktıları üzerinden deterministik olarak üretilmiştir.", margin_x, y, 500, body_font, 10)
+            y -= 4
+            top_titles = []
+            for m in measures[:5]:
+                if isinstance(m, dict):
+                    t = str(m.get("title") or m.get("id") or "Aksiyon")
+                    pct = m.get("expected_reduction_pct_of_total")
+                    if pct is not None and str(pct).strip() != "":
+                        t = f"{t} (~%{pct})"
+                    top_titles.append(t)
+            if top_titles:
+                y = _draw_bullets(c, top_titles, margin_x, y, max_width=500, body_font=body_font, font_size=10)
+                y -= 6
+
+        # Optimizer portfolio
+        try:
+            opt = ai.get("optimizer") or {}
+            port = (opt.get("portfolio") or {}) if isinstance(opt, dict) else {}
+            summ = (port.get("summary") or {}) if isinstance(port, dict) else {}
+        except Exception:
+            summ = {}
+
+        if summ:
+            y = _draw_heading(c, margin_x, y, "Seçilen Portföy (Optimizer)", bold_font)
+            y = _draw_kv(c, margin_x, y, "Seçilen Aksiyon Sayısı", str(summ.get("selected_count")), body_font)
+            y = _draw_kv(c, margin_x, y, "Toplam Azaltım (tCO2/yıl)", _fmt_num(summ.get("reduction_tco2"), 3), body_font)
+            y = _draw_kv(c, margin_x, y, "Toplam CAPEX (EUR)", _fmt_num(summ.get("capex_eur"), 2), body_font)
+            y = _draw_kv(c, margin_x, y, "Yıllıklaştırılmış Maliyet (EUR/yıl)", _fmt_num(summ.get("annualized_cost_eur"), 2), body_font)
+            if summ.get("avg_cost_per_tco2") is not None:
+                y = _draw_kv(c, margin_x, y, "Ortalama Maliyet (EUR/tCO2)", _fmt_num(summ.get("avg_cost_per_tco2"), 2), body_font)
+            y -= 6
+
+        # Scenario simulation
+        try:
+            sc = ai.get("scenario") or {}
+        except Exception:
+            sc = {}
+
+        if isinstance(sc, dict) and sc:
+            y = _draw_heading(c, margin_x, y, "Maliyet Senaryosu (Tahmini)", bold_font)
+            base = sc.get("baseline") or {}
+            scen = sc.get("scenario") or {}
+            delta = sc.get("delta") or {}
+            if isinstance(base, dict) and isinstance(scen, dict):
+                y = _draw_kv(c, margin_x, y, "Baz Emisyon (tCO2)", _fmt_num(base.get("total_emissions_tco2"), 3), body_font)
+                y = _draw_kv(c, margin_x, y, "Senaryo Emisyon (tCO2)", _fmt_num(scen.get("total_emissions_tco2"), 3), body_font)
+            if isinstance(delta, dict):
+                y = _draw_kv(c, margin_x, y, "ETS Maliyet Değişimi (EUR)", _fmt_num(delta.get("ets_cost_eur"), 2), body_font)
+            y -= 6
+
     c.showPage()
     c.save()
 
