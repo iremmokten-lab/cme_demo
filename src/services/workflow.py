@@ -9,9 +9,7 @@ from src.db.models import CalculationSnapshot, DatasetUpload
 from src.db.session import db
 from src.mrv.audit import append_audit
 from src.mrv.compliance import evaluate_compliance
-from src.mrv.strict_validator import build_compliance_checks_json
 from src.mrv.lineage import sha256_json
-from src.services.compliance_reports import save_compliance_checks_report
 
 
 def _run_phase3_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
@@ -118,7 +116,7 @@ def latest_upload(project_id: int, dataset_type: str) -> DatasetUpload | None:
         )
 
 
-def _input_hashes_payload(project_id: int, energy_u: DatasetUpload, prod_u: DatasetUpload, materials_u: DatasetUpload | None) -> dict:
+def _input_hashes_payload(project_id: int, energy_u: DatasetUpload, prod_u: DatasetUpload, materials_u: DatasetUpload | None, cbam_defaults_u: DatasetUpload | None) -> dict:
     """Activity data snapshot ref.
     DatasetUpload modelinde içerik hash alanı `sha256` olarak tutulur.
     """
@@ -147,6 +145,17 @@ def _input_hashes_payload(project_id: int, energy_u: DatasetUpload, prod_u: Data
                 "schema_version": str(getattr(materials_u, "schema_version", "") or ""),
             }
             if materials_u
+            else None
+        ),
+        "cbam_defaults": (
+            {
+                "upload_id": getattr(cbam_defaults_u, "id", None),
+                "sha256": getattr(cbam_defaults_u, "sha256", None),
+                "uri": str(getattr(cbam_defaults_u, "storage_uri", "") or ""),
+                "original_filename": str(getattr(cbam_defaults_u, "original_filename", "") or ""),
+                "schema_version": str(getattr(cbam_defaults_u, "schema_version", "") or ""),
+            }
+            if cbam_defaults_u
             else None
         ),
     }
@@ -280,19 +289,24 @@ def run_full(
     energy_u = latest_upload(project_id, "energy")
     prod_u = latest_upload(project_id, "production")
     materials_u = latest_upload(project_id, "materials")
+    cbam_defaults_u = latest_upload(project_id, "cbam_defaults")
 
     if not energy_u:
         raise ValueError("energy.csv yüklenmemiş.")
     if not prod_u:
         raise ValueError("production.csv yüklenmemiş.")
 
-    input_hashes = _input_hashes_payload(project_id, energy_u, prod_u, materials_u)
+    input_hashes = _input_hashes_payload(project_id, energy_u, prod_u, materials_u, cbam_defaults_u)
 
     energy_df = load_csv_from_uri(str(getattr(energy_u, "storage_uri", "") or ""))
     prod_df = load_csv_from_uri(str(getattr(prod_u, "storage_uri", "") or ""))
     materials_df = None
+    cbam_defaults_df = None
     if materials_u and str(getattr(materials_u, "storage_uri", "") or ""):
         materials_df = load_csv_from_uri(str(getattr(materials_u, "storage_uri", "") or ""))
+
+    if cbam_defaults_u and str(getattr(cbam_defaults_u, "storage_uri", "") or ""):
+        cbam_defaults_df = load_csv_from_uri(str(getattr(cbam_defaults_u, "storage_uri", "") or ""))
 
     input_bundle, result_bundle, legacy_results = run_orchestrator(
         project_id=int(project_id),
@@ -303,6 +317,7 @@ def run_full(
         energy_df=energy_df,
         production_df=prod_df,
         materials_df=materials_df,
+        cbam_defaults_df=cbam_defaults_df,
     )
 
     # Reuse key
@@ -356,26 +371,7 @@ def run_full(
     det["snapshot_result_hash"] = candidate_hash
     results_json["deterministic"] = det
 
-    
-    # HARD FAIL strict validator (ETS + CBAM)
-    tr_mode = False
-    try:
-        from src import config as _cfg
-        tr_mode = bool(getattr(_cfg, "TR_ETS_MODE", False)) or bool((_cfg.load_app_config() or {}).get("TR_ETS_MODE", False))
-    except Exception:
-        tr_mode = False
-
-    strict_obj = build_compliance_checks_json(
-        project_id=int(project_id),
-        snapshot_id=None,
-        config=(config or {}),
-        results_json=results_json,
-        tr_ets_mode=bool(tr_mode),
-    )
-    results_json["compliance_strict"] = strict_obj
-    results_json["compliance_status"] = strict_obj.get("overall_status") or "PASS"
-
-# Faz 3 AI outputs
+    # Faz 3 AI outputs
     try:
         ai_payload = _run_phase3_ai(int(project_id), legacy_results, (config or {}))
         if ai_payload:
@@ -397,24 +393,6 @@ def run_full(
         created_by_user_id=created_by_user_id,
         previous_snapshot_hash=prev_hash,
     )
-
-
-    # compliance_checks.json (HARD FAIL) dosyasını oluştur ve rapor kayıtlarına yaz
-    try:
-        # snapshot_id artık kesin
-        strict_now = results_json.get("compliance_strict") or {}
-        if isinstance(strict_now, dict):
-            strict_now["snapshot_id"] = int(snap.id)
-            results_json["compliance_strict"] = strict_now
-        save_compliance_checks_report(
-            project_id=int(project_id),
-            snapshot_id=int(snap.id),
-            compliance_obj=(results_json.get("compliance_strict") or {}),
-            created_by_user_id=created_by_user_id,
-        )
-    except Exception:
-        # Hard fail validator raporu üretilemese bile snapshot üretimi bozulmasın.
-        pass
 
     try:
         append_audit("snapshot_created", {"snapshot_id": snap.id, "result_hash": candidate_hash})
