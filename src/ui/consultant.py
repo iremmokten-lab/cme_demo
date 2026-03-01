@@ -186,12 +186,13 @@ def consultant_app(user):
 
     # Uploads
     with tabs[0]:
-        st.subheader("CSV Uploads (energy / production / materials)")
+        st.subheader("CSV Uploads (energy / production / materials / cbam_defaults)")
         st.caption("Yeni şema: energy(month, facility_id, fuel_type, fuel_quantity, fuel_unit)")
 
         up_energy = st.file_uploader("energy.csv", type=["csv"], key="up_energy")
         up_prod = st.file_uploader("production.csv", type=["csv"], key="up_prod")
         up_mat = st.file_uploader("materials.csv (precursor)", type=["csv"], key="up_mat")
+        up_cbam_def = st.file_uploader("cbam_defaults.csv (DEFAULT intensiteler)", type=["csv"], key="up_cbam_def")
 
         def _handle_upload(uploaded, dtype: str):
             if uploaded is None:
@@ -242,12 +243,13 @@ def consultant_app(user):
             _handle_upload(up_energy, "energy")
             _handle_upload(up_prod, "production")
             _handle_upload(up_mat, "materials")
+            _handle_upload(up_cbam_def, "cbam_defaults")
         except Exception as e:
             st.error("Upload hatası")
             st.exception(e)
 
         st.markdown("### Excel (XLSX) Ingestion (Faz 2)")
-        st.caption("CSV yanında XLSX template ingestion. Sheet isimleri: energy, production, materials")
+        st.caption("CSV yanında XLSX template ingestion. Sheet isimleri: energy, production, materials, cbam_defaults")
 
         colx1, colx2 = st.columns([2, 1])
         with colx2:
@@ -268,9 +270,10 @@ def consultant_app(user):
 
             try:
                 sheets = read_xlsx_sheets(xfile.getvalue())
-                missing = [k for k in ("energy", "production", "materials") if k not in sheets]
+                required = ("energy", "production")
+                missing = [k for k in required if k not in sheets]
                 if missing:
-                    st.error(f"XLSX içinde eksik sheet var: {missing}. Gerekli: energy, production, materials")
+                    st.error(f"XLSX içinde eksik sheet var: {missing}. Gerekli: {list(required)} | Opsiyonel: ['materials', 'cbam_defaults']")
                 else:
                     st.success("XLSX okundu. Sheet'ler CSV gibi ingest edilecek.")
                     class _Uploaded(io.BytesIO):
