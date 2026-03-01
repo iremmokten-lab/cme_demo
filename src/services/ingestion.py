@@ -46,8 +46,17 @@ def validate_csv(dataset_type: str, df: pd.DataFrame) -> list[str]:
             errors.append("Production şeması bekleniyor: month, facility_id, product_code/product, quantity, unit.")
     elif dtype == "materials":
         required_row = {"month", "facility_id", "material", "quantity", "unit"}
+        # Step-3: materials.csv iki amaçla kullanılabilir:
+        #  (a) klasik malzeme EF (material, quantity, unit, emission_factor)
+        #  (b) precursor zinciri (sku, precursor_sku, precursor_quantity, ...)
+        precursor_min = {"sku", "precursor_sku", "precursor_quantity"}
+        if not (required_row.issubset(cols) or precursor_min.issubset(cols)):
+            errors.append("Materials şeması bekleniyor: (month, facility_id, material, quantity, unit) veya precursor: (sku, precursor_sku, precursor_quantity).")
+    elif dtype == "cbam_defaults":
+        required_row = {"cbam_good_key", "direct_intensity_tco2_per_unit", "indirect_intensity_tco2_per_unit", "unit", "source", "version"}
+        # cn_code opsiyonel; yoksa cbam_good_key üzerinden eşleşir
         if not required_row.issubset(cols):
-            errors.append("Materials şeması bekleniyor: month, facility_id, material, quantity, unit.")
+            errors.append("CBAM defaults şeması bekleniyor: cbam_good_key, direct_intensity_tco2_per_unit, indirect_intensity_tco2_per_unit, unit, source, version (cn_code opsiyonel).")
     else:
         # esnek
         if "month" not in cols:
@@ -159,14 +168,14 @@ def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_xlsx_sheets(xlsx_bytes: bytes) -> dict[str, pd.DataFrame]:
-    """Beklenen sheet isimleri: energy, production, materials"""
+    """Beklenen sheet isimleri: energy, production, materials, cbam_defaults"""
     import io
 
     xf = pd.ExcelFile(io.BytesIO(xlsx_bytes))
     out: dict[str, pd.DataFrame] = {}
     for name in xf.sheet_names:
         key = _norm(name)
-        if key in ("energy", "production", "materials"):
+        if key in ("energy", "production", "materials", "cbam_defaults"):
             df = pd.read_excel(xf, sheet_name=name)
             out[key] = df
     return out
