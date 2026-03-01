@@ -123,24 +123,20 @@ class DatasetUpload(Base):
     sha256 = Column(String(64), default="", index=True)
 
     # Newer naming (kept for compatibility)
-    content_hash = Column(String(64), default="", index=True)
-
-    # Storage (Streamlit Cloud friendly)
+    content_hash = Column(String(64), default="")
     storage_uri = Column(String(500), default="")
 
-    # Small-file DB storage (legacy + cloud)
+    # Streamlit Cloud storage (optional)
     content_bytes = Column(LargeBinary, nullable=True)
-    content_b64 = Column(Text, nullable=True)
+    content_b64 = Column(Text, default="")
 
+    # Validation / DQ
     meta_json = Column(Text, default="{}")
-
-    # Data Quality fields used by exports/ui
     validated = Column(Boolean, default=False)
     data_quality_score = Column(Integer, default=0)
     data_quality_report_json = Column(Text, default="{}")
 
     uploaded_at = Column(DateTime(timezone=True), default=utcnow)
-    uploaded_by_user_id = Column(Integer, nullable=True)
 
     project = relationship("Project", back_populates="uploads")
 
@@ -151,49 +147,44 @@ class EvidenceDocument(Base):
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
 
-    # Legacy fields (UI + exports)
+    title = Column(String(200), nullable=False)
+    description = Column(Text, default="")
+
     original_filename = Column(String(255), default="")
-    title = Column(String(255), nullable=False, default="Evidence")
-    category = Column(String(80), default="documents")  # invoice / meter / lab / contract / statement / ...
-    doc_type = Column(String(80), default="generic")
+    category = Column(String(80), default="documents")
     notes = Column(Text, default="")
 
     sha256 = Column(String(64), default="", index=True)
-    content_hash = Column(String(64), default="", index=True)
-
+    content_hash = Column(String(64), default="")
     storage_uri = Column(String(500), default="")
-
-    # DB copy (optional)
     content_bytes = Column(LargeBinary, nullable=True)
-    content_b64 = Column(Text, nullable=True)
-    mime_type = Column(String(120), default="application/octet-stream")
-
+    content_b64 = Column(Text, default="")
+    mime_type = Column(String(120), default="")
     meta_json = Column(Text, default="{}")
 
     uploaded_at = Column(DateTime(timezone=True), default=utcnow)
-    uploaded_by_user_id = Column(Integer, nullable=True)
 
     project = relationship("Project", back_populates="evidence_docs")
 
 
 # ----------------------------
-# Methodology / monitoring plan (MRR / MRV)
+# Monitoring plan / methodology
 # ----------------------------
 class Methodology(Base):
     __tablename__ = "methodologies"
+    __table_args__ = (UniqueConstraint("project_id", "name", "version", name="uq_methodology_identity"),)
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
 
     name = Column(String(200), nullable=False)
-    regime = Column(String(50), default="ets", index=True)  # cbam / ets / tr_ets / internal
+    version = Column(String(50), default="v1")
+    scope = Column(String(120), default="")
 
-    config_json = Column(Text, default="{}")
+    description = Column(Text, default="")
 
     created_at = Column(DateTime(timezone=True), default=utcnow)
     created_by_user_id = Column(Integer, nullable=True)
-
-    is_active = Column(Boolean, default=True)
 
     project = relationship("Project", back_populates="methodologies")
     snapshots = relationship("CalculationSnapshot", back_populates="methodology")
@@ -204,39 +195,41 @@ class MonitoringPlan(Base):
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True, index=True)
 
-    name = Column(String(200), nullable=False)
-    plan_json = Column(Text, default="{}")
+    method = Column(String(120), default="calculation")
+    tier_level = Column(String(50), default="Tier 2")
 
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-    created_by_user_id = Column(Integer, nullable=True)
+    config_json = Column(Text, default="{}")
 
-    is_active = Column(Boolean, default=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_by_user_id = Column(Integer, nullable=True)
 
     project = relationship("Project", back_populates="monitoring_plans")
 
 
 # ----------------------------
-# Factors (versioned, deterministic)
+# Factor governance
 # ----------------------------
 class FactorSet(Base):
     __tablename__ = "factorsets"
+    __table_args__ = (UniqueConstraint("project_id", "name", "region", "year", "version", name="uq_factorset_identity"),)
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
 
     name = Column(String(200), nullable=False)
-    region = Column(String(20), default="TR", index=True)
+    region = Column(String(20), default="TR")
+    year = Column(Integer, nullable=True)
     version = Column(String(50), default="v1")
-    year = Column(Integer, nullable=True, index=True)
 
     meta_json = Column(Text, default="{}")
-    created_at = Column(DateTime(timezone=True), default=utcnow)
-    created_by_user_id = Column(Integer, nullable=True)
 
     locked = Column(Boolean, default=False)
     locked_at = Column(DateTime(timezone=True), nullable=True)
-    locked_by_user_id = Column(Integer, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    created_by_user_id = Column(Integer, nullable=True)
 
     project = relationship("Project", back_populates="factor_sets")
     factors = relationship("EmissionFactor", back_populates="factor_set", cascade="all, delete-orphan")
@@ -252,15 +245,27 @@ class EmissionFactor(Base):
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     factor_set_id = Column(Integer, ForeignKey("factorsets.id"), nullable=True, index=True)
 
+    # Governance identity
     factor_type = Column(String(120), nullable=False, index=True)
     region = Column(String(20), default="TR", index=True)
     year = Column(Integer, nullable=True, index=True)
     version = Column(String(50), default="v1")
 
+    # Value
     value = Column(Float, nullable=False, default=0.0)
     unit = Column(String(50), default="")
     source = Column(String(255), default="")
     reference = Column(Text, default="")
+    methodology = Column(Text, default="")  # methodology / tier note
+
+    # Validity window (audit / replay)
+    valid_from = Column(String(30), default="")  # ISO date string for portability (Streamlit Cloud)
+    valid_to = Column(String(30), default="")
+
+    # Immutability / drift control
+    locked = Column(Boolean, default=False)
+    factor_hash = Column(String(64), default="", index=True)
+
     meta_json = Column(Text, default="{}")
 
     created_at = Column(DateTime(timezone=True), default=utcnow)
@@ -280,28 +285,45 @@ class CalculationSnapshot(Base):
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow)
+
+    # Engine / orchestration versioning (replayability)
     engine_version = Column(String(50), default="engine-0.0.0")
 
-    config_json = Column(Text, default="{}")
-    input_hashes_json = Column(Text, default="{}")
-    results_json = Column(Text, default="{}")
+    # Core payloads (canonical JSON)
+    config_json = Column(Text, default="{}")          # monitoring plan / config / methodology params
+    input_hashes_json = Column(Text, default="{}")    # dataset refs (sha256/uri/ids)
+    results_json = Column(Text, default="{}")         # calculation output + reports payloads
 
+    # Explicit governance refs
     methodology_id = Column(Integer, ForeignKey("methodologies.id"), nullable=True, index=True)
     factor_set_id = Column(Integer, ForeignKey("factorsets.id"), nullable=True, index=True)
     monitoring_plan_id = Column(Integer, ForeignKey("monitoringplans.id"), nullable=True, index=True)
 
-    # Audit-ready hashes
+    # Deterministic hash set (audit-ready)
+    dataset_hashes_json = Column(Text, default="{}")  # per dataset hash map (energy/production/materials)
+    factor_set_hash = Column(String(64), default="", index=True)
+    methodology_hash = Column(String(64), default="", index=True)
+
+    # Input/Result hashes (single source of truth)
     input_hash = Column(String(64), default="", index=True)
     result_hash = Column(String(64), default="", index=True)
 
+    # Scenario lineage
     previous_snapshot_hash = Column(String(64), nullable=True, index=True)
+    base_snapshot_id = Column(Integer, nullable=True, index=True)  # scenario base snapshot if any
+    scenario_meta_json = Column(Text, default="{}")
+
+    # External evidence frozen for replay (e.g., carbon price)
+    price_evidence_json = Column(Text, default="[]")
 
     created_by_user_id = Column(Integer, nullable=True)
 
-    locked = Column(Boolean, default=False)
+    # Immutability
+    locked = Column(Boolean, default=False, index=True)
     locked_at = Column(DateTime(timezone=True), nullable=True)
     locked_by_user_id = Column(Integer, nullable=True)
 
+    # Sharing (client/verifier read-only)
     shared_with_client = Column(Boolean, default=False)
 
     project = relationship("Project", back_populates="snapshots")
@@ -309,6 +331,46 @@ class CalculationSnapshot(Base):
     methodology = relationship("Methodology", back_populates="snapshots")
     factor_set = relationship("FactorSet")
     monitoring_plan = relationship("MonitoringPlan")
+
+
+class SnapshotDatasetLink(Base):
+    """Snapshot ↔ DatasetUpload bağları (DB-level immutability & audit).
+
+    Amaç:
+      - Snapshot oluşturulduğu anda hangi dataset upload'larının kullanıldığını kayıt etmek
+      - Kilitli snapshot'lar için datasetupload silme/güncelleme işlemlerini DB katmanında engellemek (SQLite trigger ile)
+    """
+    __tablename__ = "snapshot_dataset_links"
+    __table_args__ = (UniqueConstraint("snapshot_id", "datasetupload_id", name="uq_snapshot_dataset_link"),)
+
+    id = Column(Integer, primary_key=True)
+    snapshot_id = Column(Integer, ForeignKey("calculationsnapshots.id"), nullable=False, index=True)
+    datasetupload_id = Column(Integer, ForeignKey("datasetuploads.id"), nullable=False, index=True)
+
+    dataset_type = Column(String(50), default="", index=True)
+    sha256 = Column(String(64), default="", index=True)
+    storage_uri = Column(String(500), default="")
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class SnapshotFactorLink(Base):
+    """Snapshot ↔ EmissionFactor bağları (factor governance / used_in_snapshots)."""
+    __tablename__ = "snapshot_factor_links"
+    __table_args__ = (UniqueConstraint("snapshot_id", "factor_id", name="uq_snapshot_factor_link"),)
+
+    id = Column(Integer, primary_key=True)
+    snapshot_id = Column(Integer, ForeignKey("calculationsnapshots.id"), nullable=False, index=True)
+    factor_id = Column(Integer, ForeignKey("emissionfactors.id"), nullable=False, index=True)
+
+    factor_type = Column(String(120), default="", index=True)
+    region = Column(String(20), default="TR", index=True)
+    year = Column(Integer, nullable=True, index=True)
+    version = Column(String(50), default="v1")
+
+    factor_hash = Column(String(64), default="", index=True)
+
+    created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
 class VerificationCase(Base):
@@ -353,7 +415,7 @@ class VerificationFinding(Base):
     title = Column(String(200), nullable=False)
     description = Column(Text, default="")
 
-    # Evidence and actions
+    # Evidence and action
     evidence_ref = Column(String(200), default="")
     corrective_action = Column(Text, default="")
     action_due_date = Column(String(30), default="")
@@ -406,15 +468,13 @@ class AuditEvent(Base):
     __tablename__ = "auditevents"
 
     id = Column(Integer, primary_key=True)
-    at = Column(DateTime(timezone=True), default=utcnow, index=True)
+    at = Column(DateTime(timezone=True), default=utcnow)
 
-    action = Column(String(80), nullable=False, index=True)
+    action = Column(String(120), nullable=False, index=True)
+    meta_json = Column(Text, default="{}")
 
-    user_id = Column(Integer, nullable=True, index=True)
-    company_id = Column(Integer, nullable=True, index=True)
-    project_id = Column(Integer, nullable=True, index=True)
+    user_id = Column(Integer, nullable=True)
+    company_id = Column(Integer, nullable=True)
 
-    entity_type = Column(String(80), default="")
-    entity_id = Column(String(80), default="")
-
-    details_json = Column(Text, default="{}")
+    entity_type = Column(String(120), default="")
+    entity_id = Column(String(120), default="")
