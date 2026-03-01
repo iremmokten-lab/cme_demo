@@ -415,6 +415,7 @@ def run_orchestrator(
         "compliance_checks": [],
     }
 
+    legacy_results["config"] = dict(config or {})
     legacy_results["results_json"] = dict(legacy_results)
 
     return input_bundle, result_bundle, legacy_results
