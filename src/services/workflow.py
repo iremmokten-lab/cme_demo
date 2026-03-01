@@ -12,17 +12,18 @@ from src.mrv.compliance import evaluate_compliance
 from src.mrv.lineage import sha256_json
 
 
-def _run_phase3_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
-    """Faz 3: Benchmark + Advisor + Optimizer.
+def _run_phase4_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
+    """Faz 4: Senaryo motoru + AI öneriler + optimizasyon + maliyet simülasyonu.
 
-    - Deterministik: sadece snapshot sonuçları + config.ai.optimizer_constraints kullanır.
-    - Evidence gap: project'e bağlı evidence kategorilerine göre çıkar.
+    - Deterministik: sadece snapshot sonuçları + config.ai.* kullanır.
+    - Çıktı: benchmark, advisor(measures), optimizer(MACC+portfolio), scenario_simulation
     """
 
     try:
         from src.engine.advisor import build_reduction_advice
         from src.engine.benchmark import build_benchmark_report
         from src.engine.optimizer import build_optimizer_payload
+        from src.engine.scenario import simulate_cost_scenario
     except Exception:
         return {}
 
@@ -44,10 +45,7 @@ def _run_phase3_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
     # Evidence categories present
     categories = []
     try:
-        from sqlalchemy import select
-
         from src.db.models import EvidenceDocument
-        from src.db.session import db
 
         with db() as s:
             cats = (
@@ -87,12 +85,21 @@ def _run_phase3_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
 
     opt = build_optimizer_payload(total_tco2=total_tco2, measures=(advice.get("measures") or []), constraints=constraints)
 
+    # Senaryo simülasyonu: optimizer.portfolio.selected ile baseline kıyasla
+    scenario = {}
+    try:
+        selected = (((opt or {}).get("portfolio") or {}).get("selected") or [])
+        scenario = simulate_cost_scenario(results=results, config=(config or {}), portfolio_selected=selected)
+    except Exception:
+        scenario = {}
+
     return {
         "benchmark": bench,
         "advisor": advice,
         "optimizer": opt,
+        "scenario": scenario,
         "meta": {
-            "phase": "faz3",
+            "phase": "faz4",
             "optimizer_constraints": constraints,
             "evidence_categories_present": categories,
         },
@@ -373,7 +380,7 @@ def run_full(
 
     # Faz 3 AI outputs
     try:
-        ai_payload = _run_phase3_ai(int(project_id), legacy_results, (config or {}))
+        ai_payload = _run_phase4_ai(int(project_id), legacy_results, (config or {}))
         if ai_payload:
             results_json["ai"] = ai_payload
     except Exception:
@@ -397,20 +404,6 @@ def run_full(
     try:
         append_audit("snapshot_created", {"snapshot_id": snap.id, "result_hash": candidate_hash})
     except Exception:
-        pass
-
-
-    # Faz 2: Karbon maliyeti raporlarını otomatik üret (JSON + PDF)
-    try:
-        from src.services.carbon_cost_reports import save_carbon_cost_reports
-
-        save_carbon_cost_reports(
-            project_id=int(project_id),
-            snapshot_id=int(snap.id),
-            created_by_user_id=created_by_user_id,
-        )
-    except Exception:
-        # Faz 2 raporu üretilemezse snapshot üretimi yine de başarısız olmasın
         pass
 
     return snap
