@@ -1,0 +1,174 @@
+spec_id: CBAM_2023_956_2023_1773
+title_tr: CBAM (EU 2023/956 + 2023/1773) Rapor Şablonu Eşlemesi
+version: 2026.03.01
+regulation_refs:
+- name: Regulation (EU) 2023/956 (CBAM)
+  url: https://eur-lex.europa.eu/eli/reg/2023/956/oj/eng
+- name: Implementing Regulation (EU) 2023/1773 (Transitional reporting)
+  url: https://eur-lex.europa.eu/eli/reg_impl/2023/1773/oj/eng
+scope_sectors:
+- cement
+- iron_steel
+- aluminium
+- fertilisers
+- electricity
+- hydrogen
+fields:
+- key: reporting.period.quarter
+  label_tr: Raporlama Dönemi (Çeyrek)
+  required: MUST
+  source: config
+  internal_path: config.period.quarter
+  notes_tr: Transitional dönemde çeyreklik rapor.
+- key: reporting.period.year
+  label_tr: Raporlama Yılı
+  required: MUST
+  source: config
+  internal_path: config.period.year
+  notes_tr: ''
+- key: declarant.importer_id
+  label_tr: İthalatçı/Declarant Kimliği
+  required: MUST
+  source: config
+  internal_path: config.importer.id
+  notes_tr: AB tarafında raporu veren.
+- key: declarant.country
+  label_tr: İthalatçı Ülke
+  required: SHOULD
+  source: config
+  internal_path: config.importer.country
+  notes_tr: ''
+- key: products[]
+  label_tr: Ürün Listesi
+  required: MUST
+  source: dataset.cbam_products
+  internal_path: datasets.cbam_products
+  notes_tr: Her CN code için kayıt.
+- key: products[].product_name
+  label_tr: Ürün Adı
+  required: MUST
+  source: dataset.cbam_products
+  internal_path: cbam.product_name
+  notes_tr: ''
+- key: products[].cn_code
+  label_tr: CN Kodu
+  required: MUST
+  source: dataset.cbam_products
+  internal_path: cbam.cn_code
+  notes_tr: Annex I kapsam kontrolü CN code ile yapılır.
+- key: products[].sector
+  label_tr: Sektör (6 grup)
+  required: MUST
+  source: dataset.cbam_products
+  internal_path: cbam.sector
+  notes_tr: cement/iron_steel/aluminium/fertilisers/electricity/hydrogen.
+- key: products[].quantity
+  label_tr: Miktar
+  required: MUST
+  source: dataset.cbam_products
+  internal_path: cbam.quantity
+  notes_tr: Ton veya MWh.
+- key: products[].quantity_unit
+  label_tr: Miktar Birimi
+  required: MUST
+  source: dataset.cbam_products
+  internal_path: cbam.unit
+  notes_tr: ''
+- key: products[].direct_emissions_tco2e
+  label_tr: Doğrudan Emisyon (tCO2e)
+  required: MUST
+  source: calculation_or_dataset
+  internal_path: cbam.direct_tco2
+  notes_tr: Ürün için tahsis edilen direct emissions.
+- key: products[].indirect_emissions_tco2e
+  label_tr: Dolaylı Emisyon (tCO2e)
+  required: MUST
+  source: calculation_or_dataset
+  internal_path: cbam.indirect_tco2
+  notes_tr: Elektrik tüketimi kaynaklı.
+- key: products[].embedded_emissions_tco2e
+  label_tr: Gömülü Emisyon (tCO2e)
+  required: MUST
+  source: calculation
+  internal_path: cbam.embedded_tco2
+  notes_tr: Direct + Indirect.
+- key: products[].intensity_tco2e_per_unit
+  label_tr: Yoğunluk (tCO2e/ton veya tCO2e/MWh)
+  required: MUST
+  source: calculation
+  internal_path: cbam.intensity
+  notes_tr: ''
+- key: products[].actual_default_flag
+  label_tr: Actual/Default Bayrağı
+  required: MUST
+  source: dataset.cbam_products
+  internal_path: cbam.actual_default
+  notes_tr: DEFAULT kullanılırsa kaynak+versiyon zorunlu.
+- key: products[].default_value_source
+  label_tr: Default Değer Kaynağı
+  required: CONDITIONAL
+  condition: actual_default_flag == 'DEFAULT'
+  source: dataset_or_config
+  internal_path: cbam.default_source
+  notes_tr: Komisyon default values dokümanı ve sürümü.
+- key: products[].default_value_version
+  label_tr: Default Değer Sürümü
+  required: CONDITIONAL
+  condition: actual_default_flag == 'DEFAULT'
+  source: dataset_or_config
+  internal_path: cbam.default_version
+  notes_tr: ''
+- key: products[].electricity_consumption_mwh
+  label_tr: Elektrik Tüketimi (MWh)
+  required: SHOULD
+  source: dataset.cbam_products
+  internal_path: cbam.electricity_mwh
+  notes_tr: Electrolysis/elektrik yoğun proseslerde önemlidir.
+- key: products[].electricity_emission_factor
+  label_tr: Elektrik Emisyon Faktörü
+  required: SHOULD
+  source: factors_or_dataset
+  internal_path: cbam.electricity_ef
+  notes_tr: ''
+- key: precursors[]
+  label_tr: Precursor/Girdi Zinciri
+  required: SHOULD
+  source: dataset.cbam_precursors
+  internal_path: datasets.cbam_precursors
+  notes_tr: Steel/Aluminium için kritik.
+- key: precursors[].parent_product_cn
+  label_tr: Ana Ürün CN
+  required: SHOULD
+  source: dataset.cbam_precursors
+  internal_path: prec.parent_cn
+  notes_tr: ''
+- key: precursors[].precursor_cn
+  label_tr: Precursor CN
+  required: SHOULD
+  source: dataset.cbam_precursors
+  internal_path: prec.cn
+  notes_tr: ''
+- key: precursors[].precursor_embedded_intensity
+  label_tr: Precursor Yoğunluğu
+  required: SHOULD
+  source: dataset.cbam_precursors
+  internal_path: prec.intensity
+  notes_tr: ''
+- key: carbon_price_paid.value
+  label_tr: Ödenen Karbon Fiyatı
+  required: DEFINTIVE_ONLY
+  source: evidence
+  internal_path: cbam.carbon_price_paid
+  notes_tr: 2026+ definitive dönem için kanıtlı.
+- key: carbon_price_paid.evidence_hash
+  label_tr: Karbon Fiyatı Kanıt Hash'i
+  required: DEFINTIVE_ONLY
+  source: evidence
+  internal_path: cbam.carbon_price_evidence.hash
+  notes_tr: Doküman hash + timestamp.
+- key: certificates_required
+  label_tr: Gerekli Sertifika Sayısı
+  required: DEFINTIVE_ONLY
+  source: calculation
+  internal_path: cbam.certificates_required
+  notes_tr: 2026+ definitive dönem.
