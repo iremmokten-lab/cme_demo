@@ -164,3 +164,16 @@ def cbam_reporting_json_to_xml(report: Dict[str, Any]) -> str:
 
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     return xml_bytes.decode("utf-8")
+
+
+# --- Portal (Declarant Portal) XML builder (v23) ---
+
+def cbam_reporting_json_to_portal_xml_v23(report: Dict[str, Any], portal_meta: dict) -> bytes:
+    """Build portal-grade XML bytes (v23 schema family).
+
+    `portal_meta` is a dict compatible with PortalMetaV23 fields.
+    """
+    from src.services.cbam_portal_xml_v23 import PortalMetaV23, build_qreport_v23
+
+    meta = PortalMetaV23(**(portal_meta or {}))
+    return build_qreport_v23(report=report or {}, meta=meta)
