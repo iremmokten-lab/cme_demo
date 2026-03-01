@@ -399,4 +399,18 @@ def run_full(
     except Exception:
         pass
 
+
+    # Faz 2: Karbon maliyeti raporlarını otomatik üret (JSON + PDF)
+    try:
+        from src.services.carbon_cost_reports import save_carbon_cost_reports
+
+        save_carbon_cost_reports(
+            project_id=int(project_id),
+            snapshot_id=int(snap.id),
+            created_by_user_id=created_by_user_id,
+        )
+    except Exception:
+        # Faz 2 raporu üretilemezse snapshot üretimi yine de başarısız olmasın
+        pass
+
     return snap
