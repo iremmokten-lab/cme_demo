@@ -251,25 +251,66 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
 
     cbam_xml_str = ""
     cbam_json_obj = {}
+    cbam_portal_zip_bytes: bytes = b""
+    cbam_portal_manifest: dict = {}
     if hard_fail:
         cbam_xml_str = ""
         cbam_json_obj = {"error": "HARD_FAIL", "message_tr": "Zorunlu alanlar eksik: CBAM resmi raporu üretilmedi.", "compliance_status": strict_overall}
     else:
         try:
-            cbam = (res or {}).get("cbam", {}) or {}
-            cbam_xml_str = str(cbam.get("cbam_reporting") or "")
-            cbam_json_obj = {
-            "schema": "cbam_report.v1",
-            "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
-            "products": cbam.get("table") or [],
-            "meta": cbam.get("meta") or {},
-            "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
-            "validation_status": {"used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors"))},
-        }
+            from src.services.cbam_xml import cbam_reporting_json_to_xml
+            from src.services.cbam_portal_package import build_cbam_portal_zip
+            from src.services.cbam_portal_xml_v23 import PortalMetaV23
+
+            cbam_reporting = (res or {}).get("cbam_reporting") or {}
+            if isinstance(cbam_reporting, dict) and cbam_reporting:
+                cbam_xml_str = cbam_reporting_json_to_xml(cbam_reporting)
+
+                cbam_json_obj = {
+                    "schema": "cbam_reporting_v2",
+                    "cbam_reporting": cbam_reporting,
+                    "validation_status": {
+                        "used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors"))
+                    },
+                }
+
+                # Portal upload ZIP (XML + optional attachments) — deterministic.
+                # Official XSD should be placed under: spec/cbam_xsd/QReport_ver23.00.xsd
+                xsd_main = Path("spec/cbam_xsd/QReport_ver23.00.xsd")
+                xsd_path = str(xsd_main) if xsd_main.exists() else None
+
+                portal_meta = PortalMetaV23(
+                    reporting_period_year=int(((cbam_reporting.get("period") or {}).get("year") or 0)),
+                    reporting_period_quarter=int(((cbam_reporting.get("period") or {}).get("quarter") or 0)),
+                    declarant_eori=str((cfg or {}).get("cbam_eori", "") or ""),
+                    declarant_name=str(((cbam_reporting.get("declarant") or {}).get("company_name") or "")),
+                    declarant_country=str(((cbam_reporting.get("declarant") or {}).get("country") or "")),
+                    operator_name=str((cfg or {}).get("cbam_operator_name", "") or ""),
+                    operator_country=str((cfg or {}).get("cbam_operator_country", "") or ""),
+                    installation_name=str((cfg or {}).get("cbam_installation_name", "") or ""),
+                    installation_city=str((cfg or {}).get("cbam_installation_city", "") or ""),
+                    installation_country=str((cfg or {}).get("cbam_installation_country", "") or ""),
+                    signed_at_iso=str((cfg or {}).get("cbam_signed_at_iso", "") or ""),
+                )
+
+                tmp_zip = Path("/tmp/cbam_portal_upload.zip")
+                cbam_portal_manifest = build_cbam_portal_zip(
+                    cbam_reporting_json=cbam_reporting,
+                    portal_meta=portal_meta,
+                    output_zip_path=str(tmp_zip),
+                    xsd_main_path=xsd_path,
+                    attachments=[],
+                    xml_filename="quarterly_report.xml",
+                )
+                cbam_portal_zip_bytes = tmp_zip.read_bytes()
+            else:
+                cbam_xml_str = ""
+                cbam_json_obj = {}
         except Exception:
             cbam_xml_str = ""
             cbam_json_obj = {}
-
+            cbam_portal_zip_bytes = b""
+            cbam_portal_manifest = {}
     # compliance
     compliance_payload = {
         "snapshot_id": int(snapshot.id),
@@ -306,16 +347,6 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     pdf_ets = _build_pdf_bytes(snapshot.id, "ETS Raporu (EU ETS / MRR)", {"ets_reporting": ets_json_obj, **base_for_pdf})
     pdf_cbam = _build_pdf_bytes(snapshot.id, "CBAM Raporu", {"cbam_report": cbam_json_obj, **base_for_pdf})
     pdf_comp = _build_pdf_bytes(snapshot.id, "Uyum (Compliance) Raporu", {"compliance": compliance_payload, **base_for_pdf})
-    # Faz 4: AI & Senaryo raporu (deterministik)
-    ai_payload = {}
-    try:
-        ai_payload = (res or {}).get("ai") or {}
-        if not isinstance(ai_payload, dict):
-            ai_payload = {}
-    except Exception:
-        ai_payload = {}
-    pdf_ai = _build_pdf_bytes(snapshot.id, "AI & Optimizasyon Raporu", {"ai": ai_payload, **base_for_pdf})
-
 
     # Evidence docs
     with db() as s:
@@ -353,9 +384,9 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         ("report/report.pdf", pdf_general or b""),
         ("ets_report.pdf", pdf_ets or b""),
         ("cbam_report.pdf", pdf_cbam or b""),
+        ("cbam_portal_upload.zip", cbam_portal_zip_bytes or b""),
+        ("cbam_portal_manifest.json", _json_bytes(cbam_portal_manifest or {})),
         ("compliance_report.pdf", pdf_comp or b""),
-        ("ai_optimization.json", _json_bytes(ai_payload)),
-        ("ai_optimization.pdf", pdf_ai or b""),
         ("evidence/evidence_index.json", _json_bytes({"evidence": evidence_index})),
     ]
     files += evidence_files
