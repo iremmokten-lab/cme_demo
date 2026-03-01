@@ -37,6 +37,12 @@ def init_db():
     except Exception:
         pass
 
+    # Faz 3: ERP Integration tabloları
+    try:
+        import src.db.erp_models  # noqa: F401
+    except Exception:
+        pass
+
     Base.metadata.create_all(bind=engine)
 
     # Faz 2: migration-like stabilization (SQLite)
