@@ -1,0 +1,163 @@
+spec_id: ETS_MRR_2018_2066
+title_tr: EU ETS (MRR 2018/2066) Rapor Şablonu Eşlemesi
+version: 2026.03.01
+regulation_refs:
+- name: Commission Implementing Regulation (EU) 2018/2066 (MRR)
+  url: https://eur-lex.europa.eu/eli/reg_impl/2018/2066/oj/eng
+fields:
+- key: facility.installation_id
+  label_tr: Tesis/Installation Kimliği
+  required: MUST
+  source: facility
+  internal_path: facility.id
+  notes_tr: Operatörün tesis kimliği.
+- key: facility.name
+  label_tr: Tesis Adı
+  required: MUST
+  source: facility
+  internal_path: facility.name
+  notes_tr: ''
+- key: facility.country
+  label_tr: Ülke
+  required: MUST
+  source: facility
+  internal_path: facility.country
+  notes_tr: ''
+- key: reporting.year
+  label_tr: Raporlama Yılı
+  required: MUST
+  source: config
+  internal_path: config.period.year
+  notes_tr: Yıllık ETS raporu dönemi.
+- key: monitoring_plan.boundaries
+  label_tr: İzleme Sınırları (Boundaries)
+  required: MUST
+  source: monitoring_plan
+  internal_path: monitoring_plan.config.boundaries
+  notes_tr: Hangi kaynaklar ve akışlar dahil.
+- key: monitoring_plan.methodology
+  label_tr: Metodoloji/Monitoring Approach
+  required: MUST
+  source: methodology
+  internal_path: methodology
+  notes_tr: Hesap yaklaşımı ve tier seçimi.
+- key: source_streams[]
+  label_tr: Kaynak Akışları (Source Streams)
+  required: MUST
+  source: dataset.energy
+  internal_path: datasets.energy
+  notes_tr: Yakıt/ham madde akışlarının listesi.
+- key: source_streams[].fuel_type
+  label_tr: Yakıt Türü
+  required: MUST
+  source: dataset.energy
+  internal_path: energy.fuel_type
+  notes_tr: 'Örn: natural_gas, diesel.'
+- key: source_streams[].activity_data
+  label_tr: Faaliyet Verisi
+  required: MUST
+  source: dataset.energy
+  internal_path: energy.activity_amount
+  notes_tr: Tüketim/miktar.
+- key: source_streams[].unit
+  label_tr: Birim
+  required: MUST
+  source: dataset.energy
+  internal_path: energy.unit
+  notes_tr: 'Örn: Nm3, t, MWh.'
+- key: source_streams[].measurement_method
+  label_tr: Ölçüm Yöntemi
+  required: SHOULD
+  source: monitoring_plan
+  internal_path: monitoring_plan.config.measurement_method
+  notes_tr: Sayaç, fatura, stok değişimi vb.
+- key: emission_factors[]
+  label_tr: Emisyon Faktörleri
+  required: MUST
+  source: factor_registry
+  internal_path: factors
+  notes_tr: Kullanılan EF listesi.
+- key: emission_factors[].factor_id
+  label_tr: Faktör ID
+  required: MUST
+  source: factor_registry
+  internal_path: factor.id
+  notes_tr: ''
+- key: emission_factors[].version
+  label_tr: Faktör Sürüm
+  required: MUST
+  source: factor_registry
+  internal_path: factor.version
+  notes_tr: ''
+- key: emission_factors[].source
+  label_tr: Faktör Kaynağı
+  required: MUST
+  source: factor_registry
+  internal_path: factor.source
+  notes_tr: Resmî kaynak/doküman.
+- key: emission_factors[].validity
+  label_tr: Geçerlilik Tarihleri
+  required: SHOULD
+  source: factor_registry
+  internal_path: factor.valid_from_to
+  notes_tr: valid_from/valid_to.
+- key: tiers[]
+  label_tr: Tier Mantığı
+  required: MUST
+  source: methodology
+  internal_path: methodology.tiers
+  notes_tr: Tier seçimi ve gerekçesi.
+- key: tiers[].justification
+  label_tr: Tier Gerekçesi
+  required: MUST
+  source: methodology
+  internal_path: methodology.tier_justification
+  notes_tr: Neden bu tier?
+- key: uncertainty.notes
+  label_tr: Belirsizlik Notları
+  required: MUST
+  source: uncertainty
+  internal_path: uncertainty
+  notes_tr: Ölçüm/hesap belirsizlikleri.
+- key: qa_qc.controls
+  label_tr: QA/QC Kontrolleri
+  required: MUST
+  source: qa_qc
+  internal_path: qa_qc
+  notes_tr: Kontrol faaliyetleri listesi.
+- key: annual_emissions.total_tco2e
+  label_tr: Yıllık Toplam Emisyon (tCO2e)
+  required: MUST
+  source: calculation
+  internal_path: results.kpis.total_tco2
+  notes_tr: Hesaplanan toplam.
+- key: annual_emissions.by_scope.scope1
+  label_tr: Scope 1
+  required: MUST
+  source: calculation
+  internal_path: results.kpis.scope1_tco2
+  notes_tr: ''
+- key: annual_emissions.by_scope.scope2
+  label_tr: Scope 2
+  required: SHOULD
+  source: calculation
+  internal_path: results.kpis.scope2_tco2
+  notes_tr: ETS raporunda ayrı raporlanabilir.
+- key: data_quality.completeness
+  label_tr: Tamlık Kontrolleri
+  required: SHOULD
+  source: dq_engine
+  internal_path: dq.completeness
+  notes_tr: Eksik ay/yakıt/ürün kontrolü.
+- key: data_quality.anomalies
+  label_tr: Anomali Kontrolleri
+  required: SHOULD
+  source: dq_engine
+  internal_path: dq.anomalies
+  notes_tr: Spike/uyumsuzluk kontrolü.
+- key: audit.snapshot_hashes
+  label_tr: Snapshot Hash Seti
+  required: MUST
+  source: snapshot
+  internal_path: snapshot.hashes
+  notes_tr: input_hash/result_hash/dataset_hashes/factor_set_hash.
