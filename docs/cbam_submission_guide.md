@@ -1,11 +1,12 @@
 
-# ETS Submission Guide
+# CBAM Submission Guide
 
-Required outputs:
-- monitoring plan
-- source streams
-- activity data
-- emission factors
-- tier logic
-- QA/QC
-- annual emissions
+Required dataset:
+- CN codes
+- quantities
+- direct emissions
+- indirect emissions
+- embedded emissions
+- intensity
+- actual/default flag
+- carbon price paid
