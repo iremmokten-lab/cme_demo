@@ -1,6 +1,6 @@
 spec_id: CBAM_2023_956_2023_1773
 title_tr: CBAM (EU 2023/956 + 2023/1773) Rapor Şablonu Eşlemesi
-version: 2026.03.01
+version: 2026.03.01+compliance90
 regulation_refs:
 - name: Regulation (EU) 2023/956 (CBAM)
   url: https://eur-lex.europa.eu/eli/reg/2023/956/oj/eng
@@ -172,3 +172,111 @@ fields:
   source: calculation
   internal_path: cbam.certificates_required
   notes_tr: 2026+ definitive dönem.
+- key: declarant.eori
+  label_tr: Declarant EORI
+  required: MUST
+  source: config
+  internal_path: config.importer.eori
+  notes_tr: AB ithalatçı EORI.
+- key: declarant.name
+  label_tr: Declarant Ünvan
+  required: MUST
+  source: config
+  internal_path: config.importer.name
+  notes_tr: ''
+- key: declarant.address
+  label_tr: Declarant Adres
+  required: MUST
+  source: config
+  internal_path: config.importer.address
+  notes_tr: ''
+- key: declarant.contact_email
+  label_tr: İletişim E-posta
+  required: SHOULD
+  source: config
+  internal_path: config.importer.contact_email
+  notes_tr: ''
+- key: reporting.period.start_date
+  label_tr: Rapor Dönemi Başlangıç
+  required: MUST
+  source: config
+  internal_path: config.period.start_date
+  notes_tr: ''
+- key: reporting.period.end_date
+  label_tr: Rapor Dönemi Bitiş
+  required: MUST
+  source: config
+  internal_path: config.period.end_date
+  notes_tr: ''
+- key: installation.operator_name
+  label_tr: Tesis Operatörü Ünvan
+  required: MUST
+  source: config
+  internal_path: config.installation.operator_name
+  notes_tr: ''
+- key: installation.country
+  label_tr: Tesis Ülkesi
+  required: MUST
+  source: config
+  internal_path: config.installation.country
+  notes_tr: ''
+- key: installation.city
+  label_tr: Tesis Şehir
+  required: SHOULD
+  source: config
+  internal_path: config.installation.city
+  notes_tr: ''
+- key: installation.installation_id
+  label_tr: Tesis ID (O3CI/Registry)
+  required: CONDITIONAL
+  source: config
+  internal_path: config.installation.installation_id
+  notes_tr: Varsa resmi kayıt kimliği.
+- key: products[].country_of_origin
+  label_tr: Menşe Ülke
+  required: MUST
+  source: dataset.cbam_products
+  internal_path: cbam.country_of_origin
+  notes_tr: ''
+- key: products[].producer_installation
+  label_tr: Üretici Tesis Referansı
+  required: CONDITIONAL
+  source: dataset.cbam_products
+  internal_path: cbam.producer_installation
+  notes_tr: Birden fazla tesis/satıcı varsa.
+- key: products[].precursor_emissions_tco2e
+  label_tr: Prekürsör Emisyon
+  required: CONDITIONAL
+  source: engine
+  internal_path: results.cbam.goods[].precursor_emissions_tco2e
+  notes_tr: Kompleks ürün.
+- key: products[].data_type_flag
+  label_tr: Actual/Default
+  required: MUST
+  source: engine
+  internal_path: results.cbam.goods[].data_type_flag
+  notes_tr: ACTUAL/DEFAULT
+- key: products[].default_value_evidence
+  label_tr: Default value kanıtı
+  required: CONDITIONAL
+  source: evidence
+  internal_path: evidence.default_value
+  notes_tr: DEFAULT kullanıldıysa şart.
+- key: products[].carbon_price_paid_eur_per_t
+  label_tr: Ödenen karbon fiyatı
+  required: CONDITIONAL
+  source: dataset.cbam_products
+  internal_path: cbam.carbon_price_paid_eur_per_t
+  notes_tr: ''
+- key: products[].supporting_documents[]
+  label_tr: Ürün destek dokümanları
+  required: CONDITIONAL
+  source: evidence
+  internal_path: evidence.attachments
+  notes_tr: Fatura, gümrük, üretim raporu.
+- key: submission.package_type
+  label_tr: XML ZIP Paket
+  required: SHOULD
+  source: system
+  internal_path: exports.cbam.zip
+  notes_tr: Portal yükleme paketi.
