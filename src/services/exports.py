@@ -23,11 +23,9 @@ from src.db.models import (
     Report,
     VerificationCase,
     VerificationFinding,
-    SnapshotDatasetLink,
-    SnapshotFactorLink,
 )
 from src.db.session import db
-from src.mrv.lineage import sha256_bytes, build_lineage_graph, sha256_json
+from src.mrv.lineage import sha256_bytes
 from src.services.reporting import build_pdf
 from src.services.ets_reporting import build_ets_reporting_dataset
 from src.services.tr_ets_reporting import build_tr_ets_reporting
@@ -175,62 +173,22 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     prod_bytes = _safe_read_bytes(inputs.get("production", {}).get("uri", ""))
     mat_bytes = _safe_read_bytes(inputs.get("materials", {}).get("uri", ""))
 
-    # factors (used_in_snapshot + governance)
-    # For audit/replay: export the factors actually used in this snapshot.
-    factor_rows: list[dict] = []
-    try:
-        with db() as s:
-            links = (
-                s.execute(
-                    select(SnapshotFactorLink, EmissionFactor)
-                    .join(EmissionFactor, EmissionFactor.id == SnapshotFactorLink.factor_id)
-                    .where(SnapshotFactorLink.snapshot_id == int(snapshot.id))
-                    .order_by(SnapshotFactorLink.factor_type, SnapshotFactorLink.region, SnapshotFactorLink.year.desc().nullslast(), SnapshotFactorLink.version)
-                )
-                .all()
-            )
-        for lnk, f in links:
-            factor_rows.append(
-                {
-                    "id": int(getattr(f, "id", 0) or 0),
-                    "factor_type": str(getattr(f, "factor_type", "") or ""),
-                    "value": float(getattr(f, "value", 0.0) or 0.0),
-                    "unit": str(getattr(f, "unit", "") or ""),
-                    "source": str(getattr(f, "source", "") or ""),
-                    "year": getattr(f, "year", None),
-                    "version": str(getattr(f, "version", "") or ""),
-                    "region": str(getattr(f, "region", "") or ""),
-                    "reference": str(getattr(f, "reference", "") or ""),
-                    "methodology": str(getattr(f, "methodology", "") or ""),
-                    "valid_from": str(getattr(f, "valid_from", "") or ""),
-                    "valid_to": str(getattr(f, "valid_to", "") or ""),
-                    "locked": bool(getattr(f, "locked", False)),
-                    "factor_hash": str(getattr(f, "factor_hash", "") or ""),
-                }
-            )
-    except Exception:
-        # Fallback: export all factors (legacy mode)
-        with db() as s:
-            factors = s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.year.desc())).scalars().all()
-        factor_rows = [
-            {
-                "id": int(getattr(f, "id", 0) or 0),
-                "factor_type": f.factor_type,
-                "value": f.value,
-                "unit": f.unit,
-                "source": f.source,
-                "year": f.year,
-                "version": f.version,
-                "region": f.region,
-                "reference": getattr(f, "reference", "") or "",
-                "methodology": getattr(f, "methodology", "") or "",
-                "valid_from": getattr(f, "valid_from", "") or "",
-                "valid_to": getattr(f, "valid_to", "") or "",
-                "locked": bool(getattr(f, "locked", False)),
-                "factor_hash": getattr(f, "factor_hash", "") or "",
-            }
-            for f in factors
-        ]
+    # factors
+    with db() as s:
+        factors = s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.year.desc())).scalars().all()
+    factor_rows = [
+        {
+            "factor_type": f.factor_type,
+            "value": f.value,
+            "unit": f.unit,
+            "source": f.source,
+            "year": f.year,
+            "version": f.version,
+            "region": f.region,
+            "reference": getattr(f, "reference", "") or "",
+        }
+        for f in factors
+    ]
 
     # methodology
     meth_obj = {}
@@ -258,8 +216,20 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         ih = {}
     try:
         res = json.loads(snapshot.results_json or "{}")
+
+
     except Exception:
         res = {}
+
+    # HARD FAIL guard: Zorunlu alanlar eksikse resmi ETS/CBAM raporlarını üretme (denetçi seviyesi).
+    strict = {}
+    try:
+        strict = (res or {}).get("compliance_strict") or {}
+    except Exception:
+        strict = {}
+    strict_overall = str((strict or {}).get("overall_status") or "")
+    hard_fail = strict_overall.upper() == "FAIL"
+
 
     snapshot_payload = {
         "snapshot_id": int(snapshot.id),
@@ -279,47 +249,71 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     if app_config.get_tr_ets_mode():
         tr_ets_json_obj = build_tr_ets_reporting(project_id=int(snapshot.project_id), snapshot_id=int(snapshot.id), results=res or {}, config=cfg or {})
 
-    cbam_json_obj = (res or {}).get("cbam_reporting") or {}
     cbam_xml_str = ""
-    try:
-        from src.services.cbam_xml import build_cbam_reporting
-
-        cbam_xml_str = build_cbam_reporting(cbam_json_obj or {})
-    except Exception:
+    cbam_json_obj = {}
+    if hard_fail:
         cbam_xml_str = ""
+        cbam_json_obj = {"error": "HARD_FAIL", "message_tr": "Zorunlu alanlar eksik: CBAM resmi raporu üretilmedi.", "compliance_status": strict_overall}
+    else:
+        try:
+            cbam = (res or {}).get("cbam", {}) or {}
+            cbam_xml_str = str(cbam.get("cbam_reporting") or "")
+            cbam_json_obj = {
+            "schema": "cbam_report.v1",
+            "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
+            "products": cbam.get("table") or [],
+            "meta": cbam.get("meta") or {},
+            "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
+            "validation_status": {"used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors"))},
+        }
+        except Exception:
+            cbam_xml_str = ""
+            cbam_json_obj = {}
 
+    # compliance
     compliance_payload = {
-        "compliance_checks": (res or {}).get("compliance_checks") or [],
-        "qa_flags": (res or {}).get("qa_flags") or [],
-        "meta": {"snapshot_id": int(snapshot.id), "project_id": int(snapshot.project_id)},
+        "snapshot_id": int(snapshot.id),
+        "project_id": int(snapshot.project_id),
+        "engine_version": str(snapshot.engine_version or ""),
+        "compliance_checks": (res or {}).get("compliance_checks", []) if isinstance(res, dict) else [],
     }
 
-    # verification payload
+    # verification
     period_year = None
     try:
-        period_year = int(((cfg or {}).get("period") or {}).get("year"))
+        period_year = ((res or {}).get("input_bundle") or {}).get("period", {}).get("year", None)
     except Exception:
         period_year = None
-    verification_payload = _verification_payload(int(snapshot.project_id), period_year)
+    if period_year is None and project is not None:
+        try:
+            period_year = int(getattr(project, "reporting_year", None))
+        except Exception:
+            period_year = None
+    verification_payload = _verification_payload(int(snapshot.project_id), int(period_year) if period_year else None)
 
     # PDFs
-    pdf_general = _build_pdf_bytes(int(snapshot.id), "MRV Raporu", res or {})
-    pdf_ets = _build_pdf_bytes(int(snapshot.id), "EU ETS Raporu", ets_json_obj or {})
-    pdf_cbam = _build_pdf_bytes(int(snapshot.id), "CBAM Raporu", cbam_json_obj or {})
-    pdf_comp = _build_pdf_bytes(int(snapshot.id), "Uyum Kontrolleri", compliance_payload or {})
+    base_for_pdf = {
+        "kpis": (res or {}).get("kpis", {}) if isinstance(res, dict) else {},
+        "config": cfg or {},
+        "cbam": (res or {}).get("cbam", {}) if isinstance(res, dict) else {},
+        "cbam_table": (res or {}).get("cbam_table", []) if isinstance(res, dict) else [],
+        "ets": (res or {}).get("ets", {}) if isinstance(res, dict) else {},
+        "qa_flags": (res or {}).get("qa_flags", []) if isinstance(res, dict) else [],
+        "compliance_checks": compliance_payload.get("compliance_checks") or [],
+    }
 
-    # evidence docs
+    pdf_general = _build_pdf_bytes(snapshot.id, "Genel MRV Raporu", base_for_pdf)
+    pdf_ets = _build_pdf_bytes(snapshot.id, "ETS Raporu (EU ETS / MRR)", {"ets_reporting": ets_json_obj, **base_for_pdf})
+    pdf_cbam = _build_pdf_bytes(snapshot.id, "CBAM Raporu", {"cbam_report": cbam_json_obj, **base_for_pdf})
+    pdf_comp = _build_pdf_bytes(snapshot.id, "Uyum (Compliance) Raporu", {"compliance": compliance_payload, **base_for_pdf})
+
+    # Evidence docs
     with db() as s:
         docs = (
-            s.execute(
-                select(EvidenceDocument)
-                .where(EvidenceDocument.project_id == int(snapshot.project_id))
-                .order_by(EvidenceDocument.uploaded_at.desc())
-            )
+            s.execute(select(EvidenceDocument).where(EvidenceDocument.project_id == int(snapshot.project_id)).order_by(EvidenceDocument.uploaded_at.desc()))
             .scalars()
             .all()
         )
-
     evidence_index = []
     evidence_files = []
     for d in docs:
@@ -331,77 +325,6 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         evidence_index.append({"id": int(d.id), "category": cat, "title": str(getattr(d, "title", "") or ""), "sha256": sha, "uri": uri, "path_in_pack": fn})
         if bts:
             evidence_files.append((fn, bts))
-
-    # lineage graph (deterministic)
-    datasets_meta: list[dict] = []
-    try:
-        with db() as s:
-            links = (
-                s.execute(
-                    select(SnapshotDatasetLink)
-                    .where(SnapshotDatasetLink.snapshot_id == int(snapshot.id))
-                    .order_by(SnapshotDatasetLink.dataset_type)
-                )
-                .scalars()
-                .all()
-            )
-        for l in links:
-            datasets_meta.append(
-                {
-                    "dataset_type": str(getattr(l, "dataset_type", "") or ""),
-                    "sha256": str(getattr(l, "sha256", "") or ""),
-                    "storage_uri": str(getattr(l, "storage_uri", "") or ""),
-                    "datasetupload_id": int(getattr(l, "datasetupload_id", 0) or 0),
-                }
-            )
-    except Exception:
-        # fallback from snapshot input_hashes
-        for k in ["energy", "production", "materials"]:
-            info = (inputs.get(k) or {}) if isinstance(inputs.get(k), dict) else {}
-            if info:
-                datasets_meta.append({"dataset_type": k, "sha256": str(info.get("sha256") or ""), "storage_uri": str(info.get("uri") or ""), "datasetupload_id": int(info.get("upload_id") or 0)})
-
-    factor_refs_for_lineage = []
-    try:
-        # factor_rows already contains governance fields
-        factor_refs_for_lineage = [
-            {"id": r.get("id"), "factor_type": r.get("factor_type"), "region": r.get("region"), "year": r.get("year"), "version": r.get("version"), "factor_hash": r.get("factor_hash")}
-            for r in (factor_rows or [])
-        ]
-        factor_refs_for_lineage.sort(key=lambda x: (str(x.get("factor_type") or ""), str(x.get("region") or ""), str(x.get("year") or ""), str(x.get("version") or "")))
-    except Exception:
-        factor_refs_for_lineage = []
-
-    reports_meta = []
-    try:
-        with db() as s:
-            reps = (
-                s.execute(
-                    select(Report)
-                    .where(Report.snapshot_id == int(snapshot.id))
-                    .order_by(Report.created_at.asc())
-                )
-                .scalars()
-                .all()
-            )
-        for r in reps:
-            reports_meta.append(
-                {"report_type": str(r.report_type or ""), "sha256": str(r.file_hash or ""), "file_path": str(r.file_path or ""), "created_at": str(r.created_at)}
-            )
-    except Exception:
-        reports_meta = []
-
-    lineage_graph = build_lineage_graph(
-        snapshot_id=int(snapshot.id),
-        project_id=int(snapshot.project_id),
-        input_hash=str(getattr(snapshot, "input_hash", "") or ""),
-        result_hash=str(getattr(snapshot, "result_hash", "") or ""),
-        datasets=datasets_meta,
-        evidence_docs=evidence_index,
-        factor_refs=factor_refs_for_lineage,
-        compliance=compliance_payload,
-        reports=reports_meta,
-    )
 
     files: list[tuple[str, bytes]] = []
     files += [
@@ -422,7 +345,6 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         ("cbam_report.pdf", pdf_cbam or b""),
         ("compliance_report.pdf", pdf_comp or b""),
         ("evidence/evidence_index.json", _json_bytes({"evidence": evidence_index})),
-        ("lineage/lineage.json", _json_bytes(lineage_graph)),
     ]
     files += evidence_files
 
@@ -435,10 +357,8 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "result_hash": str(getattr(snapshot, "result_hash", "") or ""),
         "files": [],
     }
-
     for path, bts in sorted(files, key=lambda x: x[0]):
-        fh = sha256(bts or b"").hexdigest()
-        manifest["files"].append({"path": path, "sha256": fh, "bytes": len(bts or b"")})
+        manifest["files"].append({"path": path, "sha256": sha256(bts or b"").hexdigest(), "bytes": len(bts or b"")})
 
     manifest["signature"] = _hmac_signature(manifest)
 
