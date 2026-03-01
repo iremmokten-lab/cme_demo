@@ -22,7 +22,7 @@ def _safe_json_load(s: str) -> dict:
         return {}
 
 
-def _extract_checks(snapshot: CalculationSnapshot) -> Tuple[List[dict], List[dict], dict]:
+def _extract_checks(snapshot: CalculationSnapshot) -> Tuple[List[dict], List[dict], dict, dict]:
     res = _safe_json_load(getattr(snapshot, "results_json", "{}") or "{}")
 
     checks = []
@@ -53,7 +53,15 @@ def _extract_checks(snapshot: CalculationSnapshot) -> Tuple[List[dict], List[dic
     checks = [c for c in checks if isinstance(c, dict)]
     qa = [q for q in qa if isinstance(q, dict)]
 
-    return checks, qa, deterministic
+    strict = {}
+    try:
+        strict = res.get("compliance_strict", {}) or {}
+    except Exception:
+        strict = {}
+    if not isinstance(strict, dict):
+        strict = {}
+
+    return checks, qa, deterministic, strict
 
 
 def _checks_df(checks: List[dict]) -> pd.DataFrame:
@@ -78,6 +86,35 @@ def _checks_df(checks: List[dict]) -> pd.DataFrame:
     df = df.sort_values(by=["_o", "Mevzuat", "Seviye", "Kural"], ascending=[True, True, True, True]).drop(columns=["_o"])
     return df
 
+
+
+
+def _strict_df(strict_obj: dict) -> pd.DataFrame:
+    checks = (strict_obj or {}).get("checks") or []
+    if not isinstance(checks, list):
+        checks = []
+    rows = []
+    for c in checks:
+        if not isinstance(c, dict):
+            continue
+        rows.append(
+            {
+                "Durum": str(c.get("status", "")),
+                "Zorunluluk": str(c.get("required", "")),
+                "Şablon": str(c.get("spec_id", "")),
+                "Alan": str(c.get("label_tr", "")),
+                "Kural": str(c.get("rule_id", "")),
+                "Mesaj": str(c.get("message_tr", "")),
+                "Düzeltme": str(c.get("remediation_tr", "")),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        return df
+    order = {"FAIL": 0, "WARN": 1, "PASS": 2, "": 9}
+    df["_o"] = df["Durum"].map(lambda x: order.get(str(x).upper(), 9))
+    df = df.sort_values(by=["_o", "Zorunluluk", "Şablon", "Alan"], ascending=[True, True, True, True]).drop(columns=["_o"])
+    return df
 
 def _qa_df(qa: List[dict]) -> pd.DataFrame:
     rows = []
@@ -132,7 +169,7 @@ def compliance_checklist_page(user) -> None:
     snap_label = st.selectbox("Snapshot seç", options=list(snap_label_to_obj.keys()))
     snap = snap_label_to_obj[snap_label]
 
-    checks, qa, det = _extract_checks(snap)
+    checks, qa, det, strict = _extract_checks(snap)
 
     # Header metrics
     c_fail = len([c for c in checks if str(c.get("status", "")).lower() == "fail"])
@@ -144,6 +181,39 @@ def compliance_checklist_page(user) -> None:
     m2.metric("Warn", c_warn)
     m3.metric("Pass", c_pass)
     m4.metric("Toplam", len(checks))
+
+
+    # HARD FAIL (resmi uyum) özeti
+    strict_overall = str((strict or {}).get("overall_status") or "UNKNOWN")
+    by_spec = (strict or {}).get("by_spec") or {}
+    if strict_overall.upper() == "FAIL":
+        st.error("🚫 HARD FAIL: Zorunlu regülasyon alanları eksik. ETS/CBAM resmi rapor üretimi engellenmelidir.")
+    elif strict_overall.upper() == "PASS":
+        st.success("✅ HARD PASS: Zorunlu regülasyon alanları mevcut (Adım-2 yapısal doğrulama).")
+    else:
+        st.warning("⚠️ HARD STATUS: Belirsiz. Lütfen snapshot ve veri setlerini kontrol edin.")
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("HARD Durum", strict_overall.upper())
+    s2.metric("ETS (MRR) Durum", str(by_spec.get("ETS_MRR_2018_2066") or ""))
+    s3.metric("CBAM Durum", str(by_spec.get("CBAM_2023_956_2023_1773") or ""))
+
+    with st.expander("HARD FAIL Detayı (Compliance Checks JSON)", expanded=False):
+        st.code(json.dumps(strict or {}, ensure_ascii=False, indent=2), language="json")
+        st.download_button(
+            label="compliance_checks.json indir",
+            data=json.dumps(strict or {}, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="compliance_checks.json",
+            mime="application/json",
+        )
+
+    st.subheader("HARD FAIL Kontrol Tablosu (Regülasyon Şablonuna Göre)")
+    s_df = _strict_df(strict or {})
+    if len(s_df) == 0:
+        st.info("HARD fail kontrolleri bulunamadı. (Bu snapshot Adım-2 öncesi üretilmiş olabilir.)")
+    else:
+        st.dataframe(s_df, use_container_width=True)
+    st.divider()
 
     with st.expander("Deterministik Kilit (Hash)", expanded=False):
         st.code(json.dumps(det or {}, ensure_ascii=False, indent=2), language="json")
