@@ -1,128 +1,168 @@
+
 # -*- coding: utf-8 -*-
-"""Faz-0: Excel Import → Dataset storage + DB kayıt + (opsiyonel) Snapshot üretimi.
+"""Faz-0 Excel ingestion → CSV storage + DatasetUpload kaydı + Data Quality.
 
-Bu servis, Excel Import Center UI tarafından kullanılır.
-
-Akış:
-1) Excel (.xlsx) yükle
-2) Şema doğrula + deterministik dataset_hash üret
-3) Data Quality raporu üret
-4) CSV bytes olarak storage backend'e yaz (local/S3)
-5) DatasetUpload tablosuna kayıt aç (sha256=file, content_hash=dataset_hash)
+Amaç:
+- Excel şablonlarını kullanıcı yükler
+- Sistem kolonları normalize eder ve şema doğrular
+- CSV bytes üretir (UTF-8) ve storage/uploads altına kaydeder (sha dedup)
+- DatasetUpload tablosuna kayıt açar (audit trail için)
 
 Not:
-- Engine run_full mevcut orchestration'dır. Bu servis snapshot üretmez; UI isterse run_full çağırır.
+- Core pipeline CSV ingest ile zaten çalışıyor (src/ui/consultant.py).
+- Burada Excel'i CSV'ye çevirip aynı formatı üretiriz; engine değişmeden çalışır.
 """
 
 from __future__ import annotations
 
+import io
 import json
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, Tuple
 
 import pandas as pd
 
+from src.connectors.excel_connector import load_excel, normalize_headers, compute_dataset_hash
 from src.db.models import DatasetUpload
 from src.db.session import db
-from src.mrv.audit import append_audit, infer_company_id_for_user
 from src.mrv.lineage import sha256_bytes
-from src.services.ingestion import data_quality_assess
-from src.services.storage_backend import get_storage_backend
-
-from src.connectors.excel_connector import compute_dataset_hash
+from src.services.ingestion import data_quality_assess, validate_csv
+from src.services.storage import UPLOAD_DIR, write_bytes
 
 
-@dataclass(frozen=True)
-class ExcelImportResult:
-    upload_id: int
-    dataset_type: str
-    storage_uri: str
-    sha256_file: str
-    dataset_hash: str
-    data_quality_score: int
-    data_quality_report: dict
+def _safe_name(name: str) -> str:
+    name = (name or "").strip().replace(" ", "_")
+    keep = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.()"
+    out = "".join(ch for ch in name if ch in keep)
+    return out or "upload"
 
 
-def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
+def _save_upload_dedup(project_id: int, dataset_type: str, file_name: str, file_bytes: bytes) -> Tuple[str, str]:
+    sha = sha256_bytes(file_bytes)
+    safe = _safe_name(file_name) or f"{dataset_type}.csv"
+    fp = UPLOAD_DIR / f"project_{project_id}" / f"{dataset_type}_{sha[:10]}_{safe}"
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    write_bytes(fp, file_bytes)
+    return str(fp.as_posix()), sha
 
 
-def save_excel_dataset(
+def _map_to_core_csv(dataset_type: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Excel şemasını core CSV şemasına dönüştürür.
+    - energy: fuel_quantity/fuel_unit zorunlu
+    - production: product_code, quantity, unit
+    - facility/cbam_products/bom_precursors: faz-0 master data (core hesapta direkt kullanılmayabilir)
+    """
+    dtype = (dataset_type or "").strip().lower()
+
+    d = normalize_headers(df)
+
+    if dtype == "energy":
+        # legacy support: quantity/unit → fuel_quantity/fuel_unit
+        if "fuel_quantity" not in d.columns and "quantity" in d.columns:
+            d = d.rename(columns={"quantity": "fuel_quantity"})
+        if "fuel_unit" not in d.columns and "unit" in d.columns:
+            d = d.rename(columns={"unit": "fuel_unit"})
+        # accept 'fuel' column as fuel_type
+        if "fuel_type" not in d.columns and "fuel" in d.columns:
+            d = d.rename(columns={"fuel": "fuel_type"})
+        # keep only relevant columns + extras
+        return d
+
+    if dtype == "production":
+        if "product_code" not in d.columns and "product" in d.columns:
+            d = d.rename(columns={"product": "product_code"})
+        if "product_code" not in d.columns and "product_sku" in d.columns:
+            d = d.rename(columns={"product_sku": "product_code"})
+        return d
+
+    if dtype == "materials":
+        # materials already a known core type in consultant panel (precursor) - keep as-is
+        return d
+
+    # master datasets
+    if dtype == "cbam_products":
+        if "product_code" not in d.columns and "product_sku" in d.columns:
+            d = d.rename(columns={"product_sku": "product_code"})
+        return d
+
+    if dtype == "bom_precursors":
+        if "product_code" not in d.columns and "product_sku" in d.columns:
+            d = d.rename(columns={"product_sku": "product_code"})
+        if "precursor_code" not in d.columns and "precursor_sku" in d.columns:
+            d = d.rename(columns={"precursor_sku": "precursor_code"})
+        return d
+
+    return d
+
+
+def ingest_excel_to_datasetupload(
     *,
     project_id: int,
     dataset_type: str,
-    df: pd.DataFrame,
+    xlsx_bytes: bytes,
     original_filename: str,
-    user: Any | None,
-    schema_version: str = "excel_v1",
-) -> ExcelImportResult:
-    dataset_hash = compute_dataset_hash(df)
+    uploaded_by_user_id: int | None = None,
+) -> Dict[str, Any]:
+    # Read + schema validate + deterministic hash
+    bio = io.BytesIO(xlsx_bytes)
+    result = load_excel(bio, dataset_type)
+    df = result["dataframe"]
+    df = _map_to_core_csv(dataset_type, df)
 
-    score, dq_report = data_quality_assess(dataset_type, df)
+    # Convert to CSV bytes
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
 
-    csv_bytes = dataframe_to_csv_bytes(df)
-    sha_file = sha256_bytes(csv_bytes)
+    # Core validator where applicable
+    dtype = dataset_type.strip().lower()
+    core_errors = []
+    if dtype in ("energy", "production", "materials"):
+        core_errors = validate_csv(dtype, df)
 
-    backend = get_storage_backend()
-    safe_name = (original_filename or f"{dataset_type}.xlsx").replace("/", "_").replace("\\", "_")
-    key = f"project_{int(project_id)}/datasets/{dataset_type}/{sha_file[:10]}_{safe_name}.csv"
-    loc = backend.put_bytes(key, csv_bytes, content_type="text/csv")
+    dq_score, dq_report = data_quality_assess(dtype, df)
+
+    storage_uri, sha = _save_upload_dedup(
+        project_id=int(project_id),
+        dataset_type=str(dtype),
+        file_name=original_filename.replace(".xlsx", ".csv"),
+        file_bytes=csv_bytes,
+    )
+
+    content_hash = compute_dataset_hash(df)
 
     meta = {
-        "source": "excel_import_center",
-        "original_filename": str(original_filename or ""),
-        "dataset_hash": dataset_hash,
-        "file_sha256": sha_file,
-        "storage_backend": loc.backend,
+        "source": "excel",
+        "xlsx_filename": original_filename,
+        "converted_to": "csv",
+        "core_validation_errors": core_errors,
     }
 
     with db() as s:
         du = DatasetUpload(
             project_id=int(project_id),
-            dataset_type=str(dataset_type),
-            schema_version=str(schema_version),
-            original_filename=str(original_filename or f"{dataset_type}.xlsx"),
-            storage_uri=str(loc.uri),
-            sha256=str(sha_file),
-            content_hash=str(dataset_hash),
-            validated=True,
-            data_quality_score=int(score),
+            dataset_type=str(dtype),
+            original_filename=str(original_filename),
+            storage_uri=str(storage_uri),
+            sha256=str(sha),
+            content_hash=str(content_hash),
+            schema_version="v1",
+            validated=(len(core_errors) == 0),
+            data_quality_score=int(dq_score),
             data_quality_report_json=json.dumps(dq_report, ensure_ascii=False),
             meta_json=json.dumps(meta, ensure_ascii=False),
-            uploaded_by_user_id=int(getattr(user, "id", None)) if user is not None and getattr(user, "id", None) is not None else None,
+            uploaded_by_user_id=uploaded_by_user_id,
         )
-        # Küçük dosyalar için DB kopyası (Streamlit Cloud uyumlu). Büyükse sadece storage_uri.
-        du.content_bytes = csv_bytes if len(csv_bytes) <= 2_000_000 else None
         s.add(du)
         s.commit()
         s.refresh(du)
 
-    try:
-        append_audit(
-            "excel_dataset_imported",
-            {
-                "project_id": int(project_id),
-                "dataset_type": str(dataset_type),
-                "upload_id": int(du.id),
-                "storage_uri": str(loc.uri),
-                "sha256_file": sha_file,
-                "dataset_hash": dataset_hash,
-                "dq_score": int(score),
-            },
-            user_id=int(getattr(user, "id", None)) if user is not None and getattr(user, "id", None) is not None else None,
-            company_id=infer_company_id_for_user(user) if user is not None else None,
-            entity_type="dataset_upload",
-            entity_id=str(int(du.id)),
-        )
-    except Exception:
-        pass
-
-    return ExcelImportResult(
-        upload_id=int(du.id),
-        dataset_type=str(dataset_type),
-        storage_uri=str(loc.uri),
-        sha256_file=str(sha_file),
-        dataset_hash=str(dataset_hash),
-        data_quality_score=int(score),
-        data_quality_report=dq_report,
-    )
+    return {
+        "dataset_upload_id": int(du.id),
+        "dataset_type": str(dtype),
+        "storage_uri": str(storage_uri),
+        "sha256": str(sha),
+        "content_hash": str(content_hash),
+        "validated": bool(len(core_errors) == 0),
+        "core_validation_errors": core_errors,
+        "data_quality_score": int(dq_score),
+        "data_quality_report": dq_report,
+        "rows": int(len(df)),
+    }
