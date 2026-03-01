@@ -1,6 +1,6 @@
 spec_id: ETS_MRR_2018_2066
 title_tr: EU ETS (MRR 2018/2066) Rapor Şablonu Eşlemesi
-version: 2026.03.01
+version: 2026.03.01+compliance90
 regulation_refs:
 - name: Commission Implementing Regulation (EU) 2018/2066 (MRR)
   url: https://eur-lex.europa.eu/eli/reg_impl/2018/2066/oj/eng
@@ -161,3 +161,87 @@ fields:
   source: snapshot
   internal_path: snapshot.hashes
   notes_tr: input_hash/result_hash/dataset_hashes/factor_set_hash.
+- key: facility.permit_id
+  label_tr: ETS Permit No
+  required: MUST
+  source: config
+  internal_path: config.facility.permit_id
+  notes_tr: ''
+- key: facility.operator_name
+  label_tr: Operatör Ünvan
+  required: MUST
+  source: config
+  internal_path: config.facility.operator_name
+  notes_tr: ''
+- key: facility.address
+  label_tr: Tesis Adres
+  required: MUST
+  source: config
+  internal_path: config.facility.address
+  notes_tr: ''
+- key: monitoring_plan.monitoring_method
+  label_tr: Monitoring Method
+  required: MUST
+  source: config
+  internal_path: config.ets.monitoring_method
+  notes_tr: Calculation/Measurement.
+- key: monitoring_plan.plan_id
+  label_tr: Monitoring Plan ID
+  required: MUST
+  source: config
+  internal_path: config.ets.monitoring_plan_id
+  notes_tr: ''
+- key: period.start_date
+  label_tr: Dönem Başlangıç
+  required: MUST
+  source: config
+  internal_path: config.period.start_date
+  notes_tr: ''
+- key: period.end_date
+  label_tr: Dönem Bitiş
+  required: MUST
+  source: config
+  internal_path: config.period.end_date
+  notes_tr: ''
+- key: source_streams[].tier
+  label_tr: Tier
+  required: MUST
+  source: config
+  internal_path: config.ets.streams[].tier
+  notes_tr: ''
+- key: source_streams[].uncertainty_percent
+  label_tr: Belirsizlik (%)
+  required: MUST
+  source: config
+  internal_path: config.ets.streams[].uncertainty_percent
+  notes_tr: ''
+- key: source_streams[].emission_factor_source
+  label_tr: EF Kaynağı
+  required: MUST
+  source: config
+  internal_path: config.ets.streams[].emission_factor_source
+  notes_tr: IPCC/NCV/analysis.
+- key: qa_qc.procedures
+  label_tr: QA/QC Prosedürleri
+  required: MUST
+  source: config
+  internal_path: config.ets.qaqc.procedures
+  notes_tr: ''
+- key: qa_qc.records[]
+  label_tr: QA/QC Kayıtları
+  required: CONDITIONAL
+  source: evidence
+  internal_path: evidence.qaqc_records
+  notes_tr: ''
+- key: calibration.certificates[]
+  label_tr: Kalibrasyon Sertifikaları
+  required: CONDITIONAL
+  source: evidence
+  internal_path: evidence.calibration
+  notes_tr: ''
+- key: verification.case
+  label_tr: Verification Case
+  required: CONDITIONAL
+  source: verification
+  internal_path: verification.case
+  notes_tr: ''
