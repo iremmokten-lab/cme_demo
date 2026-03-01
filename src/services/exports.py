@@ -29,7 +29,7 @@ from src.mrv.lineage import sha256_bytes
 from src.services.reporting import build_pdf
 from src.services.ets_reporting import build_ets_reporting_dataset
 from src.services.tr_ets_reporting import build_tr_ets_reporting
-from src.services.storage import EVIDENCE_DOCS_CATEGORIES
+from src.services.storage import EVIDENCE_DOCS_CATEGORIES, REPORT_DIR
 
 
 def build_xlsx_from_results(results_json: str) -> bytes:
@@ -306,6 +306,10 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     pdf_ets = _build_pdf_bytes(snapshot.id, "ETS Raporu (EU ETS / MRR)", {"ets_reporting": ets_json_obj, **base_for_pdf})
     pdf_cbam = _build_pdf_bytes(snapshot.id, "CBAM Raporu", {"cbam_report": cbam_json_obj, **base_for_pdf})
     pdf_comp = _build_pdf_bytes(snapshot.id, "Uyum (Compliance) Raporu", {"compliance": compliance_payload, **base_for_pdf})
+    # Faz 2: Karbon maliyeti raporları (otomatik üretilmişse evidence pack'e eklenir)
+    carbon_cost_json = _safe_read_bytes(str(REPORT_DIR / str(int(snapshot.id)) / "carbon_cost.json"))
+    carbon_cost_pdf = _safe_read_bytes(str(REPORT_DIR / str(int(snapshot.id)) / "carbon_cost.pdf"))
+
 
     # Evidence docs
     with db() as s:
@@ -344,6 +348,8 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         ("ets_report.pdf", pdf_ets or b""),
         ("cbam_report.pdf", pdf_cbam or b""),
         ("compliance_report.pdf", pdf_comp or b""),
+        ("carbon_cost/carbon_cost.json", carbon_cost_json or b""),
+        ("carbon_cost/carbon_cost.pdf", carbon_cost_pdf or b""),
         ("evidence/evidence_index.json", _json_bytes({"evidence": evidence_index})),
     ]
     files += evidence_files
