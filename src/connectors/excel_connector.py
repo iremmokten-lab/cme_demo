@@ -1,49 +1,74 @@
-import pandas as pd
+
+# -*- coding: utf-8 -*-
+"""Excel Connector (Excel-first, deterministic, Streamlit Cloud compatible)."""
+
+from __future__ import annotations
+
 import hashlib
 import json
-from .excel_schema import SCHEMAS
+from typing import Dict, Any, Tuple, List
+
+import pandas as pd
+
+from .excel_schema import SCHEMAS, ColumnSpec
 
 
-def canonical_json(data):
+def _quantize_number(x: Any) -> Any:
+    if pd.isna(x):
+        return None
+    if isinstance(x, int):
+        return int(x)
+    if isinstance(x, float):
+        return float(f"{x:.6f}")
+    return x
+
+
+def canonical_json_records(records: List[Dict[str, Any]]) -> str:
+    normalized = []
+    for r in records:
+        nr = {k: _quantize_number(v) for k, v in r.items()}
+        normalized.append(nr)
     return json.dumps(
-        data,
+        normalized,
         sort_keys=True,
         ensure_ascii=False,
-        separators=(",", ":")
+        separators=(",", ":"),
     )
 
 
-def compute_hash(df):
-    data = df.to_dict(orient="records")
-    canonical = canonical_json(data)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+def compute_dataset_hash(df: pd.DataFrame) -> str:
+    df2 = df.copy()
+    df2.columns = [str(c).strip() for c in df2.columns]
+    df2 = df2.reindex(sorted(df2.columns), axis=1)
+
+    sort_keys = [c for c in ["facility_id", "period", "product_sku", "cn_code", "fuel_type"] if c in df2.columns]
+    if sort_keys:
+        df2 = df2.sort_values(by=sort_keys, kind="mergesort").reset_index(drop=True)
+
+    records = df2.to_dict(orient="records")
+    payload = canonical_json_records(records)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def validate_schema(df, schema):
-
-    missing = []
-
-    for col in schema:
-        if col not in df.columns:
-            missing.append(col)
-
-    if missing:
-        raise ValueError(f"Missing columns: {missing}")
-
-    return True
+def validate_schema(df: pd.DataFrame, schema: List[ColumnSpec]) -> Tuple[bool, List[str]]:
+    df_cols = {str(c).strip() for c in df.columns}
+    missing = [c.name for c in schema if c.required and c.name not in df_cols]
+    return (len(missing) == 0, missing)
 
 
-def load_excel(file, dataset_type):
+def load_excel(file, dataset_type: str) -> Dict[str, Any]:
+    if dataset_type not in SCHEMAS:
+        raise ValueError(f"Bilinmeyen dataset türü: {dataset_type}")
 
     schema = SCHEMAS[dataset_type]
 
     df = pd.read_excel(file)
+    df.columns = [str(c).strip() for c in df.columns]
 
-    validate_schema(df, schema)
+    ok, missing = validate_schema(df, schema)
+    if not ok:
+        raise ValueError(f"Eksik zorunlu kolonlar: {missing}")
 
-    dataset_hash = compute_hash(df)
+    dataset_hash = compute_dataset_hash(df)
 
-    return {
-        "dataframe": df,
-        "hash": dataset_hash
-    }
+    return {"dataset_type": dataset_type, "hash": dataset_hash, "dataframe": df}
