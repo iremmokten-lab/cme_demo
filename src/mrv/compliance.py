@@ -7,6 +7,7 @@ from sqlalchemy import select
 from src.db.models import EvidenceDocument
 from src.db.session import db
 from src.mrv.bundles import ComplianceCheck, InputBundle, QAFlag, ResultBundle
+from src.mrv.strict_validator import validate_strict
 
 
 def _norm(s: Any) -> str:
@@ -35,6 +36,29 @@ def _mk(
         details=dict(details or {}),
     )
 
+
+
+def _strict_to_compliance(strict_checks: list) -> list[ComplianceCheck]:
+    out: list[ComplianceCheck] = []
+    for sc in strict_checks or []:
+        try:
+            d = sc.to_dict() if hasattr(sc, "to_dict") else dict(sc)
+        except Exception:
+            continue
+        status = str(d.get("status") or "").strip().lower()
+        sev = "fail" if status == "fail" else ("warn" if status == "warn" else "info")
+        out.append(
+            _mk(
+                rule_id=str(d.get("rule_id") or d.get("field_key") or "STRICT"),
+                reg_reference=str(d.get("reg_reference") or d.get("spec_id") or "spec"),
+                severity=sev,
+                status=status if status in ["pass", "warn", "fail"] else "info",
+                message_tr=str(d.get("message_tr") or d.get("label_tr") or "Strict kontrol"),
+                remediation_tr=str(d.get("remediation_tr") or "Eksik alanları tamamlayın."),
+                details=d,
+            )
+        )
+    return out
 
 def _list_evidence_docs(project_id: int) -> List[EvidenceDocument]:
     with db() as s:
@@ -126,6 +150,46 @@ def evaluate_compliance(
       - Verification 2018/2067: evidence completeness + sampling universe (MVP)
     """
     checks: List[ComplianceCheck] = []
+
+    
+    # === STRICT REGULATORY SPECS (regulation-grade gate) ===
+    # Spec/*.yaml içindeki MUST alanları tamamlanmadan PASS vermez.
+    # Hedef: ETS + CBAM uyumunu 90%+ seviyeye taşımak için "eksik veri = FAIL" politikasını güçlendirmek.
+
+    try:
+        overall_cbam, strict_cbam = validate_strict(
+            project_id=int(getattr(input_bundle, "project_id", 0) or 0),
+            config=(legacy_results or {}).get("config", {}) if isinstance(legacy_results, dict) else {},
+            results_json=(legacy_results or {}) if isinstance(legacy_results, dict) else {},
+            spec_id="CBAM_2023_956_2023_1773",
+        )
+        checks.extend(_strict_to_compliance(strict_cbam))
+    except Exception:
+        pass
+
+    try:
+        overall_ets, strict_ets = validate_strict(
+            project_id=int(getattr(input_bundle, "project_id", 0) or 0),
+            config=(legacy_results or {}).get("config", {}) if isinstance(legacy_results, dict) else {},
+            results_json=(legacy_results or {}) if isinstance(legacy_results, dict) else {},
+            spec_id="ETS_MRR_2018_2066",
+        )
+        checks.extend(_strict_to_compliance(strict_ets))
+    except Exception:
+        pass
+
+    try:
+        strict_ets, _meta_ets = validate_strict(
+            project_id=int(getattr(input_bundle, "project_id", 0) or 0),
+            config=(legacy_results or {}).get("config", {}) if isinstance(legacy_results, dict) else {},
+            results_json=(legacy_results or {}) if isinstance(legacy_results, dict) else {},
+            spec_id="ETS_MRR_2018_2066",
+        )
+        checks.extend(_strict_to_compliance(strict_ets))
+    except Exception:
+        pass
+
+
     qa_flags: List[QAFlag] = []
 
     # -------------------------
