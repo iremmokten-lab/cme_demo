@@ -166,6 +166,7 @@ def run_orchestrator(
     energy_df: pd.DataFrame,
     production_df: pd.DataFrame,
     materials_df: pd.DataFrame | None = None,
+    cbam_defaults_df: pd.DataFrame | None = None,
 ) -> Tuple[InputBundle, ResultBundle, Dict[str, Any]]:
     """Paket A2: Deterministik Orchestrator (FAZ 1 son hali).
 
@@ -285,6 +286,7 @@ def run_orchestrator(
         allocation_basis=str(cbam_cfg.get("allocation_basis", "quantity") or "quantity"),
         allocation_by_sku=allocation_by_sku,
         allocation_meta=allocation_meta,
+        cbam_defaults_df=cbam_defaults_df,
     )
     cbam_table = cbam_df.to_dict(orient="records") if cbam_df is not None and len(cbam_df) > 0 else []
 
