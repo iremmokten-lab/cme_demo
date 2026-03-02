@@ -251,66 +251,25 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
 
     cbam_xml_str = ""
     cbam_json_obj = {}
-    cbam_portal_zip_bytes: bytes = b""
-    cbam_portal_manifest: dict = {}
     if hard_fail:
         cbam_xml_str = ""
         cbam_json_obj = {"error": "HARD_FAIL", "message_tr": "Zorunlu alanlar eksik: CBAM resmi raporu üretilmedi.", "compliance_status": strict_overall}
     else:
         try:
-            from src.services.cbam_xml import cbam_reporting_json_to_xml
-            from src.services.cbam_portal_package import build_cbam_portal_zip
-            from src.services.cbam_portal_xml_v23 import PortalMetaV23
-
-            cbam_reporting = (res or {}).get("cbam_reporting") or {}
-            if isinstance(cbam_reporting, dict) and cbam_reporting:
-                cbam_xml_str = cbam_reporting_json_to_xml(cbam_reporting)
-
-                cbam_json_obj = {
-                    "schema": "cbam_reporting_v2",
-                    "cbam_reporting": cbam_reporting,
-                    "validation_status": {
-                        "used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors"))
-                    },
-                }
-
-                # Portal upload ZIP (XML + optional attachments) — deterministic.
-                # Official XSD should be placed under: spec/cbam_xsd/QReport_ver23.00.xsd
-                xsd_main = Path("spec/cbam_xsd/QReport_ver23.00.xsd")
-                xsd_path = str(xsd_main) if xsd_main.exists() else None
-
-                portal_meta = PortalMetaV23(
-                    reporting_period_year=int(((cbam_reporting.get("period") or {}).get("year") or 0)),
-                    reporting_period_quarter=int(((cbam_reporting.get("period") or {}).get("quarter") or 0)),
-                    declarant_eori=str((cfg or {}).get("cbam_eori", "") or ""),
-                    declarant_name=str(((cbam_reporting.get("declarant") or {}).get("company_name") or "")),
-                    declarant_country=str(((cbam_reporting.get("declarant") or {}).get("country") or "")),
-                    operator_name=str((cfg or {}).get("cbam_operator_name", "") or ""),
-                    operator_country=str((cfg or {}).get("cbam_operator_country", "") or ""),
-                    installation_name=str((cfg or {}).get("cbam_installation_name", "") or ""),
-                    installation_city=str((cfg or {}).get("cbam_installation_city", "") or ""),
-                    installation_country=str((cfg or {}).get("cbam_installation_country", "") or ""),
-                    signed_at_iso=str((cfg or {}).get("cbam_signed_at_iso", "") or ""),
-                )
-
-                tmp_zip = Path("/tmp/cbam_portal_upload.zip")
-                cbam_portal_manifest = build_cbam_portal_zip(
-                    cbam_reporting_json=cbam_reporting,
-                    portal_meta=portal_meta,
-                    output_zip_path=str(tmp_zip),
-                    xsd_main_path=xsd_path,
-                    attachments=[],
-                    xml_filename="quarterly_report.xml",
-                )
-                cbam_portal_zip_bytes = tmp_zip.read_bytes()
-            else:
-                cbam_xml_str = ""
-                cbam_json_obj = {}
+            cbam = (res or {}).get("cbam", {}) or {}
+            cbam_xml_str = str(cbam.get("cbam_reporting") or "")
+            cbam_json_obj = {
+            "schema": "cbam_report.v1",
+            "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
+            "products": cbam.get("table") or [],
+            "meta": cbam.get("meta") or {},
+            "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
+            "validation_status": {"used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors"))},
+        }
         except Exception:
             cbam_xml_str = ""
             cbam_json_obj = {}
-            cbam_portal_zip_bytes = b""
-            cbam_portal_manifest = {}
+
     # compliance
     compliance_payload = {
         "snapshot_id": int(snapshot.id),
@@ -384,12 +343,121 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         ("report/report.pdf", pdf_general or b""),
         ("ets_report.pdf", pdf_ets or b""),
         ("cbam_report.pdf", pdf_cbam or b""),
-        ("cbam_portal_upload.zip", cbam_portal_zip_bytes or b""),
-        ("cbam_portal_manifest.json", _json_bytes(cbam_portal_manifest or {})),
         ("compliance_report.pdf", pdf_comp or b""),
         ("evidence/evidence_index.json", _json_bytes({"evidence": evidence_index})),
     ]
     files += evidence_files
+
+# --- Compliance Closure: Regulation versions + Portal package + ETS evidence ---
+try:
+    from sqlalchemy import select
+    from src.db.cbam_compliance_models import RegulationSpecVersion, CBAMMethodologyEvidence, CBAMCarbonPricePaid
+    from src.db.ets_compliance_models import ETSMonitoringPlan, ETSUncertaintyAssessment, ETSTierJustification, ETSQAQCEvidence, ETSFallbackEvent
+    from src.services.cbam_portal_package import build_cbam_portal_package
+except Exception:
+    RegulationSpecVersion = None
+    CBAMMethodologyEvidence = None
+    CBAMCarbonPricePaid = None
+    ETSMonitoringPlan = None
+    ETSUncertaintyAssessment = None
+    ETSTierJustification = None
+    ETSQAQCEvidence = None
+    ETSFallbackEvent = None
+    build_cbam_portal_package = None
+
+# regulation versions
+reg_versions = []
+try:
+    if RegulationSpecVersion is not None:
+        with db() as s:
+            reg_versions = s.execute(select(RegulationSpecVersion).order_by(RegulationSpecVersion.fetched_at.desc())).scalars().all()
+except Exception:
+    reg_versions = []
+if reg_versions:
+    files.append(("regulation/versions.json", _json_bytes({"versions": [
+        {"spec_name": r.spec_name, "spec_version": r.spec_version, "spec_hash": r.spec_hash, "source": r.source, "fetched_at": str(r.fetched_at)}
+        for r in reg_versions
+    ]})))
+
+# CBAM portal package (portal-real)
+if (not hard_fail) and build_cbam_portal_package is not None:
+    try:
+        portal_zip, portal_manifest = build_cbam_portal_package(int(snapshot.id))
+        files.append(("cbam/portal_package.zip", portal_zip))
+        files.append(("cbam/portal_manifest.json", _json_bytes(portal_manifest)))
+    except Exception:
+        pass
+
+# CBAM evidence extras: methodology + carbon price paid (if captured)
+try:
+    with db() as s:
+        # company_id is on project
+        company_id = int(getattr(project, "company_id", 0) or 0)
+        if CBAMMethodologyEvidence is not None and company_id:
+            m = s.execute(select(CBAMMethodologyEvidence).where(CBAMMethodologyEvidence.company_id==company_id, CBAMMethodologyEvidence.snapshot_id==int(snapshot.id)).order_by(CBAMMethodologyEvidence.created_at.desc())).scalars().first()
+            if m:
+                files.append(("cbam/methodology_evidence.json", _json_bytes({
+                    "boundary": m.boundary, "allocation": m.allocation, "scrap_method": m.scrap_method,
+                    "electricity_method": m.electricity_method, "electricity_factor_source": m.electricity_factor_source,
+                    "notes": m.notes, "created_at": str(m.created_at)
+                })))
+        if CBAMCarbonPricePaid is not None and company_id:
+            cps = s.execute(select(CBAMCarbonPricePaid).where(CBAMCarbonPricePaid.company_id==company_id, CBAMCarbonPricePaid.snapshot_id==int(snapshot.id)).order_by(CBAMCarbonPricePaid.created_at.desc())).scalars().all()
+            if cps:
+                files.append(("cbam/carbon_price_paid.json", _json_bytes({"items":[
+                    {"country": c.country, "instrument": c.instrument, "amount_per_tco2": c.amount_per_tco2, "currency": c.currency, "verified": bool(c.verified), "evidence_doc_id": c.evidence_doc_id, "notes": c.notes, "created_at": str(c.created_at)}
+                    for c in cps
+                ]})))
+except Exception:
+    pass
+
+# ETS evidence extras: monitoring plan + tier justification + uncertainty + QAQC + fallback
+try:
+    with db() as s:
+        company_id = int(getattr(project, "company_id", 0) or 0)
+        year = int(period_year) if period_year else None
+        if company_id and year:
+            if ETSMonitoringPlan is not None:
+                mp = s.execute(select(ETSMonitoringPlan).where(ETSMonitoringPlan.company_id==company_id, ETSMonitoringPlan.year==year, ETSMonitoringPlan.status=="active").order_by(ETSMonitoringPlan.version.desc())).scalars().first()
+                if mp:
+                    try:
+                        mp_json = json.loads(mp.plan_json or "{}")
+                    except Exception:
+                        mp_json = {}
+                    files.append(("ets/monitoring_plan.json", _json_bytes({"year": year, "version": mp.version, "hash": mp.plan_hash, "plan": mp_json})))
+            if ETSUncertaintyAssessment is not None:
+                ua = s.execute(select(ETSUncertaintyAssessment).where(ETSUncertaintyAssessment.company_id==company_id, ETSUncertaintyAssessment.year==year).order_by(ETSUncertaintyAssessment.created_at.desc())).scalars().first()
+                if ua:
+                    try:
+                        ua_json = json.loads(ua.assessment_json or "{}")
+                    except Exception:
+                        ua_json = {}
+                    files.append(("ets/uncertainty_assessment.json", _json_bytes({"year": year, "result_percent": ua.result_percent, "method": ua.method, "assessment": ua_json})))
+            if ETSTierJustification is not None:
+                tj = s.execute(select(ETSTierJustification).where(ETSTierJustification.company_id==company_id, ETSTierJustification.year==year).order_by(ETSTierJustification.created_at.desc())).scalars().first()
+                if tj:
+                    try:
+                        tj_json = json.loads(tj.justification_json or "{}")
+                    except Exception:
+                        tj_json = {}
+                    files.append(("ets/tier_justification.json", _json_bytes({"year": year, "justification": tj_json})))
+            if ETSQAQCEvidence is not None:
+                qs = s.execute(select(ETSQAQCEvidence).where(ETSQAQCEvidence.company_id==company_id, ETSQAQCEvidence.year==year).order_by(ETSQAQCEvidence.created_at.desc())).scalars().all()
+                if qs:
+                    files.append(("ets/qaqc_evidence.json", _json_bytes({"year": year, "items":[
+                        {"control_name": q.control_name, "description": q.description, "evidence_doc_id": q.evidence_doc_id, "created_at": str(q.created_at)}
+                        for q in qs
+                    ]})))
+            if ETSFallbackEvent is not None:
+                fs = s.execute(select(ETSFallbackEvent).where(ETSFallbackEvent.company_id==company_id, ETSFallbackEvent.year==year).order_by(ETSFallbackEvent.created_at.desc())).scalars().all()
+                if fs:
+                    files.append(("ets/missing_data_fallback.json", _json_bytes({"year": year, "events":[
+                        {"reason": f.reason, "method": f.method, "value": f.value, "created_at": str(f.created_at)}
+                        for f in fs
+                    ]})))
+except Exception:
+    pass
+
 
     manifest = {
         "snapshot_id": int(snapshot.id),
