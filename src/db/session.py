@@ -32,9 +32,9 @@ def init_db():
         pass
 
 
-    # Production Step1 tabloları (portal submissions, approvals, audit logs, verifier workspace)
+    # Production Step2 tabloları (integrations, jobs, cache, regulation specs)
     try:
-        import src.db.production_step1_models  # noqa: F401
+        import src.db.production_step2_models  # noqa: F401
     except Exception:
         pass
 
