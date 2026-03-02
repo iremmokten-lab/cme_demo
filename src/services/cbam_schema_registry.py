@@ -8,6 +8,8 @@ from pathlib import Path
 
 import requests
 
+from src.services.cbam_schema_assets import DEFAULT_CBAM_XSD_ZIP_URL, ensure_cbam_xsd_assets
+
 DEFAULT_CACHE_DIR = os.getenv("CME_CBAM_XSD_CACHE", "/tmp/cbam_xsd_cache")
 
 @dataclass(frozen=True)
@@ -39,3 +41,45 @@ def fetch_official_cbam_xsd_zip(url: str, version_label: str) -> SchemaRef:
         with zipfile.ZipFile(zip_path, "r") as z:
             z.extractall(extract_dir)
     return SchemaRef(version_label=version_label, zip_path=zip_path, xsd_root_dir=extract_dir, sha256=sha)
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible API used by pages.
+# ---------------------------------------------------------------------------
+
+
+def fetch_and_cache_official_cbam_xsd_zip(
+    *,
+    url: str = DEFAULT_CBAM_XSD_ZIP_URL,
+    version_label: str = "23.00",
+    cache_dir: str | None = None,
+) -> SchemaRef:
+    """Fetch the official CBAM XSD zip and cache it.
+
+    Some pages call this name; keep it as a wrapper.
+    """
+    global DEFAULT_CACHE_DIR
+    if cache_dir:
+        DEFAULT_CACHE_DIR = str(cache_dir)
+    return fetch_official_cbam_xsd_zip(url=url, version_label=version_label)
+
+
+def get_latest_cbam_xsd(
+    *,
+    cache_dir: str = "./spec/cbam_xsd",
+    version_label: str = "23.00",
+    url: str = DEFAULT_CBAM_XSD_ZIP_URL,
+) -> SchemaRef:
+    """Return the latest available CBAM XSD schema reference.
+
+    - Prefers local cache (Streamlit Cloud friendly).
+    - Falls back to download if missing.
+    """
+    asset = ensure_cbam_xsd_assets(base_dir=cache_dir, version=version_label, url=url)
+    # Build a SchemaRef compatible with the validator/services.
+    return SchemaRef(
+        version_label=str(asset.version),
+        zip_path=str(asset.xsd_dir / "cbam_xsd.zip") if (asset.xsd_dir / "cbam_xsd.zip").exists() else "",
+        xsd_root_dir=str(asset.xsd_dir),
+        sha256=str(asset.zip_sha256),
+    )
