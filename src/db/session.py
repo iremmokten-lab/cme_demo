@@ -32,16 +32,10 @@ def init_db():
         pass
 
 
-    # Global-ready Step1 modelleri
+    # Phase A+B modelleri (Compliance + Master Data)
     try:
-        import src.db.global_ready_models_step1  # noqa: F401
-    except Exception:
-        pass
-
-
-    # Global-ready Step2 modelleri
-    try:
-        import src.db.global_ready_models_step2  # noqa: F401
+        import src.db.phase_ab_models  # noqa: F401
+        import src.erp.masterdata.models  # noqa: F401
     except Exception:
         pass
 
