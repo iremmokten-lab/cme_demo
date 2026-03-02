@@ -38,6 +38,13 @@ def init_db():
     except Exception:
         pass
 
+
+    # Global-ready Step2 modelleri
+    try:
+        import src.db.global_ready_models_step2  # noqa: F401
+    except Exception:
+        pass
+
     Base.metadata.create_all(bind=engine)
 
     # Faz 2: migration-like stabilization (SQLite)
