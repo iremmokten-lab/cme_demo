@@ -36,7 +36,7 @@ with st.sidebar:
     logout_button()
 
 st.title("Audit Log")
-companies = prj.list_companies()
+companies = prj.list_companies_for_user(user)
 if not companies:
     st.info("Şirket kaydı yok.")
     st.stop()
@@ -51,8 +51,8 @@ with db() as s:
         s.execute(
             select(AuditEvent)
             .where(AuditEvent.company_id == int(cid))
-            .where(AuditEvent.created_at >= since)
-            .order_by(AuditEvent.created_at.desc())
+            .where(AuditEvent.at >= since)
+            .order_by(AuditEvent.at.desc())
         )
         .scalars()
         .all()
@@ -61,14 +61,14 @@ with db() as s:
 data = []
 for r in rows:
     try:
-        payload = json.loads(r.payload_json or "{}")
+        payload = json.loads(r.meta_json or "{}")
     except Exception:
         payload = {}
     data.append(
         {
-            "time": str(r.created_at),
+            "time": str(r.at),
             "user_id": r.user_id,
-            "event": r.event_type,
+            "event": r.action,
             "entity_type": r.entity_type,
             "entity_id": r.entity_id,
             "payload": payload,
