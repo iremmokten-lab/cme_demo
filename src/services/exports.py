@@ -7,7 +7,7 @@ import zipfile
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Any, Dict, Tuple
 
 import pandas as pd
 from sqlalchemy import select
@@ -15,24 +15,23 @@ from sqlalchemy import select
 from src import config as app_config
 from src.db.models import (
     CalculationSnapshot,
-    DatasetUpload,
     EmissionFactor,
     EvidenceDocument,
     Methodology,
     Project,
-    Report,
     VerificationCase,
     VerificationFinding,
 )
 from src.db.session import db
 from src.mrv.lineage import sha256_bytes
-from src.services.reporting import build_pdf
 from src.services.ets_reporting import build_ets_reporting_dataset
-from src.services.tr_ets_reporting import build_tr_ets_reporting
+from src.services.reporting import build_pdf
 from src.services.storage import EVIDENCE_DOCS_CATEGORIES
+from src.services.tr_ets_reporting import build_tr_ets_reporting
 
 
 def build_xlsx_from_results(results_json: str) -> bytes:
+    """Create a simple Excel export from snapshot results."""
     results = json.loads(results_json) if results_json else {}
     kpis = results.get("kpis", {}) or {}
     table = results.get("cbam_table", []) or []
@@ -56,18 +55,6 @@ def _safe_read_bytes(uri: str) -> bytes:
     return b""
 
 
-def _snapshot_input_uris(snapshot: CalculationSnapshot) -> dict:
-    try:
-        ih = json.loads(snapshot.input_hashes_json or "{}")
-    except Exception:
-        ih = {}
-    return {
-        "energy": ih.get("energy") or {},
-        "production": ih.get("production") or {},
-        "materials": ih.get("materials") or {},
-    }
-
-
 def _json_bytes(obj: Any) -> bytes:
     return json.dumps(obj or {}, ensure_ascii=False, sort_keys=True, default=str, indent=2).encode("utf-8")
 
@@ -76,7 +63,7 @@ def _hmac_signature(manifest_obj: dict) -> str | None:
     key = app_config.get_evidence_pack_hmac_key()
     if not key:
         return None
-    msg = _json_bytes({k: v for k, v in manifest_obj.items() if k != "signature"})
+    msg = _json_bytes({k: v for k, v in (manifest_obj or {}).items() if k != "signature"})
     return hmac.new(key.encode("utf-8"), msg, digestmod="sha256").hexdigest()
 
 
@@ -162,20 +149,45 @@ def _verification_payload(project_id: int, period_year: int | None) -> dict:
 
 
 def build_evidence_pack(snapshot_id: int) -> bytes:
+    """Build a verifier-friendly evidence pack as a ZIP."""
+
     with db() as s:
         snapshot = s.get(CalculationSnapshot, int(snapshot_id))
         if not snapshot:
             raise ValueError("Snapshot bulunamadı.")
         project = s.get(Project, int(snapshot.project_id))
 
-    inputs = _snapshot_input_uris(snapshot)
-    energy_bytes = _safe_read_bytes(inputs.get("energy", {}).get("uri", ""))
-    prod_bytes = _safe_read_bytes(inputs.get("production", {}).get("uri", ""))
-    mat_bytes = _safe_read_bytes(inputs.get("materials", {}).get("uri", ""))
+    # Snapshot payloads
+    try:
+        cfg = json.loads(snapshot.config_json or "{}")
+    except Exception:
+        cfg = {}
+    try:
+        ih = json.loads(snapshot.input_hashes_json or "{}")
+    except Exception:
+        ih = {}
+    try:
+        res = json.loads(snapshot.results_json or "{}")
+    except Exception:
+        res = {}
 
-    # factors
+    # Hard-fail guard used by compliance pages
+    strict = (res or {}).get("compliance_strict") or {}
+    strict_overall = str((strict or {}).get("overall_status") or "")
+    hard_fail = strict_overall.upper() == "FAIL"
+
+    # Input datasets (best-effort)
+    energy_bytes = _safe_read_bytes(((ih.get("energy") or {}) or {}).get("uri", ""))
+    prod_bytes = _safe_read_bytes(((ih.get("production") or {}) or {}).get("uri", ""))
+    mat_bytes = _safe_read_bytes(((ih.get("materials") or {}) or {}).get("uri", ""))
+
+    # Factors
     with db() as s:
-        factors = s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.year.desc())).scalars().all()
+        factors = (
+            s.execute(select(EmissionFactor).order_by(EmissionFactor.factor_type, EmissionFactor.year.desc()))
+            .scalars()
+            .all()
+        )
     factor_rows = [
         {
             "factor_type": f.factor_type,
@@ -190,8 +202,8 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         for f in factors
     ]
 
-    # methodology
-    meth_obj = {}
+    # Methodology
+    meth_obj: dict = {}
     if getattr(snapshot, "methodology_id", None):
         with db() as s:
             m = s.get(Methodology, int(snapshot.methodology_id))
@@ -205,32 +217,6 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
                 "created_at": str(getattr(m, "created_at", None)) if getattr(m, "created_at", None) else None,
             }
 
-    # snapshot payload
-    try:
-        cfg = json.loads(snapshot.config_json or "{}")
-    except Exception:
-        cfg = {}
-    try:
-        ih = json.loads(snapshot.input_hashes_json or "{}")
-    except Exception:
-        ih = {}
-    try:
-        res = json.loads(snapshot.results_json or "{}")
-
-
-    except Exception:
-        res = {}
-
-    # HARD FAIL guard: Zorunlu alanlar eksikse resmi ETS/CBAM raporlarını üretme (denetçi seviyesi).
-    strict = {}
-    try:
-        strict = (res or {}).get("compliance_strict") or {}
-    except Exception:
-        strict = {}
-    strict_overall = str((strict or {}).get("overall_status") or "")
-    hard_fail = strict_overall.upper() == "FAIL"
-
-
     snapshot_payload = {
         "snapshot_id": int(snapshot.id),
         "project_id": int(snapshot.project_id),
@@ -243,42 +229,57 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "results": res,
     }
 
-    # regulatory datasets
-    ets_json_obj = build_ets_reporting_dataset(project_id=int(snapshot.project_id), snapshot_id=int(snapshot.id), results=res or {}, config=cfg or {})
+    # Regulatory datasets
+    ets_json_obj = build_ets_reporting_dataset(
+        project_id=int(snapshot.project_id),
+        snapshot_id=int(snapshot.id),
+        results=res or {},
+        config=cfg or {},
+    )
     tr_ets_json_obj = {}
     if app_config.get_tr_ets_mode():
-        tr_ets_json_obj = build_tr_ets_reporting(project_id=int(snapshot.project_id), snapshot_id=int(snapshot.id), results=res or {}, config=cfg or {})
+        tr_ets_json_obj = build_tr_ets_reporting(
+            project_id=int(snapshot.project_id),
+            snapshot_id=int(snapshot.id),
+            results=res or {},
+            config=cfg or {},
+        )
 
     cbam_xml_str = ""
-    cbam_json_obj = {}
+    cbam_json_obj: dict = {}
     if hard_fail:
-        cbam_xml_str = ""
-        cbam_json_obj = {"error": "HARD_FAIL", "message_tr": "Zorunlu alanlar eksik: CBAM resmi raporu üretilmedi.", "compliance_status": strict_overall}
+        cbam_json_obj = {
+            "error": "HARD_FAIL",
+            "message_tr": "Zorunlu alanlar eksik: CBAM resmi raporu üretilmedi.",
+            "compliance_status": strict_overall,
+        }
     else:
         try:
             cbam = (res or {}).get("cbam", {}) or {}
             cbam_xml_str = str(cbam.get("cbam_reporting") or "")
             cbam_json_obj = {
-            "schema": "cbam_report.v1",
-            "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
-            "products": cbam.get("table") or [],
-            "meta": cbam.get("meta") or {},
-            "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
-            "validation_status": {"used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors"))},
-        }
+                "schema": "cbam_report.v1",
+                "facility": (res or {}).get("input_bundle", {}).get("facility", {}),
+                "products": cbam.get("table") or [],
+                "meta": cbam.get("meta") or {},
+                "methodology": (res or {}).get("input_bundle", {}).get("methodology_ref", {}),
+                "validation_status": {
+                    "used_default_factors": bool(((res or {}).get("energy", {}) or {}).get("used_default_factors"))
+                },
+            }
         except Exception:
             cbam_xml_str = ""
             cbam_json_obj = {}
 
-    # compliance
     compliance_payload = {
         "snapshot_id": int(snapshot.id),
         "project_id": int(snapshot.project_id),
         "engine_version": str(snapshot.engine_version or ""),
         "compliance_checks": (res or {}).get("compliance_checks", []) if isinstance(res, dict) else [],
+        "compliance_strict": strict,
     }
 
-    # verification
+    # Verification payload (year best-effort)
     period_year = None
     try:
         period_year = ((res or {}).get("input_bundle") or {}).get("period", {}).get("year", None)
@@ -301,33 +302,44 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
         "qa_flags": (res or {}).get("qa_flags", []) if isinstance(res, dict) else [],
         "compliance_checks": compliance_payload.get("compliance_checks") or [],
     }
-
     pdf_general = _build_pdf_bytes(snapshot.id, "Genel MRV Raporu", base_for_pdf)
     pdf_ets = _build_pdf_bytes(snapshot.id, "ETS Raporu (EU ETS / MRR)", {"ets_reporting": ets_json_obj, **base_for_pdf})
     pdf_cbam = _build_pdf_bytes(snapshot.id, "CBAM Raporu", {"cbam_report": cbam_json_obj, **base_for_pdf})
     pdf_comp = _build_pdf_bytes(snapshot.id, "Uyum (Compliance) Raporu", {"compliance": compliance_payload, **base_for_pdf})
 
-    # Evidence docs
+    # Evidence documents
     with db() as s:
         docs = (
-            s.execute(select(EvidenceDocument).where(EvidenceDocument.project_id == int(snapshot.project_id)).order_by(EvidenceDocument.uploaded_at.desc()))
+            s.execute(
+                select(EvidenceDocument)
+                .where(EvidenceDocument.project_id == int(snapshot.project_id))
+                .order_by(EvidenceDocument.uploaded_at.desc())
+            )
             .scalars()
             .all()
         )
     evidence_index = []
-    evidence_files = []
+    evidence_files: list[tuple[str, bytes]] = []
     for d in docs:
         cat = _ensure_category(getattr(d, "category", "") or "")
         uri = str(getattr(d, "storage_uri", "") or "")
         bts = _safe_read_bytes(uri)
-        sha = sha256_bytes(bts) if bts else (str(getattr(d, "sha256", "") or ""))
+        sha_val = sha256_bytes(bts) if bts else (str(getattr(d, "sha256", "") or ""))
         fn = f"evidence/{cat}/{int(d.id)}_{Path(uri).name if uri else 'document.bin'}"
-        evidence_index.append({"id": int(d.id), "category": cat, "title": str(getattr(d, "title", "") or ""), "sha256": sha, "uri": uri, "path_in_pack": fn})
+        evidence_index.append(
+            {
+                "id": int(d.id),
+                "category": cat,
+                "title": str(getattr(d, "title", "") or ""),
+                "sha256": sha_val,
+                "uri": uri,
+                "path_in_pack": fn,
+            }
+        )
         if bts:
             evidence_files.append((fn, bts))
 
-    files: list[tuple[str, bytes]] = []
-    files += [
+    files: list[tuple[str, bytes]] = [
         ("input/energy.csv", energy_bytes or b""),
         ("input/production.csv", prod_bytes or b""),
         ("input/materials.csv", mat_bytes or b""),
@@ -348,117 +360,237 @@ def build_evidence_pack(snapshot_id: int) -> bytes:
     ]
     files += evidence_files
 
-# --- Compliance Closure: Regulation versions + Portal package + ETS evidence ---
-try:
-    from sqlalchemy import select
-    from src.db.cbam_compliance_models import RegulationSpecVersion, CBAMMethodologyEvidence, CBAMCarbonPricePaid
-    from src.db.ets_compliance_models import ETSMonitoringPlan, ETSUncertaintyAssessment, ETSTierJustification, ETSQAQCEvidence, ETSFallbackEvent
-    from src.services.cbam_portal_package import build_cbam_portal_package
-except Exception:
-    RegulationSpecVersion = None
-    CBAMMethodologyEvidence = None
-    CBAMCarbonPricePaid = None
-    ETSMonitoringPlan = None
-    ETSUncertaintyAssessment = None
-    ETSTierJustification = None
-    ETSQAQCEvidence = None
-    ETSFallbackEvent = None
-    build_cbam_portal_package = None
+    # Optional: compliance closure extras (best-effort; do not fail pack creation)
+    try:
+        from src.db.cbam_compliance_models import RegulationSpecVersion, CBAMMethodologyEvidence, CBAMCarbonPricePaid
+        from src.db.ets_compliance_models import (
+            ETSMonitoringPlan,
+            ETSUncertaintyAssessment,
+            ETSTierJustification,
+            ETSQAQCEvidence,
+            ETSFallbackEvent,
+        )
+        from src.services.cbam_portal_package import build_cbam_portal_package
 
-# regulation versions
-reg_versions = []
-try:
-    if RegulationSpecVersion is not None:
+        # regulation versions
+        reg_versions = []
         with db() as s:
             reg_versions = s.execute(select(RegulationSpecVersion).order_by(RegulationSpecVersion.fetched_at.desc())).scalars().all()
-except Exception:
-    reg_versions = []
-if reg_versions:
-    files.append(("regulation/versions.json", _json_bytes({"versions": [
-        {"spec_name": r.spec_name, "spec_version": r.spec_version, "spec_hash": r.spec_hash, "source": r.source, "fetched_at": str(r.fetched_at)}
-        for r in reg_versions
-    ]})))
+        if reg_versions:
+            files.append(
+                (
+                    "regulation/versions.json",
+                    _json_bytes(
+                        {
+                            "versions": [
+                                {
+                                    "spec_name": r.spec_name,
+                                    "spec_version": r.spec_version,
+                                    "spec_hash": r.spec_hash,
+                                    "source": r.source,
+                                    "fetched_at": str(r.fetched_at),
+                                }
+                                for r in reg_versions
+                            ]
+                        }
+                    ),
+                )
+            )
 
-# CBAM portal package (portal-real)
-if (not hard_fail) and build_cbam_portal_package is not None:
-    try:
-        portal_zip, portal_manifest = build_cbam_portal_package(int(snapshot.id))
-        files.append(("cbam/portal_package.zip", portal_zip))
-        files.append(("cbam/portal_manifest.json", _json_bytes(portal_manifest)))
-    except Exception:
-        pass
+        # CBAM portal package
+        if (not hard_fail) and callable(build_cbam_portal_package):
+            try:
+                portal_zip, portal_manifest = build_cbam_portal_package(int(snapshot.id))
+                files.append(("cbam/portal_package.zip", portal_zip))
+                files.append(("cbam/portal_manifest.json", _json_bytes(portal_manifest)))
+            except Exception:
+                pass
 
-# CBAM evidence extras: methodology + carbon price paid (if captured)
-try:
-    with db() as s:
-        # company_id is on project
-        company_id = int(getattr(project, "company_id", 0) or 0)
-        if CBAMMethodologyEvidence is not None and company_id:
-            m = s.execute(select(CBAMMethodologyEvidence).where(CBAMMethodologyEvidence.company_id==company_id, CBAMMethodologyEvidence.snapshot_id==int(snapshot.id)).order_by(CBAMMethodologyEvidence.created_at.desc())).scalars().first()
-            if m:
-                files.append(("cbam/methodology_evidence.json", _json_bytes({
-                    "boundary": m.boundary, "allocation": m.allocation, "scrap_method": m.scrap_method,
-                    "electricity_method": m.electricity_method, "electricity_factor_source": m.electricity_factor_source,
-                    "notes": m.notes, "created_at": str(m.created_at)
-                })))
-        if CBAMCarbonPricePaid is not None and company_id:
-            cps = s.execute(select(CBAMCarbonPricePaid).where(CBAMCarbonPricePaid.company_id==company_id, CBAMCarbonPricePaid.snapshot_id==int(snapshot.id)).order_by(CBAMCarbonPricePaid.created_at.desc())).scalars().all()
-            if cps:
-                files.append(("cbam/carbon_price_paid.json", _json_bytes({"items":[
-                    {"country": c.country, "instrument": c.instrument, "amount_per_tco2": c.amount_per_tco2, "currency": c.currency, "verified": bool(c.verified), "evidence_doc_id": c.evidence_doc_id, "notes": c.notes, "created_at": str(c.created_at)}
-                    for c in cps
-                ]})))
-except Exception:
-    pass
+        # CBAM evidence extras
+        with db() as s:
+            company_id = int(getattr(project, "company_id", 0) or 0)
+            if company_id:
+                m = (
+                    s.execute(
+                        select(CBAMMethodologyEvidence)
+                        .where(CBAMMethodologyEvidence.company_id == company_id)
+                        .where(CBAMMethodologyEvidence.snapshot_id == int(snapshot.id))
+                        .order_by(CBAMMethodologyEvidence.created_at.desc())
+                    )
+                    .scalars()
+                    .first()
+                )
+                if m:
+                    files.append(
+                        (
+                            "cbam/methodology_evidence.json",
+                            _json_bytes(
+                                {
+                                    "boundary": m.boundary,
+                                    "allocation": m.allocation,
+                                    "scrap_method": m.scrap_method,
+                                    "electricity_method": m.electricity_method,
+                                    "electricity_factor_source": m.electricity_factor_source,
+                                    "notes": m.notes,
+                                    "created_at": str(m.created_at),
+                                }
+                            ),
+                        )
+                    )
 
-# ETS evidence extras: monitoring plan + tier justification + uncertainty + QAQC + fallback
-try:
-    with db() as s:
+                cps = (
+                    s.execute(
+                        select(CBAMCarbonPricePaid)
+                        .where(CBAMCarbonPricePaid.company_id == company_id)
+                        .where(CBAMCarbonPricePaid.snapshot_id == int(snapshot.id))
+                        .order_by(CBAMCarbonPricePaid.created_at.desc())
+                    )
+                    .scalars()
+                    .all()
+                )
+                if cps:
+                    files.append(
+                        (
+                            "cbam/carbon_price_paid.json",
+                            _json_bytes(
+                                {
+                                    "items": [
+                                        {
+                                            "country": c.country,
+                                            "instrument": c.instrument,
+                                            "amount_per_tco2": c.amount_per_tco2,
+                                            "currency": c.currency,
+                                            "verified": bool(c.verified),
+                                            "evidence_doc_id": c.evidence_doc_id,
+                                            "notes": c.notes,
+                                            "created_at": str(c.created_at),
+                                        }
+                                        for c in cps
+                                    ]
+                                }
+                            ),
+                        )
+                    )
+
+        # ETS evidence extras
         company_id = int(getattr(project, "company_id", 0) or 0)
         year = int(period_year) if period_year else None
         if company_id and year:
-            if ETSMonitoringPlan is not None:
-                mp = s.execute(select(ETSMonitoringPlan).where(ETSMonitoringPlan.company_id==company_id, ETSMonitoringPlan.year==year, ETSMonitoringPlan.status=="active").order_by(ETSMonitoringPlan.version.desc())).scalars().first()
+            with db() as s:
+                mp = (
+                    s.execute(
+                        select(ETSMonitoringPlan)
+                        .where(ETSMonitoringPlan.company_id == company_id)
+                        .where(ETSMonitoringPlan.year == year)
+                        .where(ETSMonitoringPlan.status == "active")
+                        .order_by(ETSMonitoringPlan.version.desc())
+                    )
+                    .scalars()
+                    .first()
+                )
                 if mp:
                     try:
                         mp_json = json.loads(mp.plan_json or "{}")
                     except Exception:
                         mp_json = {}
                     files.append(("ets/monitoring_plan.json", _json_bytes({"year": year, "version": mp.version, "hash": mp.plan_hash, "plan": mp_json})))
-            if ETSUncertaintyAssessment is not None:
-                ua = s.execute(select(ETSUncertaintyAssessment).where(ETSUncertaintyAssessment.company_id==company_id, ETSUncertaintyAssessment.year==year).order_by(ETSUncertaintyAssessment.created_at.desc())).scalars().first()
+
+                ua = (
+                    s.execute(
+                        select(ETSUncertaintyAssessment)
+                        .where(ETSUncertaintyAssessment.company_id == company_id)
+                        .where(ETSUncertaintyAssessment.year == year)
+                        .order_by(ETSUncertaintyAssessment.created_at.desc())
+                    )
+                    .scalars()
+                    .first()
+                )
                 if ua:
                     try:
                         ua_json = json.loads(ua.assessment_json or "{}")
                     except Exception:
                         ua_json = {}
                     files.append(("ets/uncertainty_assessment.json", _json_bytes({"year": year, "result_percent": ua.result_percent, "method": ua.method, "assessment": ua_json})))
-            if ETSTierJustification is not None:
-                tj = s.execute(select(ETSTierJustification).where(ETSTierJustification.company_id==company_id, ETSTierJustification.year==year).order_by(ETSTierJustification.created_at.desc())).scalars().first()
+
+                tj = (
+                    s.execute(
+                        select(ETSTierJustification)
+                        .where(ETSTierJustification.company_id == company_id)
+                        .where(ETSTierJustification.year == year)
+                        .order_by(ETSTierJustification.created_at.desc())
+                    )
+                    .scalars()
+                    .first()
+                )
                 if tj:
                     try:
                         tj_json = json.loads(tj.justification_json or "{}")
                     except Exception:
                         tj_json = {}
                     files.append(("ets/tier_justification.json", _json_bytes({"year": year, "justification": tj_json})))
-            if ETSQAQCEvidence is not None:
-                qs = s.execute(select(ETSQAQCEvidence).where(ETSQAQCEvidence.company_id==company_id, ETSQAQCEvidence.year==year).order_by(ETSQAQCEvidence.created_at.desc())).scalars().all()
+
+                qs = (
+                    s.execute(
+                        select(ETSQAQCEvidence)
+                        .where(ETSQAQCEvidence.company_id == company_id)
+                        .where(ETSQAQCEvidence.year == year)
+                        .order_by(ETSQAQCEvidence.created_at.desc())
+                    )
+                    .scalars()
+                    .all()
+                )
                 if qs:
-                    files.append(("ets/qaqc_evidence.json", _json_bytes({"year": year, "items":[
-                        {"control_name": q.control_name, "description": q.description, "evidence_doc_id": q.evidence_doc_id, "created_at": str(q.created_at)}
-                        for q in qs
-                    ]})))
-            if ETSFallbackEvent is not None:
-                fs = s.execute(select(ETSFallbackEvent).where(ETSFallbackEvent.company_id==company_id, ETSFallbackEvent.year==year).order_by(ETSFallbackEvent.created_at.desc())).scalars().all()
+                    files.append(
+                        (
+                            "ets/qaqc_evidence.json",
+                            _json_bytes(
+                                {
+                                    "year": year,
+                                    "items": [
+                                        {
+                                            "control_name": q.control_name,
+                                            "description": q.description,
+                                            "evidence_doc_id": q.evidence_doc_id,
+                                            "created_at": str(q.created_at),
+                                        }
+                                        for q in qs
+                                    ],
+                                }
+                            ),
+                        )
+                    )
+
+                fs = (
+                    s.execute(
+                        select(ETSFallbackEvent)
+                        .where(ETSFallbackEvent.company_id == company_id)
+                        .where(ETSFallbackEvent.year == year)
+                        .order_by(ETSFallbackEvent.created_at.desc())
+                    )
+                    .scalars()
+                    .all()
+                )
                 if fs:
-                    files.append(("ets/missing_data_fallback.json", _json_bytes({"year": year, "events":[
-                        {"reason": f.reason, "method": f.method, "value": f.value, "created_at": str(f.created_at)}
-                        for f in fs
-                    ]})))
-except Exception:
-    pass
+                    files.append(
+                        (
+                            "ets/missing_data_fallback.json",
+                            _json_bytes(
+                                {
+                                    "year": year,
+                                    "events": [
+                                        {"reason": f.reason, "method": f.method, "value": f.value, "created_at": str(f.created_at)}
+                                        for f in fs
+                                    ],
+                                }
+                            ),
+                        )
+                    )
 
+    except Exception:
+        # Optional enrichment: ignore.
+        pass
 
+    # Manifest
     manifest = {
         "snapshot_id": int(snapshot.id),
         "project_id": int(snapshot.project_id),
@@ -476,7 +608,10 @@ except Exception:
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json", _json_bytes(manifest))
-        z.writestr("signature.json", _json_bytes({"algorithm": "HMAC-SHA256", "key_id": "EVIDENCE_PACK_HMAC_KEY", "signature": manifest.get("signature")}))
+        z.writestr(
+            "signature.json",
+            _json_bytes({"algorithm": "HMAC-SHA256", "key_id": "EVIDENCE_PACK_HMAC_KEY", "signature": manifest.get("signature")}),
+        )
         for path, bts in sorted(files, key=lambda x: x[0]):
             z.writestr(path, bts or b"")
 
@@ -484,7 +619,7 @@ except Exception:
 
 
 def export_evidence_pack(project_id: int, snapshot_id: int) -> Tuple[bytes, Dict[str, Any]]:
-    """UI/API için uyumlu wrapper: (zip_bytes, manifest_dict)."""
+    """UI/API compatible wrapper: (zip_bytes, manifest_dict)."""
     zip_bytes = build_evidence_pack(int(snapshot_id))
     with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
         manifest = json.loads(z.read("manifest.json").decode("utf-8"))
