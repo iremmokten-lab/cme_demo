@@ -1,14 +1,17 @@
 from __future__ import annotations
+import json, time, traceback
+from typing import Callable, Dict, Any
 
-import json
-from typing import Dict, Any
+from src.services.job_queue import claim_next, finish
 
-from src.services import job_queue
-from src.services.observability import log_event
-from src.services.cbam_portal_package import store_cbam_portal_package
+# Job handlers registry
+_HANDLERS: Dict[str, Callable[[dict], dict]] = {}
 
-def run_once() -> bool:
-    j = job_queue.fetch_next()
+def register(kind:str, fn:Callable[[dict], dict])->None:
+    _HANDLERS[str(kind)] = fn
+
+def run_once()->bool:
+    j = claim_next()
     if not j:
         return False
     try:
@@ -16,15 +19,18 @@ def run_once() -> bool:
     except Exception:
         payload = {}
     try:
-        if j.job_type == "CBAM_PORTAL_PACKAGE":
-            snap = int(payload.get("snapshot_id"))
-            res = store_cbam_portal_package(snap)
-            job_queue.complete(j.id, res)
-            log_event("job_succeeded", job_type=j.job_type, job_id=j.id)
-        else:
-            job_queue.fail(j.id, f"Unknown job type: {j.job_type}")
-            log_event("job_failed", job_type=j.job_type, job_id=j.id, error="unknown_job_type")
+        if j.kind not in _HANDLERS:
+            raise ValueError(f"Handler yok: {j.kind}")
+        res = _HANDLERS[j.kind](payload)
+        finish(j.id, True, result=res)
     except Exception as e:
-        job_queue.fail(j.id, str(e))
-        log_event("job_failed", job_type=j.job_type, job_id=j.id, error=str(e))
+        finish(j.id, False, result={}, error=str(e) + "\n" + traceback.format_exc()[:4000])
     return True
+
+def run_loop(poll_seconds:float=1.0, max_loops:int=1000):
+    loops=0
+    while loops < max_loops:
+        did = run_once()
+        if not did:
+            time.sleep(poll_seconds)
+        loops += 1
