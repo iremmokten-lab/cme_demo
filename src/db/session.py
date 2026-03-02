@@ -31,15 +31,18 @@ def init_db():
     except Exception:
         pass
 
-    # Faz 1: Master Data Engine tabloları
+
+    # Compliance Closure: CBAM/ETS compliance models
     try:
-        import src.master_data.models  # noqa: F401
+        import src.db.cbam_compliance_models  # noqa: F401
     except Exception:
         pass
-
-    # Faz 3: ERP Integration tabloları
     try:
-        import src.db.erp_models  # noqa: F401
+        import src.db.ets_compliance_models  # noqa: F401
+    except Exception:
+        pass
+    try:
+        import src.db.job_models  # noqa: F401
     except Exception:
         pass
 
