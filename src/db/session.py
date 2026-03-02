@@ -32,17 +32,9 @@ def init_db():
         pass
 
 
-    # Compliance Closure: CBAM/ETS compliance models
+    # Global-ready Step1 modelleri
     try:
-        import src.db.cbam_compliance_models  # noqa: F401
-    except Exception:
-        pass
-    try:
-        import src.db.ets_compliance_models  # noqa: F401
-    except Exception:
-        pass
-    try:
-        import src.db.job_models  # noqa: F401
+        import src.db.global_ready_models_step1  # noqa: F401
     except Exception:
         pass
 
