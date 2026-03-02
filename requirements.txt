@@ -22,5 +22,5 @@ pydantic==2.8.2
 httpx==0.27.2
 PyYAML==6.0.2
 
-# CBAM portal-grade XSD validation (pure python)
+requests==2.32.3
 xmlschema==3.4.3
