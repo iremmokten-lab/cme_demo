@@ -32,10 +32,9 @@ def init_db():
         pass
 
 
-    # Phase A+B modelleri (Compliance + Master Data)
+    # Production Step1 tabloları (portal submissions, approvals, audit logs, verifier workspace)
     try:
-        import src.db.phase_ab_models  # noqa: F401
-        import src.erp.masterdata.models  # noqa: F401
+        import src.db.production_step1_models  # noqa: F401
     except Exception:
         pass
 
