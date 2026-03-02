@@ -26,15 +26,14 @@ def init_db():
     from src.db.models import Base
 
     # CN Registry tabloları (metadata içine dahil olsun diye import)
+    # ERP Automation tabloları
     try:
-        import src.db.cbam_registry  # noqa: F401
+        import src.db.erp_automation_models  # noqa: F401
     except Exception:
         pass
 
-
-    # Production Step2 tabloları (integrations, jobs, cache, regulation specs)
     try:
-        import src.db.production_step2_models  # noqa: F401
+        import src.db.cbam_registry  # noqa: F401
     except Exception:
         pass
 
