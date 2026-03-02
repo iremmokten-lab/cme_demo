@@ -12,18 +12,17 @@ from src.mrv.compliance import evaluate_compliance
 from src.mrv.lineage import sha256_json
 
 
-def _run_phase4_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
-    """Faz 4: Senaryo motoru + AI öneriler + optimizasyon + maliyet simülasyonu.
+def _run_phase3_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
+    """Faz 3: Benchmark + Advisor + Optimizer.
 
-    - Deterministik: sadece snapshot sonuçları + config.ai.* kullanır.
-    - Çıktı: benchmark, advisor(measures), optimizer(MACC+portfolio), scenario_simulation
+    - Deterministik: sadece snapshot sonuçları + config.ai.optimizer_constraints kullanır.
+    - Evidence gap: project'e bağlı evidence kategorilerine göre çıkar.
     """
 
     try:
         from src.engine.advisor import build_reduction_advice
         from src.engine.benchmark import build_benchmark_report
         from src.engine.optimizer import build_optimizer_payload
-        from src.engine.scenario import simulate_cost_scenario
     except Exception:
         return {}
 
@@ -45,7 +44,10 @@ def _run_phase4_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
     # Evidence categories present
     categories = []
     try:
+        from sqlalchemy import select
+
         from src.db.models import EvidenceDocument
+        from src.db.session import db
 
         with db() as s:
             cats = (
@@ -85,21 +87,12 @@ def _run_phase4_ai(project_id: int, legacy_results: dict, config: dict) -> dict:
 
     opt = build_optimizer_payload(total_tco2=total_tco2, measures=(advice.get("measures") or []), constraints=constraints)
 
-    # Senaryo simülasyonu: optimizer.portfolio.selected ile baseline kıyasla
-    scenario = {}
-    try:
-        selected = (((opt or {}).get("portfolio") or {}).get("selected") or [])
-        scenario = simulate_cost_scenario(results=results, config=(config or {}), portfolio_selected=selected)
-    except Exception:
-        scenario = {}
-
     return {
         "benchmark": bench,
         "advisor": advice,
         "optimizer": opt,
-        "scenario": scenario,
         "meta": {
-            "phase": "faz4",
+            "phase": "faz3",
             "optimizer_constraints": constraints,
             "evidence_categories_present": categories,
         },
@@ -271,6 +264,14 @@ def create_snapshot(
                 entity_type="snapshot",
                 entity_id=str(snap.id),
             )
+
+    # Compliance Closure (Adım 2): Portal paketini background job olarak kuyruğa al
+    try:
+        from src.services.job_queue import enqueue as _enqueue_job
+        _enqueue_job("CBAM_PORTAL_PACKAGE", {"snapshot_id": int(snap.id)})
+    except Exception:
+        pass
+
         return snap
 
 
@@ -380,7 +381,7 @@ def run_full(
 
     # Faz 3 AI outputs
     try:
-        ai_payload = _run_phase4_ai(int(project_id), legacy_results, (config or {}))
+        ai_payload = _run_phase3_ai(int(project_id), legacy_results, (config or {}))
         if ai_payload:
             results_json["ai"] = ai_payload
     except Exception:
