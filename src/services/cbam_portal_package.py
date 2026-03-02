@@ -1,97 +1,76 @@
 from __future__ import annotations
 
-"""CBAM portal submission package builder.
-
-Portal workflow (Declarant Portal):
-- User uploads a ZIP containing:
-  * one quarterly report XML file (must conform to the official XSD)
-  * optional binary attachments (pdf/xlsx/docx/jpeg etc.)
-
-This module builds a deterministic ZIP suitable for upload.
-"""
-
 import io
-import json
 import zipfile
-from dataclasses import asdict
 from datetime import datetime, timezone
 from hashlib import sha256
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Any, Tuple, List
 
-from src.mrv.lineage import sha256_bytes
+from sqlalchemy import select
 
-from src.services.cbam_portal_xml_v23 import PortalMetaV23, build_qreport_v23
-from src.services.cbam_xsd_validator import CBAMXSDValidator
+from src.db.session import db
+from src.db.models import CalculationSnapshot, EvidenceDocument
+from src.services.storage_backend import get_storage_backend
 
+def _sha256(b: bytes) -> str:
+    return sha256(b).hexdigest()
 
-_ALLOWED_ATTACH_EXT = {".pdf", ".xlsx", ".xls", ".doc", ".docx", ".jpeg", ".jpg", ".png"}
-
-
-def _zip_write_bytes(zf: zipfile.ZipFile, arcname: str, data: bytes) -> None:
-    zi = zipfile.ZipInfo(arcname)
-    # fixed timestamp for determinism
-    zi.date_time = (2020, 1, 1, 0, 0, 0)
-    zi.compress_type = zipfile.ZIP_DEFLATED
-    zf.writestr(zi, data)
-
-
-def build_cbam_portal_zip(
-    *,
-    cbam_reporting_json: Dict[str, Any],
-    portal_meta: PortalMetaV23,
-    output_zip_path: str,
-    xsd_main_path: Optional[str] = None,
-    attachments: Optional[List[str]] = None,
-    xml_filename: str = "quarterly_report.xml",
-) -> Dict[str, Any]:
-    """Create portal ZIP. Returns manifest-like info + validation result if XSD provided."""
-
-    attachments = attachments or []
-    # filter + stable sort
-    cleaned: List[str] = []
-    for a in attachments:
+def build_cbam_portal_package(snapshot_id: int, *, include_evidence: bool = True) -> Tuple[bytes, Dict[str, Any]]:
+    with db() as s:
+        snap = s.get(CalculationSnapshot, int(snapshot_id))
+        if not snap:
+            raise ValueError("Snapshot bulunamadı.")
         try:
-            p = Path(a)
-            if not p.exists() or not p.is_file():
-                continue
-            if p.suffix.lower() not in _ALLOWED_ATTACH_EXT:
-                continue
-            cleaned.append(str(p))
+            res = __import__("json").loads(snap.results_json or "{}")
         except Exception:
-            continue
-    cleaned = sorted(set(cleaned))
+            res = {}
+        cbam_xml = (((res or {}).get("cbam") or {}).get("cbam_reporting") or "") if isinstance(res, dict) else ""
+        if not cbam_xml:
+            raise ValueError("CBAM XML boş. (Hard FAIL olabilir ya da CBAM yok.)")
 
-    xml_bytes = build_qreport_v23(report=cbam_reporting_json, meta=portal_meta)
+        docs: List[EvidenceDocument] = []
+        if include_evidence:
+            docs = s.execute(
+                select(EvidenceDocument)
+                .where(EvidenceDocument.project_id == int(snap.project_id))
+                .order_by(EvidenceDocument.created_at.desc())
+            ).scalars().all()
 
-    validation = None
-    if xsd_main_path:
-        try:
-            v = CBAMXSDValidator(xsd_main_path)
-            validation = v.validate_xml_bytes(xml_bytes)
-        except Exception as e:
-            validation = {"valid": False, "errors": [str(e)], "xsd_main": xsd_main_path}
+    out = io.BytesIO()
+    manifest = {
+        "snapshot_id": int(snapshot_id),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "files": [],
+        "sha256": {},
+    }
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("cbam_report.xml", cbam_xml.encode("utf-8"))
+        manifest["files"].append("cbam_report.xml")
+        manifest["sha256"]["cbam_report.xml"] = _sha256(cbam_xml.encode("utf-8"))
 
-    out_p = Path(output_zip_path)
-    out_p.parent.mkdir(parents=True, exist_ok=True)
+        backend = get_storage_backend()
+        for d in docs:
+            # only attach docs marked for CBAM or generic documents
+            cat = (d.category or "documents").lower()
+            if cat not in ("cbam", "documents"):
+                continue
+            try:
+                b = backend.get_bytes_by_uri(d.uri)
+            except Exception:
+                continue
+            name = (d.filename or f"evidence_{d.id}.bin").replace("..", "_").replace("/", "_")
+            path = f"attachments/{name}"
+            z.writestr(path, b)
+            manifest["files"].append(path)
+            manifest["sha256"][path] = _sha256(b)
 
-    with zipfile.ZipFile(out_p, "w") as zf:
-        _zip_write_bytes(zf, xml_filename, xml_bytes)
+        z.writestr("manifest.json", __import__("json").dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"))
 
-        for ap in cleaned:
-            p = Path(ap)
-            _zip_write_bytes(zf, p.name, p.read_bytes())
+    return out.getvalue(), manifest
 
-        # add a small deterministic manifest for audit
-        manifest = {
-            "schema": "cbam_portal_zip_v1",
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "xml_filename": xml_filename,
-            "xml_sha256": sha256(xml_bytes).hexdigest(),
-            "portal_meta": asdict(portal_meta),
-            "attachments": [{"name": Path(a).name, "sha256": sha256(Path(a).read_bytes()).hexdigest()} for a in cleaned],
-            "xsd_validation": validation,
-        }
-        _zip_write_bytes(zf, "manifest.json", json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"))
-
-    return manifest
+def store_cbam_portal_package(snapshot_id: int) -> Dict[str, Any]:
+    bts, manifest = build_cbam_portal_package(int(snapshot_id))
+    backend = get_storage_backend()
+    key = f"reports/{int(snapshot_id)}/cbam_portal_package.zip"
+    uri = backend.put_bytes(key, bts)
+    return {"uri": uri, "sha256": _sha256(bts), "manifest": manifest}
