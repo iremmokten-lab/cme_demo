@@ -25,17 +25,30 @@ def init_db():
     # Base tablolar
     from src.db.models import Base
 
-    # CN Registry tabloları (metadata içine dahil olsun diye import)
-    # ERP Automation tabloları
-    try:
-        import src.db.erp_automation_models  # noqa: F401
-    except Exception:
-        pass
+    # IMPORTANT:
+    # SQLAlchemy needs all model modules imported before create_all(),
+    # otherwise ForeignKey targets might not be registered and
+    # "NoReferencedTableError" happens.
+    model_modules = [
+        "src.db.cbam_registry",
+        "src.db.cbam_compliance_models",
+        "src.db.ets_compliance_models",
+        "src.db.phase_ab_models",
+        "src.db.production_step1_models",
+        "src.db.production_step2_models",
+        "src.db.global_ready_models_step1",
+        "src.db.global_ready_models_step2",
+        "src.db.job_models",
+        "src.db.erp_models",
+        "src.db.erp_automation_models",
+    ]
 
-    try:
-        import src.db.cbam_registry  # noqa: F401
-    except Exception:
-        pass
+    for mod in model_modules:
+        try:
+            __import__(mod)  # noqa: WPS421
+        except Exception:
+            # Demo mode: allow missing optional modules.
+            pass
 
     Base.metadata.create_all(bind=engine)
 
