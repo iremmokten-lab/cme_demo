@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Boolean, Float, UniqueConstraint, Index
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Float, UniqueConstraint, Index
 from src.db.models import Base
 
 def utcnow() -> datetime:
@@ -20,9 +20,9 @@ class ETSMonitoringPlan(Base):
     version = Column(Integer, nullable=False, default=1)
     valid_from = Column(DateTime(timezone=True), nullable=True)
     valid_to = Column(DateTime(timezone=True), nullable=True)
-    status = Column(String(40), default="active")  # active/superseded/locked
+    status = Column(String(40), default="active")
 
-    plan_json = Column(Text, default="{}")  # source streams, tiers, methods, QAQC
+    plan_json = Column(Text, default="{}")
     plan_hash = Column(String(80), default="")
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
@@ -35,7 +35,7 @@ class ETSCalibrationCertificate(Base):
     certificate_ref = Column(String(200), default="")
     valid_from = Column(DateTime(timezone=True), nullable=True)
     valid_to = Column(DateTime(timezone=True), nullable=True)
-    evidence_doc_id = Column(Integer, ForeignKey("evidence_documents.id"), nullable=True)
+    evidence_doc_id = Column(Integer, ForeignKey("evidencedocuments.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
 class ETSUncertaintyAssessment(Base):
@@ -66,7 +66,7 @@ class ETSQAQCEvidence(Base):
     year = Column(Integer, nullable=False)
     control_name = Column(String(200), nullable=False)
     description = Column(Text, default="")
-    evidence_doc_id = Column(Integer, ForeignKey("evidence_documents.id"), nullable=True)
+    evidence_doc_id = Column(Integer, ForeignKey("evidencedocuments.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
 class ETSFallbackEvent(Base):
