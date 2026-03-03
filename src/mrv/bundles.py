@@ -13,6 +13,20 @@ def _as_str(x: Any, default: str = "") -> str:
         return default
 
 
+def _as_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _as_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
 def _sorted_list_of_dicts(rows: List[Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
     def kf(d: Dict[str, Any]) -> Tuple:
         return tuple(_as_str(d.get(k, "")) for k in keys)
