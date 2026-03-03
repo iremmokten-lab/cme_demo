@@ -22,28 +22,14 @@ def write_bytes(path: Path, data: bytes):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
 
-    # Many callers store the returned value as a URI.
-    # Returning the string form keeps compatibility across local + Streamlit Cloud.
-    return str(path)
+
+def ensure_directory(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def storage_path_for_project(project_id: int, relative_path: str) -> Path:
-    """Return a stable, per-project storage location.
-
-    This is used by CBAM portal simulators, ERP ingestion, and report exports.
-    """
-    pid = int(project_id)
-    rel = str(relative_path or "").lstrip("/\\")
-    base = Path("./storage/projects") / str(pid)
-    return base / rel
-
-
-def read_bytes(path_or_uri: str | Path) -> bytes:
-    """Best-effort read for local file storage."""
-    try:
-        p = Path(path_or_uri)
-        if p.exists():
-            return p.read_bytes()
-    except Exception:
-        pass
-    return b""
+def storage_path_for_project(project_id: int) -> str:
+    """Proje bazlı storage klasörü döndürür ve yoksa oluşturur."""
+    p = Path("./storage") / f"project_{int(project_id)}"
+    ensure_directory(p)
+    return str(p)
