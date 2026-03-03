@@ -142,7 +142,7 @@ class DatasetUpload(Base):
 
 
 class EvidenceDocument(Base):
-    __tablename__ = "evidencedocuments"
+    __tablename__ = "evidence_documents"
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
