@@ -38,9 +38,7 @@ def get_tr_ets_mode() -> bool:
     return _get_bool(v, False)
 
 
-# Backwards-compatible constant used across pages.
-# Some pages import TR_ETS_MODE directly; keep it available.
-TR_ETS_MODE: bool = get_tr_ets_mode()
+TR_ETS_MODE = get_tr_ets_mode()
 
 
 def get_evidence_pack_hmac_key() -> str:
