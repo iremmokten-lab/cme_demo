@@ -478,3 +478,23 @@ class AuditEvent(Base):
 
     entity_type = Column(String(120), default="")
     entity_id = Column(String(120), default="")
+
+# ----------------------------
+# Compatibility aliases
+# ----------------------------
+# Some modules historically referenced these table names (no underscore / underscore variants).
+# We keep these lightweight tables so SQLAlchemy can create FK targets and the app can start.
+
+class EvidenceDocumentLegacy(Base):
+    """Legacy alias for evidence documents table name without underscore."""
+    __tablename__ = "evidencedocuments"
+
+    id = Column(Integer, primary_key=True)
+
+
+class CalculationSnapshotLegacy(Base):
+    """Legacy alias for calculation snapshots table name with underscore."""
+    __tablename__ = "calculation_snapshots"
+
+    id = Column(Integer, primary_key=True)
+
