@@ -54,18 +54,18 @@ def run_migrations(engine: Engine):
         _try(conn, "ALTER TABLE datasetuploads ADD COLUMN data_quality_report_json TEXT")
 
         # ----------------------------
-        # evidencedocuments
+        # evidence_documents
         # ----------------------------
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN original_filename VARCHAR(255)")
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN category VARCHAR(80)")
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN notes TEXT")
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN sha256 VARCHAR(64)")
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN content_hash VARCHAR(64)")
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN storage_uri VARCHAR(500)")
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN content_bytes BLOB")
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN content_b64 TEXT")
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN mime_type VARCHAR(120)")
-        _try(conn, "ALTER TABLE evidencedocuments ADD COLUMN meta_json TEXT")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN original_filename VARCHAR(255)")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN category VARCHAR(80)")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN notes TEXT")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN sha256 VARCHAR(64)")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN content_hash VARCHAR(64)")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN storage_uri VARCHAR(500)")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN content_bytes BLOB")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN content_b64 TEXT")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN mime_type VARCHAR(120)")
+        _try(conn, "ALTER TABLE evidence_documents ADD COLUMN meta_json TEXT")
 
         # ----------------------------
         # emissionfactors governance
