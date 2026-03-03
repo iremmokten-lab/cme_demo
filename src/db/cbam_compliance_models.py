@@ -36,8 +36,9 @@ class CBAMProducerAttestation(Base):
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
     producer_id = Column(Integer, ForeignKey("cbam_producers.id"), nullable=False)
 
-    attestation_ref = Column(String(200), default="")
-    statement = Column(Text, default="")
+    # attestation payload summary (hashable)
+    attestation_ref = Column(String(200), default="")  # document ref id / external ref
+    statement = Column(Text, default="")  # brief statement
     signed_by = Column(String(200), default="")
     signed_at = Column(DateTime(timezone=True), default=utcnow)
     document_evidence_id = Column(Integer, ForeignKey("evidencedocuments.id"), nullable=True)
@@ -54,11 +55,11 @@ class CBAMMethodologyEvidence(Base):
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
     snapshot_id = Column(Integer, ForeignKey("calculationsnapshots.id"), nullable=False)
 
-    boundary = Column(Text, default="")
-    allocation = Column(Text, default="")
-    scrap_method = Column(Text, default="")
-    electricity_method = Column(Text, default="")
-    electricity_factor_source = Column(String(250), default="")
+    boundary = Column(Text, default="")        # system boundary
+    allocation = Column(Text, default="")      # allocation rationale
+    scrap_method = Column(Text, default="")    # scrap treatment
+    electricity_method = Column(Text, default="")  # indirect electricity methodology
+    electricity_factor_source = Column(String(250), default="")  # source of electricity factor
     notes = Column(Text, default="")
 
     created_at = Column(DateTime(timezone=True), default=utcnow)
@@ -74,7 +75,7 @@ class CBAMCarbonPricePaid(Base):
     snapshot_id = Column(Integer, ForeignKey("calculationsnapshots.id"), nullable=False)
 
     country = Column(String(80), default="")
-    instrument = Column(String(120), default="")
+    instrument = Column(String(120), default="")  # tax / ETS / fee
     amount_per_tco2 = Column(Float, default=0.0)
     currency = Column(String(10), default="EUR")
     evidence_doc_id = Column(Integer, ForeignKey("evidencedocuments.id"), nullable=True)
@@ -92,9 +93,9 @@ class CBAMQuarterlySubmission(Base):
     id = Column(Integer, primary_key=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
     year = Column(Integer, nullable=False)
-    quarter = Column(Integer, nullable=False)
+    quarter = Column(Integer, nullable=False)  # 1..4
 
-    status = Column(String(40), default="draft")
+    status = Column(String(40), default="draft")  # draft/submitted/corrected/resubmitted/locked
     snapshot_id = Column(Integer, ForeignKey("calculationsnapshots.id"), nullable=True)
 
     portal_package_uri = Column(String(500), default="")
@@ -112,7 +113,7 @@ class RegulationSpecVersion(Base):
         Index("ix_reg_spec_name", "spec_name"),
     )
     id = Column(Integer, primary_key=True)
-    spec_name = Column(String(120), nullable=False)
+    spec_name = Column(String(120), nullable=False)  # CBAM_XSD, ETS_MRR, CBAM_RULES
     spec_version = Column(String(120), nullable=False)
     spec_hash = Column(String(80), default="")
     source = Column(String(400), default="")
