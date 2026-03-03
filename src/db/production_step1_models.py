@@ -80,5 +80,5 @@ class CorrectiveAction(Base):
     action = Column(Text, default="")
     due_date = Column(String(40), default="")
     status = Column(String(30), default="open", index=True)  # open/done
-    evidence_doc_id = Column(Integer, ForeignKey("evidencedocuments.id"), nullable=True, index=True)
+    evidence_doc_id = Column(Integer, ForeignKey("evidence_documents.id"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
