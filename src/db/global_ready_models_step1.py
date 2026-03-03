@@ -37,7 +37,7 @@ class ProducerAttestation(Base):
     signed_by = Column(String(200), default="")  # name/email
     signed_at = Column(DateTime(timezone=True), nullable=True)
 
-    evidence_doc_id = Column(Integer, ForeignKey("evidencedocuments.id"), nullable=True, index=True)
+    evidence_doc_id = Column(Integer, ForeignKey("evidence_documents.id"), nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
