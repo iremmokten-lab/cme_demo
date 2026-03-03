@@ -27,8 +27,12 @@ def db():
     return SessionLocal()
 
 
-def _import_all_db_modules():
-    """src.db paketindeki tüm modülleri yükleyerek tüm Table tanımlarını metadata'ya dahil eder."""
+def _import_all_db_modules() -> None:
+    """src.db paketindeki tüm modülleri yükleyerek tüm Table tanımlarını metadata'ya dahil eder.
+
+    Streamlit Cloud'da import sırası farklı olabildiği için create_all öncesi
+    metadata'nın eksiksiz kurulmasını sağlar.
+    """
     try:
         import src.db as db_pkg  # noqa: F401
     except Exception:
@@ -49,7 +53,7 @@ def _import_all_db_modules():
             continue
 
 
-def _ensure_stub_table(md: MetaData, table_name: str):
+def _ensure_stub_table(md: MetaData, table_name: str | None) -> None:
     """Eksik FK hedef tablolar için minimum stub tablo yaratır."""
     if not table_name:
         return
@@ -65,25 +69,29 @@ def _ensure_stub_table(md: MetaData, table_name: str):
 
 def _missing_table_from_error(e: Exception) -> str | None:
     msg = str(e)
-    # ör: could not find table 'evidencedocuments'
     m = re.search(r"could not find table ['\"]([^'\"]+)['\"]", msg, re.IGNORECASE)
     if m:
         return m.group(1)
     return None
 
 
-def init_db():
+def init_db() -> None:
     """Uygulama açılış DB init.
 
-    Streamlit Cloud'da import sırası nedeniyle metadata eksik kalıp
-    NoReferencedTableError üretebiliyor. Bu fonksiyon:
-      1) src.db.models ve diğer db modüllerini yükler
+    Bu repo'da bazı tablolarda FK hedefleri (örn: evidencedocuments) farklı dosyalarda
+    tanımlı olabildiği için import sırası metadata'yı eksik bırakıp
+    NoReferencedTableError üretebiliyor.
+
+    Bu fonksiyon:
+      1) src.db.models ve src.db altındaki diğer modülleri yükler
       2) create_all sırasında eksik FK hedef tablolarını otomatik stub olarak ekler
       3) create_all'ı başarıyla tamamlar
     """
+    # Base + çekirdek modeller
     import src.db.models as _models  # noqa: F401
     from src.db.models import Base
 
+    # Diğer db modülleri (metadata tam olsun)
     _import_all_db_modules()
 
     md: MetaData = Base.metadata
@@ -92,7 +100,7 @@ def init_db():
     _ensure_stub_table(md, "evidencedocuments")
     _ensure_stub_table(md, "evidence_documents")
 
-    # create_all: eksik referans varsa otomatik toparla (max döngü)
+    # create_all: eksik referans varsa otomatik toparla
     for _ in range(25):
         try:
             md.create_all(bind=engine)
@@ -103,5 +111,4 @@ def init_db():
                 raise
             _ensure_stub_table(md, missing)
 
-    # Çok sayıda eksik hedef tablo varsa burada hala patlıyor olabilir
     md.create_all(bind=engine)
