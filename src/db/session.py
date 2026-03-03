@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import importlib
 import os
 import pkgutil
-import importlib
+import re
 from pathlib import Path
 
 from sqlalchemy import Column, Integer, MetaData, Table, create_engine
@@ -27,89 +28,80 @@ def db():
 
 
 def _import_all_db_modules():
-    """
-    src.db paketindeki tüm modülleri yükleyerek (models, registry, vb.)
-    tüm SQLAlchemy Table tanımlarının Base.metadata içine girmesini sağlar.
-
-    Streamlit Cloud'da import sırası bazen farklı olabildiği için bu yaklaşım,
-    create_all öncesi metadata'nın eksiksiz kurulmasını sağlar.
-    """
+    """src.db paketindeki tüm modülleri yükleyerek tüm Table tanımlarını metadata'ya dahil eder."""
     try:
         import src.db as db_pkg  # noqa: F401
     except Exception:
         return
 
-    try:
-        pkg_path = getattr(db_pkg, "__path__", None)
-        if not pkg_path:
-            return
-        for m in pkgutil.iter_modules(pkg_path, prefix="src.db."):
-            name = m.name
-            # session modülünü tekrar import etmeyelim (döngü riski)
-            if name.endswith(".session"):
-                continue
-            try:
-                importlib.import_module(name)
-            except Exception:
-                # Bazı opsiyonel modüller hata verebilir; kritik olanlar zaten models üzerinden yüklenir.
-                continue
-    except Exception:
+    pkg_path = getattr(db_pkg, "__path__", None)
+    if not pkg_path:
         return
 
+    for m in pkgutil.iter_modules(pkg_path, prefix="src.db."):
+        name = m.name
+        if name.endswith(".session"):
+            continue
+        try:
+            importlib.import_module(name)
+        except Exception:
+            # Opsiyonel modüller hata verse de açılışı bloklamasın
+            continue
 
-def _ensure_compat_tables(md: MetaData):
-    """
-    Bazı tablolarda FK olarak referenced edilen ama metadata'da bulunmayan
-    hedef tabloları (özellikle evidencedocuments) için minimum compat tabloları ekler.
-    """
-    if "evidencedocuments" not in md.tables:
-        Table(
-            "evidencedocuments",
-            md,
-            Column("id", Integer, primary_key=True),
-            extend_existing=True,
-        )
-    # Bazı kod dallarında farklı isimle referans edilebiliyor
-    if "evidence_documents" not in md.tables:
-        Table(
-            "evidence_documents",
-            md,
-            Column("id", Integer, primary_key=True),
-            extend_existing=True,
-        )
+
+def _ensure_stub_table(md: MetaData, table_name: str):
+    """Eksik FK hedef tablolar için minimum stub tablo yaratır."""
+    if not table_name:
+        return
+    if table_name in md.tables:
+        return
+    Table(
+        table_name,
+        md,
+        Column("id", Integer, primary_key=True),
+        extend_existing=True,
+    )
+
+
+def _missing_table_from_error(e: Exception) -> str | None:
+    msg = str(e)
+    # ör: could not find table 'evidencedocuments'
+    m = re.search(r"could not find table ['\"]([^'\"]+)['\"]", msg, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
 
 
 def init_db():
+    """Uygulama açılış DB init.
+
+    Streamlit Cloud'da import sırası nedeniyle metadata eksik kalıp
+    NoReferencedTableError üretebiliyor. Bu fonksiyon:
+      1) src.db.models ve diğer db modüllerini yükler
+      2) create_all sırasında eksik FK hedef tablolarını otomatik stub olarak ekler
+      3) create_all'ı başarıyla tamamlar
     """
-    Uygulama açılışında SQLite şemasını güvenli şekilde ayağa kaldırır.
-
-    Bu fonksiyon şu problemi çözer:
-    - create_all sırasında FK hedef tablosu metadata'da yoksa NoReferencedTableError oluşur.
-      (Örn: cbam_producer_attestations.document_evidence_id -> evidencedocuments.id)
-      Bu hata uygulamanın hiç açılmamasına sebep olur. :contentReference[oaicite:1]{index=1}
-
-    Çözüm:
-    - src.db altındaki modülleri yükle
-    - compat hedef tabloları garanti et
-    - create_all'ı NoReferencedTableError korumasıyla çalıştır
-    """
-
-    # 1) Modelleri kesin yükle (Base + tablolar)
     import src.db.models as _models  # noqa: F401
-    from src.db.models import Base  # noqa: F401
+    from src.db.models import Base
 
-    # 2) Diğer db modüllerini de yükle (metadata eksik kalmasın)
     _import_all_db_modules()
 
     md: MetaData = Base.metadata
 
-    # 3) Compat hedef tabloları garanti altına al
-    _ensure_compat_tables(md)
+    # Sık görülen compat isimleri
+    _ensure_stub_table(md, "evidencedocuments")
+    _ensure_stub_table(md, "evidence_documents")
 
-    # 4) create_all - iki aşamalı koruma
-    try:
-        md.create_all(bind=engine)
-    except NoReferencedTableError:
-        # metadata'da eksik hedef tablo varsa tamamla ve tekrar dene
-        _ensure_compat_tables(md)
-        md.create_all(bind=engine)
+    # create_all: eksik referans varsa otomatik toparla (max döngü)
+    for _ in range(25):
+        try:
+            md.create_all(bind=engine)
+            return
+        except NoReferencedTableError as e:
+            missing = _missing_table_from_error(e)
+            if not missing:
+                raise
+            _ensure_stub_table(md, missing)
+
+    # Çok sayıda eksik hedef tablo varsa burada hala patlıyor olabilir
+    md.create_all(bind=engine)
