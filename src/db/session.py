@@ -37,7 +37,8 @@ def init_db():
     except Exception:
         pass
 
-    # Compliance tabloları
+    
+    # Compliance tabloları (FK referansları için önce import edilmeli)
     try:
         import src.db.cbam_compliance_models  # noqa: F401
     except Exception:
@@ -48,7 +49,7 @@ def init_db():
     except Exception:
         pass
 
-    Base.metadata.create_all(bind=engine)
+Base.metadata.create_all(bind=engine)
 
     # Faz 2: migration-like stabilization (SQLite)
     try:
