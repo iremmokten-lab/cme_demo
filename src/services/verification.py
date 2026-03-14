@@ -373,3 +373,9 @@ def list_cases_for_snapshot_payload(user: User, *, project_id: int, period_year:
         payload["cases"].append(cj)
 
     return payload
+
+
+
+def list_cases_for_project(project_id: int, limit: int = 200):
+    with db() as s:
+        return s.execute(select(VerificationCase).where(VerificationCase.project_id == int(project_id)).order_by(VerificationCase.created_at.desc()).limit(int(limit))).scalars().all()
