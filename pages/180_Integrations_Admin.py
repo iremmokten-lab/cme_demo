@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.db.session import init_db
 import json
 import streamlit as st
 from src.services.authz import current_user, login_view, logout_button
@@ -6,6 +7,7 @@ from src.services.projects import list_company_projects_for_user
 from src.services.integrations_registry import create_connection, list_connections
 
 st.set_page_config(page_title="Integrations Admin", layout="wide")
+init_db()
 u=current_user()
 if not u:
     login_view(); st.stop()
