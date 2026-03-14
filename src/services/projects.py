@@ -219,3 +219,12 @@ def list_snapshots_for_user(user: Any, *, project_id: int | None = None, limit: 
 
 def list_shared_snapshots_for_user(user: Any, limit: int = 200) -> List[CalculationSnapshot]:
     return list_snapshots_for_user(user, project_id=None, limit=int(limit))
+
+
+
+def list_snapshots_for_project(project_id: int, *, shared_only: bool = False, limit: int = 200):
+    with db() as s:
+        q = select(CalculationSnapshot).where(CalculationSnapshot.project_id == int(project_id))
+        if shared_only:
+            q = q.where(CalculationSnapshot.shared_with_client == True)  # noqa: E712
+        return s.execute(q.order_by(desc(CalculationSnapshot.created_at)).limit(int(limit))).scalars().all()
