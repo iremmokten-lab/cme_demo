@@ -5,13 +5,14 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 from sqlalchemy import select
+from sqlalchemy.orm import joinedload
 
 from src.db.models import Methodology, MonitoringPlan, Project
 from src.db.session import db
 from src.engine.allocation import allocate_product_emissions, allocation_map_from_df
 from src.engine.cbam import cbam_compute
-from src.engine.emissions import energy
-from src import config as app_config_emissions, resolve_factor_set_for_energy_df
+from src.engine.emissions import energy_emissions, resolve_factor_set_for_energy_df
+from src import config as app_config
 from src.engine.ets import ets_net_and_cost, ets_verification_payload
 from src.mrv.bundles import FactorRef, InputBundle, MonitoringPlanRef, PriceRef, QAFlag, ResultBundle
 from src.mrv.lineage import sha256_json
@@ -181,7 +182,11 @@ def run_orchestrator(
     config = config or {}
 
     with db() as s:
-        project = s.get(Project, int(project_id))
+        project = s.execute(
+            select(Project)
+            .options(joinedload(Project.facility), joinedload(Project.company))
+            .where(Project.id == int(project_id))
+        ).scalars().first()
         if not project:
             raise ValueError("Proje bulunamadı.")
 
@@ -196,13 +201,12 @@ def run_orchestrator(
     market_override = (config or {}).get("market_grid_factor_override", None)
     market_override_f = float(market_override) if market_override is not None and str(market_override).strip() != "" else None
 
-    factor_meta_rows, _factor_lookup = resolve_factor_set_for_energy_df(
-        energy_df=energy_df,
+    factor_bundle = resolve_factor_set_for_energy_df(
+        project_id=int(project_id),
+        df_energy=energy_df,
         region=region or "TR",
-        electricity_method=electricity_method,
-        market_grid_factor_override=market_override_f,
     )
-    factor_refs = _factor_refs_from_meta(factor_meta_rows)
+    factor_refs = _factor_refs_from_meta(list((factor_bundle or {}).get("refs") or []))
 
     # Monitoring plan ref
     mp_ref = _latest_monitoring_plan_ref(facility.get("id"))
@@ -268,8 +272,8 @@ def run_orchestrator(
     alloc_method = str(alloc_cfg.get("method") or (config or {}).get("allocation_method") or "quantity_based")
     allocation_df, allocation_meta = allocate_product_emissions(
         production_df,
-        direct_tco2_total=float(energy_out.get("direct_tco2", 0.0) or 0.0),
-        indirect_tco2_total=float(energy_out.get("indirect_tco2", 0.0) or 0.0),
+        scope1_tco2=float(energy_out.get("direct_tco2", 0.0) or 0.0),
+        scope2_tco2=float(energy_out.get("indirect_tco2", 0.0) or 0.0),
         method=alloc_method,
     )
     allocation_by_sku = allocation_map_from_df(allocation_df)
