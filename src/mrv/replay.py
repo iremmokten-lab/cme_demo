@@ -70,8 +70,11 @@ def replay(snapshot_id: int) -> Dict[str, Any]:
     factor_set_ref = (legacy2.get("input_bundle") or {}).get("factor_set_ref") or []
     monitoring_plan_ref = (legacy2.get("input_bundle") or {}).get("monitoring_plan_ref") or None
 
+    # Persisted snapshot input hash was originally computed with the stored engine version.
+    # Replay must use the same canonical engine version instead of relying on an optional
+    # legacy_results top-level field, which may be absent in older/newer payloads.
     candidate_input_hash = compute_input_hash(
-        engine_version=str(legacy2.get("engine_version") or ""),
+        engine_version=str(getattr(snap, "engine_version", "") or ""),
         config=config or {},
         input_hashes=activity_snapshot_ref or {},
         scenario=scenario or {},
