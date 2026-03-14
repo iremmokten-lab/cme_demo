@@ -156,6 +156,135 @@ def _bootstrap_demo_users():
         s.commit()
 
 
+
+
+
+def _render_project_setup(user):
+    company_id = prj.require_company_id(user)
+    companies = prj.list_companies_for_user(user)
+    company = companies[0] if companies else None
+
+    st.markdown("### Tesis / Proje Oluştur")
+    if company is not None:
+        st.caption(f"Aktif şirket: {getattr(company, 'name', 'Demo Company')} (#{getattr(company, 'id', company_id)})")
+
+    facilities = prj.list_facilities(company_id)
+    facility_options = {"Tesis seçilmesin": 0}
+    for fac in facilities:
+        facility_options[f"{fac.name} (#{fac.id})"] = int(fac.id)
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("#### Yeni Tesis")
+        with st.form("create_facility_form", clear_on_submit=True):
+            facility_name = st.text_input("Tesis adı", placeholder="Örn. Dilovası Tesisi")
+            facility_country = st.text_input("Ülke kodu", value="TR", max_chars=2)
+            facility_sector = st.text_input("Sektör", placeholder="Örn. Çimento")
+            create_facility_btn = st.form_submit_button("Tesis oluştur", type="primary", use_container_width=True)
+
+        if create_facility_btn:
+            try:
+                fac = prj.create_facility(
+                    company_id=company_id,
+                    name=facility_name,
+                    country_code=facility_country or "TR",
+                    sector=facility_sector or "",
+                )
+                append_audit(
+                    "facility_created",
+                    {"company_id": int(company_id), "facility_id": int(fac.id), "name": fac.name},
+                    user_id=getattr(user, "id", None),
+                    company_id=int(company_id),
+                    entity_type="facility",
+                    entity_id=int(fac.id),
+                )
+                st.success(f"Tesis oluşturuldu: {fac.name} (#{fac.id})")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Tesis oluşturulamadı: {e}")
+
+    with c2:
+        st.markdown("#### Yeni Proje")
+        with st.form("create_project_form", clear_on_submit=True):
+            project_name = st.text_input("Proje adı", placeholder="Örn. 2026 Q1 MRV")
+            project_description = st.text_area("Proje açıklaması", value="", placeholder="Opsiyonel açıklama")
+            selected_facility_label = st.selectbox("Bağlı tesis", list(facility_options.keys()))
+            create_project_btn = st.form_submit_button("Proje oluştur", type="primary", use_container_width=True)
+
+        if create_project_btn:
+            try:
+                selected_facility_id = int(facility_options.get(selected_facility_label, 0))
+                project = prj.create_project(
+                    company_id=company_id,
+                    facility_id=selected_facility_id or None,
+                    name=project_name,
+                    description=project_description or "",
+                )
+                append_audit(
+                    "project_created",
+                    {
+                        "company_id": int(company_id),
+                        "project_id": int(project.id),
+                        "facility_id": int(selected_facility_id) if selected_facility_id else None,
+                        "name": project.name,
+                    },
+                    user_id=getattr(user, "id", None),
+                    company_id=int(company_id),
+                    entity_type="project",
+                    entity_id=int(project.id),
+                )
+                st.success(f"Proje oluşturuldu: {project.name} (#{project.id})")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Proje oluşturulamadı: {e}")
+
+    st.markdown("### Mevcut Kayıtlar")
+    facilities = prj.list_facilities(company_id)
+    projects = prj.list_projects(company_id)
+
+    left, right = st.columns(2)
+    with left:
+        if facilities:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "id": f.id,
+                            "tesis": f.name,
+                            "ülke": getattr(f, "country_code", "") or getattr(f, "country", ""),
+                            "sektör": getattr(f, "sector", "") or "",
+                        }
+                        for f in facilities
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Henüz tesis yok.")
+
+    with right:
+        if projects:
+            fac_name = {int(f.id): f.name for f in facilities}
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "id": p.id,
+                            "proje": p.name,
+                            "tesis": fac_name.get(int(p.facility_id), "-") if getattr(p, "facility_id", None) else "-",
+                            "açıklama": (getattr(p, "description", "") or "")[:120],
+                        }
+                        for p in projects
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Henüz proje yok.")
+
 def consultant_app(user):
     _bootstrap_demo_users()
 
@@ -165,7 +294,8 @@ def consultant_app(user):
     # Project selection
     projs = prj.list_company_projects_for_user(user)
     if not projs:
-        st.info("Henüz proje yok. Önce tesis/proje oluşturun.")
+        st.info("Henüz proje yok. Aşağıdan tesis ve proje oluşturabilirsiniz.")
+        _render_project_setup(user)
         return
 
     pmap = {f"{p.name} (#{p.id})": int(p.id) for p in projs}
@@ -503,6 +633,8 @@ def consultant_app(user):
     # Setup
     with tabs[6]:
         st.subheader("Kurulum / Demo Bilgisi")
+        _render_project_setup(user)
+        st.divider()
         st.markdown(
             """
 - Admin: **admin@demo.com / ChangeMe123!**  
