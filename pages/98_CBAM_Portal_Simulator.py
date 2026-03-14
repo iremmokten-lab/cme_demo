@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.db.session import init_db
 import json
 import streamlit as st
 
@@ -12,6 +13,7 @@ from src.services.cbam_portal_simulator import simulate_portal_acceptance
 from src.services.supplier_portal import list_producers, create_producer, submit_attestation, list_attestations
 
 st.set_page_config(page_title="CBAM Portal Simulator", layout="wide")
+init_db()
 user = current_user()
 if not user:
     login_view(); st.stop()
