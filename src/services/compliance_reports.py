@@ -129,3 +129,7 @@ def get_compliance_checks_for_snapshot(snapshot_id: int) -> Optional[Dict[str, A
             return json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             return None
+
+
+def build_compliance_report_json(project_id: int) -> Dict[str, Any]:
+    return get_latest_compliance_checks(project_id) or {"project_id": int(project_id), "status": "empty"}
