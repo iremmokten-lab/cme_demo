@@ -1,9 +1,11 @@
 from __future__ import annotations
+from src.db.session import init_db
 import streamlit as st
 from src.services.authz import current_user, login_view, logout_button
 from src.services.regulation_spec_registry import register_spec, list_specs
 
 st.set_page_config(page_title="Regulation Specs", layout="wide")
+init_db()
 u=current_user()
 if not u:
     login_view(); st.stop()
