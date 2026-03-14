@@ -27,12 +27,22 @@ def _months_present(df: pd.DataFrame) -> List[str]:
     return sorted({str(x) for x in df["month"].dropna().tolist()})
 
 
-def completeness_checks(
-    *,
-    energy_df: pd.DataFrame | None,
-    production_df: pd.DataFrame | None,
-) -> Dict[str, Any]:
-    """Completeness kontrolleri: missing months/products/fuels."""
+def completeness_checks(*args, energy_df: pd.DataFrame | None = None, production_df: pd.DataFrame | None = None) -> Dict[str, Any]:
+    """Completeness kontrolleri: missing months/products/fuels.
+
+    Legacy compatibility: callers may still pass ``(dataset_type, df)``. In that
+    case the single dataframe is routed to the correct slot.
+    """
+    if args:
+        if len(args) == 2 and energy_df is None and production_df is None:
+            dataset_type, df = args
+            dtype = _norm(dataset_type)
+            if dtype == "energy":
+                energy_df = df
+            elif dtype == "production":
+                production_df = df
+        else:
+            raise TypeError("completeness_checks expects either keyword dataframes or (dataset_type, df)")
     checks: List[Dict[str, Any]] = []
 
     energy_months = _months_present(energy_df) if isinstance(energy_df, pd.DataFrame) else []
@@ -101,12 +111,18 @@ def completeness_checks(
     return {"checks": checks}
 
 
-def anomaly_checks(
-    *,
-    energy_df: pd.DataFrame | None,
-    production_df: pd.DataFrame | None,
-) -> Dict[str, Any]:
+def anomaly_checks(*args, energy_df: pd.DataFrame | None = None, production_df: pd.DataFrame | None = None) -> Dict[str, Any]:
     """Anomali kontrolleri: intensity spikes, numeric outliers (basit)."""
+    if args:
+        if len(args) == 2 and energy_df is None and production_df is None:
+            dataset_type, df = args
+            dtype = _norm(dataset_type)
+            if dtype == "energy":
+                energy_df = df
+            elif dtype == "production":
+                production_df = df
+        else:
+            raise TypeError("anomaly_checks expects either keyword dataframes or (dataset_type, df)")
     flags: List[Dict[str, Any]] = []
 
     # Energy spike (quantity)
