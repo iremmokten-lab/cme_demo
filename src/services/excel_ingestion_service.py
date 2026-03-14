@@ -148,7 +148,6 @@ def ingest_excel_to_datasetupload(
             data_quality_score=int(dq_score),
             data_quality_report_json=json.dumps(dq_report, ensure_ascii=False),
             meta_json=json.dumps(meta, ensure_ascii=False),
-            uploaded_by_user_id=uploaded_by_user_id,
         )
         s.add(du)
         s.commit()
