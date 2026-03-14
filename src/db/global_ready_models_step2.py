@@ -8,6 +8,7 @@ from src.db.models import Base, utcnow
 
 class AccessAuditLog(Base):
     __tablename__ = "access_audit_logs"
+    __table_args__ = {"extend_existing": True}
 
     id = Column(Integer, primary_key=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=True, index=True)
