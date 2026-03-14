@@ -26,7 +26,7 @@ def utcnow() -> datetime:
 
 
 class ERPConnection(Base):
-    __tablename__ = "erp_connections"
+    __tablename__ = "erp_auto_connections"
     __table_args__ = (
         Index("ix_erp_conn_project_status", "project_id", "status"),
         UniqueConstraint("project_id", "name", name="uq_erp_conn_project_name"),
@@ -48,7 +48,7 @@ class ERPConnection(Base):
 
 
 class ERPMapping(Base):
-    __tablename__ = "erp_mappings"
+    __tablename__ = "erp_auto_mappings"
     __table_args__ = (
         Index("ix_erp_map_project_dataset", "project_id", "dataset_type"),
         UniqueConstraint("project_id", "dataset_type", "version", name="uq_erp_map_project_dataset_ver"),
@@ -69,7 +69,7 @@ class ERPMapping(Base):
 
 
 class ERPIngestionRun(Base):
-    __tablename__ = "erp_ingestion_runs"
+    __tablename__ = "erp_auto_ingestion_runs"
     __table_args__ = (
         Index("ix_erp_run_project_time", "project_id", "started_at"),
         Index("ix_erp_run_conn_time", "connection_id", "started_at"),
@@ -78,7 +78,7 @@ class ERPIngestionRun(Base):
     id = Column(Integer, primary_key=True)
 
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
-    connection_id = Column(Integer, ForeignKey("erp_connections.id"), nullable=False, index=True)
+    connection_id = Column(Integer, ForeignKey("erp_auto_connections.id"), nullable=False, index=True)
 
     dataset_type = Column(String(50), nullable=False, index=True)
     mapping_version = Column(Integer, default=1)
@@ -97,11 +97,11 @@ class ERPIngestionRun(Base):
 
 
 class ERPDeadLetter(Base):
-    __tablename__ = "erp_dead_letter"
+    __tablename__ = "erp_auto_dead_letter"
     __table_args__ = (Index("ix_erp_dlq_run", "run_id"),)
 
     id = Column(Integer, primary_key=True)
-    run_id = Column(Integer, ForeignKey("erp_ingestion_runs.id"), nullable=False, index=True)
+    run_id = Column(Integer, ForeignKey("erp_auto_ingestion_runs.id"), nullable=False, index=True)
 
     dataset_type = Column(String(50), default="", index=True)
     reason = Column(String(120), default="")
