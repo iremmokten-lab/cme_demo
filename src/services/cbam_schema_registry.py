@@ -61,7 +61,11 @@ def fetch_and_cache_official_cbam_xsd_zip(
     global DEFAULT_CACHE_DIR
     if cache_dir:
         DEFAULT_CACHE_DIR = str(cache_dir)
-    return fetch_official_cbam_xsd_zip(url=url, version_label=version_label)
+    try:
+        return fetch_official_cbam_xsd_zip(url=url, version_label=version_label)
+    except Exception:
+        asset = ensure_cbam_xsd_assets(base_dir=cache_dir or "./spec/cbam_xsd", version=version_label, url=url)
+        return SchemaRef(version_label=str(asset.version), zip_path="", xsd_root_dir=str(asset.xsd_dir), sha256=str(asset.zip_sha256))
 
 
 def get_latest_cbam_xsd(
