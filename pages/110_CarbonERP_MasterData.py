@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.db.session import init_db
 import streamlit as st
 from src.services.authz import current_user, login_view, logout_button
 from src.services.projects import list_company_projects_for_user
@@ -10,6 +11,7 @@ from src.erp.masterdata.service import (
 )
 
 st.set_page_config(page_title="Carbon ERP • Master Data", layout="wide")
+init_db()
 user=current_user()
 if not user:
     login_view(); st.stop()
