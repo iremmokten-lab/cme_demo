@@ -409,3 +409,9 @@ def energy_emissions(
         "region": region,
         "factor_set_id": factor_set_id,
     }
+
+
+
+# Backwards-compatible alias used by orchestrator/pages
+def energy(*args, **kwargs):
+    return energy_emissions(*args, **kwargs)
