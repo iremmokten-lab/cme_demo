@@ -139,12 +139,12 @@ def data_quality_assess(dataset_type: str, df: pd.DataFrame) -> tuple[int, dict]
         add_check("outliers_iqr", "pass", {"outlier_count": 0}, penalty=0)
 
     # Completeness + anomalies
-    for chk in completeness_checks(dtype, df):
+    for chk in (completeness_checks(dtype, df).get("checks") or []):
         stt = str(chk.get("status") or "pass")
         pen = 25 if stt == "fail" else (10 if stt == "warn" else 0)
         add_check(str(chk.get("id") or "completeness"), stt, chk.get("details") or {}, penalty=pen)
 
-    for chk in anomaly_checks(dtype, df):
+    for chk in (anomaly_checks(dtype, df).get("qa_flags") or []):
         stt = str(chk.get("status") or "pass")
         pen = 15 if stt == "fail" else (5 if stt == "warn" else 0)
         add_check(str(chk.get("id") or "anomaly"), stt, chk.get("details") or {}, penalty=pen)
