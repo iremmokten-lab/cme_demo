@@ -40,3 +40,7 @@ def generate_evidence_pack(snapshot_id, files, out_dir):
         "manifest": manifest_path,
         "signature": sig_path
     }
+
+
+def build_evidence_pack(project_id: int):
+    return {"project_id": int(project_id), "status": "not_implemented"}
