@@ -112,3 +112,52 @@ def build_cbam_reporting_structure(
         "totals": totals,
     }
     return report
+
+
+
+def build_cbam_xml_for_project_quarter(*, project_id: int, period_year: int, period_quarter: int) -> bytes:
+    """Build XML bytes for the latest snapshot of a project/quarter.
+
+    Fallback-friendly wrapper used by portal pages.
+    """
+    import json
+    from sqlalchemy import select
+    from src.db.models import CalculationSnapshot
+    from src.db.session import db
+    from src.services.cbam_xml import build_cbam_reporting, cbam_reporting_json_to_xml
+
+    with db() as s:
+        snap = s.execute(
+            select(CalculationSnapshot)
+            .where(CalculationSnapshot.project_id == int(project_id))
+            .order_by(CalculationSnapshot.created_at.desc())
+            .limit(1)
+        ).scalars().first()
+
+    if not snap:
+        report = build_cbam_reporting(
+            period={"year": int(period_year), "quarter": int(period_quarter)},
+            declarant={"company_name": "Demo Company"},
+            installation={"facility_name": f"Project {int(project_id)}"},
+            cbam_table=[],
+            methodology_note_tr="Otomatik demo XML üretimi",
+        )
+        return cbam_reporting_json_to_xml(report).encode("utf-8")
+
+    try:
+        res = json.loads(snap.results_json or "{}")
+    except Exception:
+        res = {}
+
+    report = (res or {}).get("cbam_reporting")
+    if isinstance(report, str) and report.strip().startswith("<?xml"):
+        return report.encode("utf-8")
+    if not isinstance(report, dict):
+        report = build_cbam_reporting(
+            period={"year": int(period_year), "quarter": int(period_quarter)},
+            declarant={"company_name": "Demo Company"},
+            installation={"facility_name": f"Project {int(project_id)}"},
+            cbam_table=(res or {}).get("cbam_table") or [],
+            methodology_note_tr="Snapshot'tan türetilmiş XML",
+        )
+    return cbam_reporting_json_to_xml(report).encode("utf-8")
