@@ -272,7 +272,7 @@ def create_snapshot(
     except Exception:
         pass
 
-        return snap
+    return snap
 
 
 def run_full(
