@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.db.session import init_db
 import streamlit as st
 from src.services.authz import current_user, login_view, logout_button
 from src.services.projects import list_company_projects_for_user
@@ -9,6 +10,7 @@ from src.services.verifier_workspace import (
 )
 
 st.set_page_config(page_title="Doğrulayıcı Workspace Pro", layout="wide")
+init_db()
 u=current_user()
 if not u:
     login_view(); st.stop()
