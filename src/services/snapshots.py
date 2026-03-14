@@ -65,3 +65,7 @@ def set_shared_with_client(snapshot_id: int, shared: bool) -> CalculationSnapsho
         s.commit()
         s.refresh(snap)
         return snap
+
+
+def list_snapshots_for_project(project_id: int):
+    return list_snapshots(project_id)
