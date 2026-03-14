@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.db.session import init_db
 import json
 import streamlit as st
 from src.services.authz import current_user, login_view, logout_button
@@ -9,6 +10,7 @@ from src.services.cbam_portal_workflow import mark_ready, submit_to_portal, refr
 from src.services.portal_readiness import validate_portal_zip_structure, compute_readiness_score
 
 st.set_page_config(page_title="CBAM Portal Submission", layout="wide")
+init_db()
 u=current_user()
 if not u:
     login_view(); st.stop()
