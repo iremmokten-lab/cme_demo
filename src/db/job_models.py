@@ -18,3 +18,6 @@ class Job(Base):
     error = Column(Text, default="")
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+Job.kind = property(lambda self: self.job_type)
