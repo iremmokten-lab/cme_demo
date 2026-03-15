@@ -57,10 +57,10 @@ with db() as s:
         st.subheader("Portal Paketi & XSD")
         if st.button("Resmi XSD indir & cache'le"):
             info = fetch_and_cache_official_cbam_xsd_zip()
-            st.success(f"Kaydedildi: {info.spec_version} ({info.spec_hash[:12]})")
+            st.success(f"Kaydedildi: {getattr(info, 'version_label', getattr(info, 'spec_version', ''))} ({getattr(info, 'sha256', getattr(info, 'spec_hash', ''))[:12]})")
 
         latest = get_latest_cbam_xsd()
-        st.write("Mevcut XSD:", latest.spec_version if latest else "Yok")
+        st.write("Mevcut XSD:", (getattr(latest, "version_label", getattr(latest, "spec_version", "")) if latest else "Yok"))
 
         snap_id = st.number_input("Snapshot ID", min_value=1, step=1, value=1)
         if st.button("Portal paketi üret (ZIP)"):
