@@ -4,7 +4,7 @@ from src.db.models import Base, utcnow
 
 class MD_Product(Base):
     __tablename__="md_products"
-    __table_args__=(UniqueConstraint("project_id","sku", name="uq_md_product_sku"),)
+    __table_args__=(UniqueConstraint("project_id","sku", name="uq_md_product_sku"), {"extend_existing": True})
     id=Column(Integer, primary_key=True)
     project_id=Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     sku=Column(String(80), nullable=False, index=True)
@@ -16,7 +16,7 @@ class MD_Product(Base):
 
 class MD_Material(Base):
     __tablename__="md_materials"
-    __table_args__=(UniqueConstraint("project_id","code", name="uq_md_material_code"),)
+    __table_args__=(UniqueConstraint("project_id","code", name="uq_md_material_code"), {"extend_existing": True})
     id=Column(Integer, primary_key=True)
     project_id=Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     code=Column(String(80), nullable=False, index=True)
@@ -27,7 +27,7 @@ class MD_Material(Base):
 
 class MD_Process(Base):
     __tablename__="md_processes"
-    __table_args__=(UniqueConstraint("project_id","code", name="uq_md_process_code"),)
+    __table_args__=(UniqueConstraint("project_id","code", name="uq_md_process_code"), {"extend_existing": True})
     id=Column(Integer, primary_key=True)
     project_id=Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     code=Column(String(80), nullable=False, index=True)
@@ -37,16 +37,17 @@ class MD_Process(Base):
 
 class MD_BOMItem(Base):
     __tablename__="md_bom_items"
-    __table_args__=(UniqueConstraint("project_id","product_id","material_id", name="uq_md_bom_line"),)
+    __table_args__=(UniqueConstraint("project_id","product_id","material_id", name="uq_md_bom_line"), {"extend_existing": True})
     id=Column(Integer, primary_key=True)
     project_id=Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     product_id=Column(Integer, ForeignKey("md_products.id"), nullable=False, index=True)
     material_id=Column(Integer, ForeignKey("md_materials.id"), nullable=False, index=True)
-    qty_per_unit=Column(String(50), default="0")  # stable float parsing later
+    qty_per_unit=Column(String(50), default="0")
     created_at=Column(DateTime(timezone=True), default=utcnow)
 
 class MD_ChangeLog(Base):
     __tablename__="md_change_log"
+    __table_args__={"extend_existing": True}
     id=Column(Integer, primary_key=True)
     project_id=Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     entity=Column(String(80), nullable=False, index=True)
