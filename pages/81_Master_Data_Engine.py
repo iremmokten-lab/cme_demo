@@ -73,6 +73,17 @@ def _err(e: Exception):
     st.error(str(e))
 
 
+def _datetime_input(label: str, value: datetime, key: str | None = None):
+    date_key = f"{key}_date" if key else f"{label}_date"
+    time_key = f"{key}_time" if key else f"{label}_time"
+    c1, c2 = st.columns(2)
+    with c1:
+        d = st.date_input(f"{label} • Tarih", value=value.date(), key=date_key)
+    with c2:
+        t = st.time_input(f"{label} • Saat", value=value.time().replace(microsecond=0), key=time_key)
+    return datetime.combine(d, t)
+
+
 with db() as s:
     svc = MasterDataService(s, company_id=company_id, user_id=getattr(user, "id", None))
 
@@ -98,7 +109,7 @@ with db() as s:
             sector = st.text_input("Sektör", value="")
 
         with col2:
-            valid_from = st.datetime_input("Geçerlilik başlangıcı (valid_from)", value=_utcnow_naive())
+            valid_from = _datetime_input("Geçerlilik başlangıcı (valid_from)", value=_utcnow_naive())
             st.caption("Bu tarih, hesap tekrarında hangi kaydın kullanılacağını belirler.")
 
         if st.button("Kaydet (Tesis)", type="primary"):
@@ -143,7 +154,7 @@ with db() as s:
         name = st.text_input("Ürün adı", value="")
         cn_code = st.text_input("CN kodu (ör. 72081000)", value="")
         sector = st.text_input("Sektör (opsiyonel)", value="")
-        valid_from = st.datetime_input("Geçerlilik başlangıcı (valid_from)", value=_utcnow_naive(), key="prod_valid_from")
+        valid_from = _datetime_input("Geçerlilik başlangıcı (valid_from)", value=_utcnow_naive(), key="prod_valid_from")
 
         if st.button("Kaydet (Ürün)", type="primary"):
             try:
@@ -201,7 +212,7 @@ with db() as s:
                 ratio = st.number_input("Oran (ratio)", min_value=0.000001, value=1.0)
                 unit = st.text_input("Birim", value="kg")
 
-            valid_from = st.datetime_input("Geçerlilik başlangıcı (valid_from)", value=_utcnow_naive(), key="bom_valid_from")
+            valid_from = _datetime_input("Geçerlilik başlangıcı (valid_from)", value=_utcnow_naive(), key="bom_valid_from")
 
             if st.button("Kaydet (BOM)", type="primary"):
                 try:
@@ -238,9 +249,9 @@ with db() as s:
         source = st.text_input("Kaynak (örn: TARIC, company)", value="")
         col1, col2 = st.columns(2)
         with col1:
-            vf = st.datetime_input("valid_from (opsiyonel)", value=_utcnow_naive(), key="cn_vf")
+            vf = _datetime_input("valid_from (opsiyonel)", value=_utcnow_naive(), key="cn_vf")
         with col2:
-            vt = st.datetime_input("valid_to (opsiyonel)", value=_utcnow_naive(), key="cn_vt")
+            vt = _datetime_input("valid_to (opsiyonel)", value=_utcnow_naive(), key="cn_vt")
 
         if st.button("Kaydet (CN Kodu)", type="primary"):
             try:
