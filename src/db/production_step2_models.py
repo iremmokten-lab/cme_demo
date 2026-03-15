@@ -1,15 +1,9 @@
 from __future__ import annotations
 
-"""Compatibility models for step-2 pages.
-
-Keep declarations unique by importing step-1 models and declaring only the
-extra tables needed by step-2 services.
-"""
-
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 
 from src.db.models import Base, utcnow
-from src.db.production_step1_models import (  # re-export canonical shared tables
+from src.db.production_step1_models import (
     AccessAuditLog,
     CBAMQuarterlySubmission,
     CbamPortalSubmission,
@@ -26,7 +20,7 @@ from src.db.production_step1_models import (  # re-export canonical shared table
 
 class CacheEntry(Base):
     __tablename__ = "cache_entries"
-    __table_args__ = (Index("ix_cache_entries_expires", "expires_at"),)
+    __table_args__ = (Index("ix_cache_entries_expires", "expires_at"), {"extend_existing": True})
 
     id = Column(Integer, primary_key=True)
     key = Column(String(255), nullable=False, unique=True, index=True)
@@ -37,7 +31,7 @@ class CacheEntry(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
-    __table_args__ = (Index("ix_jobs_status", "status"), Index("ix_jobs_kind", "kind"))
+    __table_args__ = (Index("ix_jobs_status", "status"), Index("ix_jobs_kind", "kind"), {"extend_existing": True})
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True, index=True)
@@ -53,7 +47,7 @@ class Job(Base):
 
 class IntegrationConnection(Base):
     __tablename__ = "integration_connections"
-    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_integration_project_name"),)
+    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_integration_project_name"), {"extend_existing": True})
 
     id = Column(Integer, primary_key=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
@@ -69,7 +63,7 @@ class IntegrationConnection(Base):
 
 class RegulationSpec(Base):
     __tablename__ = "regulation_specs"
-    __table_args__ = (UniqueConstraint("code", "version", name="uq_regulation_specs_code_version"),)
+    __table_args__ = (UniqueConstraint("code", "version", name="uq_regulation_specs_code_version"), {"extend_existing": True})
 
     id = Column(Integer, primary_key=True)
     code = Column(String(80), nullable=False, index=True)
