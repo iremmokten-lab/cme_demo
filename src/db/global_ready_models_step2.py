@@ -8,7 +8,10 @@ from src.db.production_step1_models import AccessAuditLog
 
 class RegulationSpecVersion(Base):
     __tablename__ = "regulation_spec_versions"
-    __table_args__ = (UniqueConstraint("spec_name", "version_label", name="uq_reg_spec_name_version"),)
+    __table_args__ = (
+        UniqueConstraint("spec_name", "version_label", name="uq_reg_spec_name_version"),
+        {"extend_existing": True},
+    )
 
     id = Column(Integer, primary_key=True)
     spec_name = Column(String(120), nullable=False, index=True)
@@ -22,7 +25,10 @@ class RegulationSpecVersion(Base):
 
 class ERPConnection(Base):
     __tablename__ = "erp_connections"
-    __table_args__ = (UniqueConstraint("company_id", "name", name="uq_erp_company_name"),)
+    __table_args__ = (
+        UniqueConstraint("company_id", "name", name="uq_erp_company_name"),
+        {"extend_existing": True},
+    )
 
     id = Column(Integer, primary_key=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
