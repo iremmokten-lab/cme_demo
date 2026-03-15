@@ -152,7 +152,7 @@ def compliance_checklist_page(user) -> None:
         proj_label = st.selectbox("Proje seç", options=list(proj_label_to_id.keys()))
         project_id = proj_label_to_id[proj_label]
 
-        snaps = list_snapshots_for_project(user, project_id)
+        snaps = list_snapshots_for_project(project_id)
     else:
         st.info("Müşteri görünümü: sadece danışman tarafından paylaşılan snapshot’lar listelenir.")
         snaps = list_shared_snapshots_for_user(user)
